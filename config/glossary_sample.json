@@ -1,0 +1,24 @@
+{
+  "terms": [
+    {
+      "source": "API",
+      "target": "应用程序接口",
+      "category": "技术"
+    },
+    {
+      "source": "machine learning",
+      "target": "机器学习",
+      "category": "技术"
+    },
+    {
+      "source": "user interface",
+      "target": "用户界面",
+      "category": "技术"
+    }
+  ],
+  "categories": [
+    "通用",
+    "技术",
+    "专业"
+  ]
+}

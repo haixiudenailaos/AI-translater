@@ -1,0 +1,8 @@
+{
+  "provider": "siliconflow",
+  "api_key": "sk-otzheovnpvqwngkicakfcatjrkrvkwesnxgtzfaprteyslyp",
+  "base_url": "https://api.siliconflow.cn/v1",
+  "model_name": "moonshotai/Kimi-K2-Instruct-0905",
+  "max_tokens": 4000,
+  "temperature": 0.26344086021505375
+}

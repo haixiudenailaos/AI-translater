@@ -1,0 +1,12 @@
+{
+  "deepseek": {
+    "api_key": "sk-otzheovnpvqwngkicakfcatjrkrvkwesnxgtzfaprteyslyp",
+    "model_name": "deepseek-ai/DeepSeek-V3.1",
+    "created_time": "D:\\Codebuddy_project2"
+  },
+  "Kimi-K2-Instruct-0905": {
+    "api_key": "sk-otzheovnpvqwngkicakfcatjrkrvkwesnxgtzfaprteyslyp",
+    "model_name": "moonshotai/Kimi-K2-Instruct-0905",
+    "created_time": "D:\\Codebuddy_project2"
+  }
+}
