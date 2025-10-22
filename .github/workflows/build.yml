@@ -138,9 +138,9 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         files: |
-          artifacts/轻小说翻译器V1.1-Windows-x64.exe
-          artifacts/轻小说翻译器V1.1-macOS-Universal.app
-          artifacts/轻小说翻译器V1.1-Linux-x64
+          轻小说翻译器V1.1-Windows-x64.exe
+          轻小说翻译器V1.1-macOS-Universal.app
+          轻小说翻译器V1.1-Linux-x64
         draft: false
         prerelease: false
         generate_release_notes: true
