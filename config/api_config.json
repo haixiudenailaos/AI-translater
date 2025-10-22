@@ -1,8 +1,12 @@
 {
   "provider": "siliconflow",
-  "api_key": "sk-otzheovnpvqwngkicakfcatjrkrvkwesnxgtzfaprteyslyp",
+  "api_key": "sk-lkyueaxfcbidfnqdjovopzseiexnloloieuwbrzfpniozmet",
+  "model_name": "deepseek-ai/DeepSeek-V3.2-Exp",
   "base_url": "https://api.siliconflow.cn/v1",
-  "model_name": "moonshotai/Kimi-K2-Instruct-0905",
   "max_tokens": 4000,
-  "temperature": 0.26344086021505375
+  "temperature": 0.26344086021505375,
+  "provider_keys": {
+    "siliconflow": "sk-lkyueaxfcbidfnqdjovopzseiexnloloieuwbrzfpniozmet",
+    "deepseek": "sk-cc746cd4f1d5413698a2f302b7111b1d"
+  }
 }

@@ -11,12 +11,12 @@ from typing import Callable, Optional, List
 import re
 
 from ..api.siliconflow_api import SiliconFlowAPI
+from ..api.deepseek_api import DeepseekAPI
 
 class TranslatorEngine:
     def __init__(self, config_manager):
         self.config_manager = config_manager
         self.api = None
-        self.is_paused = False
         self.is_stopped = False
         
         # 延迟初始化API与正则（按需构建）
@@ -26,7 +26,14 @@ class TranslatorEngine:
     def _init_api(self):
         """初始化API客户端"""
         api_config = self.config_manager.get_api_config()
-        if api_config.get("provider") == "siliconflow":
+        provider = api_config.get("provider", "siliconflow")
+        
+        if provider == "deepseek":
+            self.api = DeepseekAPI(api_config)
+        elif provider == "siliconflow":
+            self.api = SiliconFlowAPI(api_config)
+        else:
+            # 默认使用 SiliconFlow
             self.api = SiliconFlowAPI(api_config)
             
     def _ensure_api(self):
@@ -45,77 +52,55 @@ class TranslatorEngine:
         self._init_api()
             
     def translate_line_by_line(self, content: str, progress_callback: Callable, complete_callback: Callable):
-        """逐行翻译模式（改为流式增量输出）"""
-        # 重置状态，确保开始新翻译时状态干净
+        """逐行翻译模式（重构：分批翻译 + 流式输出）
+        
+        核心原则：
+        1. 按配置的batch_lines（默认20行）拆分原文
+        2. 每批使用流式翻译，实时显示翻译进度
+        3. 每批翻译完成后，准确写入对应行号位置
+        4. 绝对不依赖换行符拆分，只按行号对应
+        """
+        # 重置状态
         self.reset()
-        # 惰性初始化 API
         self._ensure_api()
         
         try:
             lines = content.split('\n')
             total_lines = len(lines)
             app_config = self.config_manager.get_app_config()
-            context_lines = app_config.get("context_lines", 2)
+            batch_lines = app_config.get("batch_lines", 20)  # 每批翻译的行数
             
-            translated_lines = []
-            
-            for i, line in enumerate(lines):
-                # 检查是否暂停或停止
-                while self.is_paused and not self.is_stopped:
-                    time.sleep(0.1)
-                    
+            # 按批次处理
+            for batch_start in range(0, total_lines, batch_lines):
+                # 检查是否停止
                 if self.is_stopped:
                     break
-                    
-                # 跳过空行
-                if not line.strip():
-                    translated_lines.append(line)
-                    progress = (i + 1) / total_lines * 100
-                    progress_callback(progress, line + '\n')
-                    continue
-                    
-                # 构建上下文
-                context = self._build_context(lines, i, context_lines)
                 
-                # 组装提示词并流式翻译，实时渲染到译文框
-                app_cfg = self.config_manager.get_app_config()
-                base_prompt = app_cfg.get("translation_prompt", "")
-                glossary_prompt = self.config_manager.get_glossary_prompt()
-                target_language = app_cfg.get("target_language", "中文")
+                # 获取当前批次的原文行
+                batch_end = min(batch_start + batch_lines, total_lines)
+                batch_source_lines = lines[batch_start:batch_end]
                 
-                full_prompt = f"{base_prompt}\n\n"
-                if context:
-                    full_prompt += f"【上下文信息】\n{context}\n\n"
-                if glossary_prompt:
-                    full_prompt += glossary_prompt + "\n\n"
-                full_prompt += f"请将以下文本翻译为{target_language}：\n{line}"
+                # 翻译当前批次（使用流式输出，传递总行数用于进度计算）
+                batch_translated_lines = self._translate_batch(
+                    batch_source_lines, 
+                    progress_callback, 
+                    batch_start,
+                    total_lines  # ✅ 传递总行数
+                )
                 
-                translated_parts: List[str] = []
-                # 更新进度（该行的固定进度值）
-                progress = (i + 1) / total_lines * 100
-                def on_chunk(chunk: str):
-                    translated_parts.append(chunk)
-                    # 实时输出增量片段（异常安全）
-                    try:
-                        progress_callback(progress, chunk)
-                    except Exception as _e:
-                        print(f"[fast/newlines] line_by_line on_chunk callback error: {type(_e).__name__}: {_e}")
+                # 计算总进度
+                overall_progress = (batch_end / total_lines) * 100
                 
-                try:
-                    response = self.api.translate_stream_enhanced(full_prompt, callback=on_chunk, context=None)
-                    # 若回调未收到内容，则使用返回值备用
-                    translated_line = ''.join(translated_parts) if translated_parts else (response.strip() if response else line)
-                except Exception as e:
-                    print(f"翻译错误: {e}")
-                    translated_line = line
+                # 回调：传递批次翻译完成的结果
+                progress_callback(overall_progress, {
+                    'batch_start': batch_start,
+                    'translated_lines': batch_translated_lines,
+                    'streaming': False  # 标记为批次完成
+                })
                 
-                translated_lines.append(translated_line)
-                # 行结束补一个换行
-                progress_callback(progress, '\n')
-                
-                # 短暂延迟，避免API请求过快
+                # 短暂延迟
                 time.sleep(0.1)
-                
+            
             if not self.is_stopped:
                 complete_callback()
                 
@@ -123,334 +108,256 @@ class TranslatorEngine:
             raise e
             
     def translate_fast_mode(self, content: str, progress_callback: Callable, complete_callback: Callable):
-        """快速翻译模式（改为流式增量输出）"""
-        # 重置状态，确保开始新翻译时状态干净
+        """快速翻译模式（重构：分批翻译 + 流式输出）
+        
+        核心原则：
+        1. 按配置的batch_lines（默认20行）拆分原文
+        2. 每批使用流式翻译，实时显示翻译进度
+        3. 每批翻译完成后，准确写入对应行号位置
+        4. 绝对不依赖换行符拆分，只按行号对应
+        """
+        # 重置状态
         self.reset()
-        # 惰性初始化 API
         self._ensure_api()
         
         try:
+            lines = content.split('\n')
+            total_lines = len(lines)
             app_config = self.config_manager.get_app_config()
-            chunk_size = app_config.get("chunk_size", 1000)
+            batch_lines = app_config.get("batch_lines", 20)  # 每批翻译的行数
             
-            # 获取缓存清理配置
-            fast_flush_interval = app_config.get("fast_flush_interval", 2)
-            fast_flush_strategy = app_config.get("fast_flush_strategy", "optimize")
-            
-            # 按字数分块
-            chunks = self._split_into_chunks(content, chunk_size)
-            total_chunks = len(chunks)
-            
-            # 预编译常用换正规则（按需）
-            re_many = self._get_re_many_newlines()
-            
-            translated_chunks = []
-            last_ended_with_newline = False  # 跟踪上一块是否以换行结束
-            
-            for i, chunk in enumerate(chunks):
-                # 检查是否暂停或停止
-                while self.is_paused and not self.is_stopped:
-                    time.sleep(0.1)
-                    
+            # 按批次处理
+            for batch_start in range(0, total_lines, batch_lines):
+                # 检查是否停止
                 if self.is_stopped:
                     break
-                    
-                # 使用流式翻译当前块，实时渲染到译文框
-                app_cfg = self.config_manager.get_app_config()
-                base_prompt = app_cfg.get("translation_prompt", "")
-                glossary_prompt = self.config_manager.get_glossary_prompt()
-                target_language = app_cfg.get("target_language", "中文")
                 
-                full_prompt = f"{base_prompt}\n\n"
-                if glossary_prompt:
-                    full_prompt += glossary_prompt + "\n\n"
-                full_prompt += f"请将以下文本翻译为{target_language}：\n\n{chunk}"
+                # 获取当前批次的原文行
+                batch_end = min(batch_start + batch_lines, total_lines)
+                batch_source_lines = lines[batch_start:batch_end]
                 
-                # 打印本块开始时的换行统计
-                self._log_newline_debug("chunk_start", i, 0, chunk)
+                # 翻译当前批次（使用流式输出，传递总行数用于进度计算）
+                batch_translated_lines = self._translate_batch(
+                    batch_source_lines, 
+                    progress_callback, 
+                    batch_start,
+                    total_lines  # ✅ 传递总行数
+                )
                 
-                translated_parts: List[str] = []
-                # 更新进度
-                progress = (i + 1) / total_chunks * 100
+                # 计算总进度
+                overall_progress = (batch_end / total_lines) * 100
                 
-                def on_chunk(chunk_part: str):
-                    translated_parts.append(chunk_part)
-                    # 实时打印增量片段换行统计
-                    piece_idx = len(translated_parts)
-                    self._log_newline_debug("on_chunk", i, piece_idx, chunk_part)
-                    
-                    # 处理流式输出中的换行符，避免多余空行
-                    processed_part = chunk_part
-                    # 片段级压缩：将连续≥3个换行压为2个
-                    try:
-                        processed_part = re_many.sub('\n', processed_part)
-                    except Exception as _e:
-                        print(f"[fast/newlines] compress(part) error: {type(_e).__name__}: {_e}")
-                    
-                    # 桥接规则B：上一块以换行结束且当前块首片段以换行开头，则去掉一个前导换行
-                    if piece_idx == 1 and i > 0 and translated_chunks:
-                        try:
-                            if translated_chunks[-1].endswith('\n') and processed_part.startswith('\n'):
-                                processed_part = processed_part.lstrip('\n')
-                                if self._should_log_fast_debug("minimal"):
-                                    print(f"[fast/newlines] bridge chunk={i} piece=1 removed_leading_newline")
-                        except Exception as _e:
-                            print(f"[fast/newlines] bridge error: {type(_e).__name__}: {_e}")
-                    
-                    # 实时增量输出到UI（异常安全）
-                    try:
-                        progress_callback(progress, processed_part)
-                    except Exception as _e:
-                        print(f"[fast/newlines] on_chunk callback error: {type(_e).__name__}: {_e}; fallback to raw part")
-                        try:
-                            progress_callback(progress, chunk_part)
-                        except Exception as __e:
-                            print(f"[fast/newlines] fallback callback failed: {type(__e).__name__}: {__e}")
-                
-                try:
-                    response = self.api.translate_stream_enhanced(full_prompt, callback=on_chunk, context=None)
-                    translated_chunk = ''.join(translated_parts) if translated_parts else (response.strip() if response else chunk)
-                except Exception as e:
-                    print(f"翻译错误: {e}")
-                    translated_chunk = chunk
-                # 块级兜底压缩：将连续≥3个换行压为2个
-                try:
-                    translated_chunk = re_many.sub('\n', translated_chunk)
-                    translated_chunk = translated_chunk.rstrip('\n') + '\n'
-                except Exception as _e:
-                    print(f"[fast/newlines] compress(chunk) error: {type(_e).__name__}: {_e}")
-                
-                translated_chunks.append(translated_chunk)
-                # 本块结束统计
-                self._log_newline_debug("chunk_end", i, 0, translated_chunk)
-                # 在块结束处显式输出一个换行以确保块间分隔（非最后一块）
-                if i < total_chunks - 1:
-                    try:
-                        progress_callback(progress,'\n')
-                    except Exception as _e:
-                        print(f"[fast/newlines] chunk_end emit newline error: {type(_e).__name__}: {_e}")
-                
-                # 智能处理块间分隔符，避免重复换行
-                if i < total_chunks - 1:  # 不是最后一块
-                    # 检查当前块是否以换行结束
-                    current_ends_with_newline = translated_chunk.endswith('\n')
-                    
-                    # 打印桥接换行决策
-                    if self._should_log_fast_debug("minimal"):
-                        next_stats = self._newline_stats(chunks[i+1])
-                        curr_stats = self._newline_stats(chunk)
-                        print(f"[fast/newlines] bridge decision chunk {i} -> {i+1}: src_current_trailing={curr_stats['trailing']}, src_next_leading={next_stats['leading']}, will_add_newline=False")
-                    
-                    # 移除原有的块间分隔符逻辑，改为在流式输出时处理
-                    # 这样可以避免在块结束时添加换行符，而是在下一块开始时智能添加
-                    last_ended_with_newline = current_ends_with_newline
-                
-                # 周期性缓存清理，避免内存占用过高
-                if (i + 1) % fast_flush_interval == 0:
-                    if self._should_log_fast_debug("minimal"):
-                        print(f"[fast/flush] after chunk {i+1}, strategy={fast_flush_strategy}")
-                    if hasattr(self.api, 'optimize_cache') and fast_flush_strategy == "optimize":
-                        self.api.optimize_cache()
-                    elif hasattr(self.api, 'clear_cache') and fast_flush_strategy == "clear":
-                        self.api.clear_cache()
+                # 回调：传递批次翻译完成的结果
+                progress_callback(overall_progress, {
+                    'batch_start': batch_start,
+                    'translated_lines': batch_translated_lines,
+                    'streaming': False  # 标记为批次完成
+                })
                 
                 # 短暂延迟
                 time.sleep(0.2)
-                
+            
             if not self.is_stopped:
                 complete_callback()
                 
         except Exception as e:
             raise e
             
-    def _build_context(self, lines: List[str], current_index: int, context_lines: int) -> str:
-        """构建上下文"""
-        context = []
+    def _translate_batch(self, batch_lines: List[str], progress_callback: Callable, batch_start: int, total_lines: Optional[int] = None) -> List[str]:
+        """翻译一批原文行，使用流式输出提升体验（增强：行号标记机制）
         
-        # 添加前面的行
-        start = max(0, current_index - context_lines)
-        for i in range(start, current_index):
-            if lines[i].strip():
-                context.append(f"前文: {lines[i]}")
-                
-        # 添加后面的行
-        end = min(len(lines), current_index + context_lines + 1)
-        for i in range(current_index + 1, end):
-            if lines[i].strip():
-                context.append(f"后文: {lines[i]}")
-                
-        return '\n'.join(context) if context else ""
+        核心逻辑：
+        1. 为每行原文添加行号标记，确保API返回时能正确对齐
+        2. 使用流式翻译，实时显示结果
+        3. 翻译完成后，解析行号标记并按序排列译文
+        4. 确保返回的译文行数 = 原文行数
+        5. ✅ 增强：API请求失败时自动重试最多5次
+        6. ✅ 修复进度条：流式阶段也显示准确进度
+        7. ✅ 新增：行号标记机制解决对齐问题
+        """
+        if not batch_lines:
+            return []
         
-    def _translate_single_line(self, line: str, context: str) -> str:
-        """翻译单行文本"""
-        if not self.api:
-            return line
-            
+        # ✅ 新增：为每行添加行号标记
+        marked_lines = []
+        for i, line in enumerate(batch_lines):
+            line_marker = f"[LINE_{i+1:03d}]"
+            marked_lines.append(f"{line_marker}{line}")
+        
+        # 合并带标记的原文
+        batch_content = '\n'.join(marked_lines)
+        expected_lines = len(batch_lines)
+        
+        # 构建提示词
         app_config = self.config_manager.get_app_config()
         base_prompt = app_config.get("translation_prompt", "")
         glossary_prompt = self.config_manager.get_glossary_prompt()
-        target_language = self.config_manager.get_app_config().get("target_language", "中文")
+        target_language = app_config.get("target_language", "中文")
         
-        # 构建完整提示词
         full_prompt = f"{base_prompt}\n\n"
-        
-        if context:
-            full_prompt += f"【上下文信息】\n{context}\n\n"
-            
         if glossary_prompt:
             full_prompt += glossary_prompt + "\n\n"
-            
-        full_prompt += f"请将以下文本翻译为{target_language}：\n{line}"
+        full_prompt += f"""请将以下文本翻译为{target_language}。
+
+重要说明：
+1. 每行文本前都有行号标记 [LINE_XXX]，请在译文中保留这些标记
+2. 保持原文的换行结构，每行对应翻译
+3. 译文格式：[LINE_XXX]译文内容
+
+原文：
+{batch_content}"""
         
-        try:
-            response = self.api.translate(full_prompt)
-            return response.strip() if response else line
-        except Exception as e:
-            print(f"翻译错误: {e}")
-            return line
-            
-    def _translate_chunk(self, chunk: str) -> str:
-        """翻译文本块"""
-        if not self.api:
-            return chunk
-            
-        app_config = self.config_manager.get_app_config()
-        base_prompt = self.config_manager.get_app_config().get("translation_prompt", "")
-        glossary_prompt = self.config_manager.get_glossary_prompt()
-        target_language = self.config_manager.get_app_config().get("target_language", "中文")
-        
-        # 构建完整提示词
-        full_prompt = f"{base_prompt}\n\n"
-        
-        if glossary_prompt:
-            full_prompt += glossary_prompt + "\n\n"
-            
-        full_prompt += f"请将以下文本翻译为{target_language}：\n\n{chunk}"
-        
-        try:
-            response = self.api.translate(full_prompt)
-            return response.strip() if response else chunk
-        except Exception as e:
-            print(f"翻译错误: {e}")
-            return chunk
-            
-    def _split_into_chunks(self, content: str, chunk_size: int) -> List[str]:
-        """将文本按字数分块"""
-        chunks = []
-        lines = content.split('\n')
-        current_chunk = []
-        current_size = 0
-        
-        for line in lines:
-            line_size = len(line)
-            
-            # 如果当前块加上这一行会超过限制，先保存当前块
-            if current_size + line_size > chunk_size and current_chunk:
-                chunks.append('\n'.join(current_chunk))
-                current_chunk = []
-                current_size = 0
+        # ✅ 新增：重试机制（最多5次）
+        max_retries = 5
+        for retry_count in range(max_retries):
+            try:
+                # 使用流式翻译，提升用户体验
+                stream_buffer = []
                 
-            current_chunk.append(line)
-            current_size += line_size
-            
-        # 添加最后一块
-        if current_chunk:
-            chunks.append('\n'.join(current_chunk))
-            
-        return chunks
+                # ✅ 新增：按行更新的流式回调状态
+                completed_lines = []  # 已完成的完整行
+                last_sent_lines = 0   # 上次发送给UI的行数
+                
+                def stream_callback(chunk):
+                    """流式回调：按完整行更新UI"""
+                    nonlocal completed_lines, last_sent_lines
+                    
+                    stream_buffer.append(chunk)
+                    current_text = ''.join(stream_buffer)
+                    
+                    # ✅ 解析当前文本，识别完整的行
+                    lines = current_text.split('\n')
+                    
+                    # 检查是否有新的完整行（除了最后一行，因为可能还在输出中）
+                    if len(lines) > 1:
+                        # 前面的行都是完整的，最后一行可能还在输出中
+                        complete_lines_now = lines[:-1]
+                        
+                        # 如果有新的完整行
+                        if len(complete_lines_now) > len(completed_lines):
+                            # 更新已完成的行列表
+                            completed_lines = complete_lines_now[:]
+                            
+                            # 过滤行号标记，只保留译文内容
+                            filtered_lines = []
+                            for line in completed_lines:
+                                filtered_line = re.sub(r'\[LINE_\d+\]', '', line)
+                                filtered_lines.append(filtered_line)
+                            
+                            filtered_text = '\n'.join(filtered_lines)
+                            
+                            # ✅ 计算流式阶段的进度
+                            if total_lines and total_lines > 0:
+                                # 已完成到当前批次起始位置的进度
+                                base_progress = (batch_start / total_lines) * 100
+                                # 当前批次占总进度的比例
+                                batch_weight = (expected_lines / total_lines) * 100
+                                # 根据已完成行数估算当前批次内的进度
+                                line_progress = len(completed_lines) / expected_lines if expected_lines > 0 else 0
+                                streaming_progress = base_progress + (batch_weight * line_progress)
+                                streaming_progress = min(streaming_progress, 100.0)  # 不超过100%
+                            else:
+                                streaming_progress = 0
+                            
+                            # 只在有新完整行时才回调更新UI
+                            progress_callback(streaming_progress, {
+                                'batch_start': batch_start,
+                                'streaming': True,  # 标记为流式输出
+                                'current_text': filtered_text,  # ✅ 使用过滤后的文本
+                                'expected_lines': expected_lines,
+                                'completed_lines': len(completed_lines)  # 新增：已完成行数
+                            })
+                            
+                            last_sent_lines = len(completed_lines)
+                
+                # 调用流式翻译API
+                if self.api is None:
+                    raise Exception("API client not initialized")
+                response = self.api.translate_stream(full_prompt, stream_callback)
+                
+                # ✅ 增强：检查翻译结果是否有效
+                if not response or not response.strip():
+                    # 没有翻译结果，使用流式缓冲区的内容（可能为空）
+                    translated_content = ''.join(stream_buffer).strip()
+                    if not translated_content:
+                        # 流式缓冲区也为空，触发重试
+                        if retry_count < max_retries - 1:
+                            print(f"翻译结果为空，正在重试 ({retry_count + 1}/{max_retries})...")
+                            time.sleep(1)  # 短暂延迟后重试
+                            continue
+                        else:
+                            # 所有重试都失败，返回空行列表
+                            print(f"翻译失败：{max_retries}次重试后仍无结果")
+                            return [''] * expected_lines
+                else:
+                    translated_content = response.strip()
+                
+                # ✅ 新增：解析行号标记并按序排列译文
+                all_lines = translated_content.split('\n')
+                
+                # 解析行号标记，构建行号到译文的映射
+                line_mapping = {}
+                unmarked_lines = []  # 没有行号标记的行
+                
+                line_marker_pattern = re.compile(r'^\[LINE_(\d+)\](.*)$')
+                
+                for line in all_lines:
+                    match = line_marker_pattern.match(line)
+                    if match:
+                        line_num = int(match.group(1))
+                        content = match.group(2)
+                        line_mapping[line_num] = content
+                    else:
+                        # 没有行号标记的行，可能是API返回格式异常
+                        if line.strip():  # 只保留非空行
+                            unmarked_lines.append(line)
+                
+                # 按行号顺序重建译文列表
+                translated_lines = []
+                for i in range(1, expected_lines + 1):
+                    if i in line_mapping:
+                        translated_lines.append(line_mapping[i])
+                    else:
+                        # 缺失的行号，尝试从未标记行中补充
+                        if unmarked_lines:
+                            translated_lines.append(unmarked_lines.pop(0))
+                        else:
+                            translated_lines.append('')  # 空行占位
+                
+                # ✅ 关键：确保译文行数 = 原文行数
+                if len(translated_lines) < expected_lines:
+                    # 译文行数不足，补充空行
+                    translated_lines.extend([''] * (expected_lines - len(translated_lines)))
+                elif len(translated_lines) > expected_lines:
+                    # 译文行数过多，截断
+                    translated_lines = translated_lines[:expected_lines]
+                
+                # ✅ 成功获取翻译结果，返回
+                return translated_lines
+                
+            except Exception as e:
+                # ✅ 增强：捕获异常后重试
+                if retry_count < max_retries - 1:
+                    print(f"翻译请求失败: {str(e)}，正在重试 ({retry_count + 1}/{max_retries})...")
+                    time.sleep(1)  # 短暂延迟后重试
+                    continue
+                else:
+                    # 所有重试都失败，返回空行列表
+                    print(f"翻译失败：{max_retries}次重试后仍失败 - {str(e)}")
+                    return [''] * expected_lines
         
-    # ========== Newline debug helpers (fast mode) ==========
-    def _get_fast_debug_level(self) -> str:
-        """获取快速模式换行调试等级：off|minimal|standard|verbose"""
-        try:
-            lvl = self.config_manager.get_app_config().get("fast_debug_newlines", "standard")
-            if isinstance(lvl, bool):
-                return "standard" if lvl else "off"
-            return str(lvl).lower()
-        except Exception:
-            return "standard"
+        # ✅ 兜底：理论上不会到达这里，但为了安全起见
+        return [''] * expected_lines
 
-    def _should_log_fast_debug(self, need: str = "minimal") -> bool:
-        """根据等级判断是否需要打印日志"""
-        order = {"off": 0, "minimal": 1, "standard": 2, "verbose": 3}
-        level = self._get_fast_debug_level()
-        return order.get(level, 2) >= order.get(need, 1)
-
-    def _newline_stats(self, text: str) -> dict:
-        """统计文本中的换行特征"""
-        if text is None:
-            text = ""
-        total = text.count("\n")
-        has_crlf = "\r\n" in text
-        # 计算前导/尾随连续换行数
-        leading = 0
-        for ch in text:
-            if ch == "\n":
-                leading += 1
-            else:
-                break
-        trailing = 0
-        for ch in reversed(text):
-            if ch == "\n":
-                trailing += 1
-            else:
-                break
-        # 最大连续换行
-        max_cons = 0
-        cur = 0
-        for ch in text:
-            if ch == "\n":
-                cur += 1
-                if cur > max_cons:
-                    max_cons = cur
-            else:
-                cur = 0
-        sample_tail = text[-40:].replace("\r", "\\r").replace("\n", "\\n")
-        return {
-            "total": total,
-            "leading": leading,
-            "trailing": trailing,
-            "max_cons": max_cons,
-            "has_crlf": has_crlf,
-            "len": len(text),
-            "tail": sample_tail
-        }
-
-    def _log_newline_debug(self, where: str, chunk_idx: int, piece_idx: int, text: str):
-        """按配置打印换行调试信息"""
-        if not self._should_log_fast_debug("minimal"):
-            return
-        stats = self._newline_stats(text)
-        lvl = self._get_fast_debug_level()
-        prefix = f"[fast/newlines] {where} chunk={chunk_idx}"
-        if piece_idx:
-            prefix += f" piece={piece_idx}"
-        if lvl == "minimal":
-            print(f"{prefix} | total={stats['total']} trailing={stats['trailing']} len={stats['len']}")
-        elif lvl == "standard":
-            print(f"{prefix} | total={stats['total']} leading={stats['leading']} trailing={stats['trailing']} max_cons={stats['max_cons']} crlf={stats['has_crlf']} len={stats['len']}")
-        else:  # verbose
-            print(f"{prefix} | total={stats['total']} leading={stats['leading']} trailing={stats['trailing']} max_cons={stats['max_cons']} crlf={stats['has_crlf']} len={stats['len']} tail='{stats['tail']}'")
-
-    def pause(self):
-        """暂停翻译"""
-        self.is_paused = True
-        
-    def resume(self):
-        """恢复翻译"""
-        self.is_paused = False
-        
     def stop(self):
         """停止翻译"""
         self.is_stopped = True
-        self.is_paused = False
         # 取消所有正在进行的API请求
         if self.api:
             self.api.cancel_requests()
         
     def reset(self):
         """重置状态"""
-        self.is_paused = False
         self.is_stopped = False
         # 重置API取消状态
         if self.api:

@@ -16,12 +16,16 @@ class SettingsWindow:
         
         # 模型名称映射：完整名称 -> 显示名称
         self.model_display_map = {
-            "deepseek-ai/DeepSeek-V3.1": "DeepSeek V3.1",
+            # SiliconFlow 模型
+            "deepseek-ai/DeepSeek-V3.2-Exp": "DeepSeek V3.2 Exp",
+            "deepseek-ai/DeepSeek-V3.1-Terminus": "DeepSeek V3.1",
             "deepseek-ai/DeepSeek-V3": "DeepSeek V3",
             "moonshotai/Kimi-K2-Instruct-0905": "Kimi K2",
             "Qwen/Qwen3-Next-80B-A3B-Instruct": "Qwen3 Next 80B",
-            # 保持向后兼容
+            # Deepseek 官方模型
             "deepseek-chat": "DeepSeek Chat",
+            "deepseek-reasoner": "DeepSeek Reasoner",
+            # 保持向后兼容
             "qwen-turbo": "Qwen Turbo",
             "glm-4-flash": "GLM-4 Flash"
         }
@@ -85,8 +89,9 @@ class SettingsWindow:
         ttk.Label(api_frame, text="API提供商:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=10)
         self.provider_var = tk.StringVar(value=self.api_config.get("provider", "siliconflow"))
         provider_combo = ttk.Combobox(api_frame, textvariable=self.provider_var,
-                                     values=["siliconflow"], state="readonly", width=30)
+                                     values=["siliconflow", "deepseek"], state="readonly", width=30)
         provider_combo.grid(row=0, column=1, padx=10, pady=10)
+        provider_combo.bind("<<ComboboxSelected>>", self.on_provider_changed)
         
         # API密钥
         ttk.Label(api_frame, text="API密钥:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=10)
@@ -113,25 +118,35 @@ class SettingsWindow:
         ttk.Label(api_frame, text="模型名称:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=10)
         
         # 获取当前模型名称并转换为显示名称
-        current_model = self.api_config.get("model_name", "deepseek-ai/DeepSeek-V3.1")
+        current_model = self.api_config.get("model_name", "deepseek-ai/DeepSeek-V3.1-Terminus")
         current_display = self.model_display_map.get(current_model, current_model)
         
         self.model_var = tk.StringVar(value=current_display)
         
-        # 模型选项列表（显示名称）
-        model_display_values = [
+        # 根据提供商设置模型选项
+        self.siliconflow_models = [
+            "DeepSeek V3.2 Exp",
             "DeepSeek V3.1",
-            "DeepSeek V3", 
+            "DeepSeek V3",
             "Kimi K2",
-            "Qwen3 Next 80B",
-            "DeepSeek Chat",  # 向后兼容
-
-
+            "Qwen3 Next 80B"
         ]
         
-        model_combo = ttk.Combobox(api_frame, textvariable=self.model_var,
+        self.deepseek_models = [
+            "DeepSeek Chat",
+            "DeepSeek Reasoner"
+        ]
+        
+        # 根据当前提供商选择模型列表
+        current_provider = self.provider_var.get()
+        if current_provider == "deepseek":
+            model_display_values = self.deepseek_models
+        else:
+            model_display_values = self.siliconflow_models
+        
+        self.model_combo = ttk.Combobox(api_frame, textvariable=self.model_var,
                                   values=model_display_values, width=30, state="readonly")
-        model_combo.grid(row=3, column=1, padx=10, pady=10)
+        self.model_combo.grid(row=3, column=1, padx=10, pady=10)
         
         # 最大令牌数
         ttk.Label(api_frame, text="最大令牌数:").grid(row=4, column=0, sticky=tk.W, padx=10, pady=10)
@@ -177,24 +192,29 @@ class SettingsWindow:
                                   textvariable=self.context_lines_var, width=33)
         context_spin.grid(row=2, column=1, padx=10, pady=10)
         
-        # 分块大小
-        ttk.Label(trans_frame, text="分块大小:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=10)
-        self.chunk_size_var = tk.IntVar(value=self.app_config.get("chunk_size", 1000))
-        chunk_spin = ttk.Spinbox(trans_frame, from_=500, to=3000, increment=100,
-                                textvariable=self.chunk_size_var, width=33)
-        chunk_spin.grid(row=3, column=1, padx=10, pady=10)
+        # 批次翻译行数
+        ttk.Label(trans_frame, text="批次翻译行数:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=10)
+        self.batch_lines_var = tk.IntVar(value=self.app_config.get("batch_lines", 20))
+        batch_spin = ttk.Spinbox(trans_frame, from_=5, to=50, increment=5,
+                                textvariable=self.batch_lines_var, width=33)
+        batch_spin.grid(row=3, column=1, padx=10, pady=10)
+        
+        # 批次行数提示
+        batch_tip = ttk.Label(trans_frame, text="每批翻译的原文行数，使用流式输出提升体验", 
+                             foreground="#666", font=('TkDefaultFont', 8))
+        batch_tip.grid(row=4, column=1, sticky=tk.W, padx=10, pady=(0, 10))
         
         # 自动保存
         self.auto_save_var = tk.BooleanVar(value=self.app_config.get("auto_save", True))
         auto_save_check = ttk.Checkbutton(trans_frame, text="启用自动保存", 
                                          variable=self.auto_save_var)
-        auto_save_check.grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=10, pady=10)
+        auto_save_check.grid(row=5, column=0, columnspan=2, sticky=tk.W, padx=10, pady=10)
         
         # 翻译提示词
-        ttk.Label(trans_frame, text="翻译提示词:").grid(row=5, column=0, sticky=tk.NW, padx=10, pady=10)
+        ttk.Label(trans_frame, text="翻译提示词:").grid(row=6, column=0, sticky=tk.NW, padx=10, pady=10)
         
         prompt_frame = ttk.Frame(trans_frame)
-        prompt_frame.grid(row=5, column=1, padx=10, pady=10, sticky=tk.EW)
+        prompt_frame.grid(row=6, column=1, padx=10, pady=10, sticky=tk.EW)
         
         self.prompt_text = tk.Text(prompt_frame, height=15, width=40, wrap=tk.WORD)
         prompt_scroll = ttk.Scrollbar(prompt_frame, orient=tk.VERTICAL, command=self.prompt_text.yview)
@@ -208,8 +228,29 @@ class SettingsWindow:
         
         # 重置按钮
         ttk.Button(trans_frame, text="重置为默认", 
-                  command=self.reset_prompt).grid(row=6, column=1, padx=10, pady=10, sticky=tk.E)
+                  command=self.reset_prompt).grid(row=7, column=1, padx=10, pady=10, sticky=tk.E)
         
+    def on_provider_changed(self, event=None):
+        """当提供商改变时更新模型列表、基础URL和API密钥"""
+        provider = self.provider_var.get()
+        
+        # 更新模型列表
+        if provider == "deepseek":
+            self.model_combo['values'] = self.deepseek_models
+            self.model_var.set(self.deepseek_models[0])  # 默认选择第一个
+            self.base_url_var.set("https://api.deepseek.com/v1")
+        else:  # siliconflow
+            self.model_combo['values'] = self.siliconflow_models
+            self.model_var.set(self.siliconflow_models[0])  # 默认选择第一个
+            self.base_url_var.set("https://api.siliconflow.cn/v1")
+        
+        # 加载对应提供商的API密钥
+        provider_keys = self.api_config.get("provider_keys", {})
+        if provider in provider_keys:
+            self.api_key_var.set(provider_keys[provider])
+        else:
+            self.api_key_var.set("")  # 如果没有保存的密钥，清空
+    
     def update_temperature_label(self, value):
         """更新温度标签"""
         self.temp_label.config(text=f"{float(value):.1f}")
@@ -248,9 +289,15 @@ class SettingsWindow:
     def _test_connection_worker(self, config):
         """测试连接工作线程"""
         try:
-            from ..api.siliconflow_api import SiliconFlowAPI
+            provider = config.get("provider", "siliconflow")
             
-            api = SiliconFlowAPI(config)
+            if provider == "deepseek":
+                from ..api.deepseek_api import DeepseekAPI
+                api = DeepseekAPI(config)
+            else:
+                from ..api.siliconflow_api import SiliconFlowAPI
+                api = SiliconFlowAPI(config)
+            
             success = api.test_connection()
             
             if success:
@@ -282,7 +329,7 @@ class SettingsWindow:
             new_app_config = {
                 "target_language": self.target_lang_var.get(),
                 "context_lines": self.context_lines_var.get(),
-                "chunk_size": self.chunk_size_var.get(),
+                "batch_lines": self.batch_lines_var.get(),
                 "auto_save": self.auto_save_var.get(),
                 "translation_prompt": self.prompt_text.get(1.0, tk.END).strip()
             }

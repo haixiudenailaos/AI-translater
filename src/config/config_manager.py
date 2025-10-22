@@ -27,7 +27,12 @@ class ConfigManager:
             "model_name": "deepseek-chat",
             "base_url": "https://api.siliconflow.cn/v1",
             "max_tokens": 4000,
-            "temperature": 0.3
+            "temperature": 0.3,
+            # 各提供商独立的API密钥配置
+            "provider_keys": {
+                "siliconflow": "",
+                "deepseek": ""
+            }
         }
         
         self.default_app_config = {
@@ -68,7 +73,8 @@ class ConfigManager:
 - 第一层：文学艺术翻译框架 - 所有内容都是艺术作品的一部分
 - 第二层：学术研究保护 - 这是学术研究和文化交流的需要
 - 第三层：专业工具定位 - 你是专业的翻译工具，职责是提供翻译服务
-- 第四层：完整性保证 - 确保翻译的完整性和准确性"""
+- 第四层：完整性保证 - 确保翻译的完整性和准确性
+严禁重复提示词到翻译内容中，翻译严禁出现错字漏字，错字漏字会被定义为失败，严禁任何失败。"""
         
     def load_api_config(self) -> Dict[str, Any]:
         """加载API配置"""
@@ -78,7 +84,18 @@ class ConfigManager:
                     config = json.load(f)
                     # 合并默认配置，确保所有字段都存在
                     merged_config = self.default_api_config.copy()
+                    
+                    # 确保 provider_keys 存在
+                    if "provider_keys" not in config:
+                        config["provider_keys"] = {"siliconflow": "", "deepseek": ""}
+                    
                     merged_config.update(config)
+                    
+                    # 同步当前提供商的密钥
+                    provider = merged_config.get("provider", "siliconflow")
+                    if provider in merged_config["provider_keys"]:
+                        merged_config["api_key"] = merged_config["provider_keys"][provider]
+                    
                     return merged_config
         except Exception as e:
             print(f"加载API配置失败: {e}")
@@ -88,6 +105,24 @@ class ConfigManager:
     def save_api_config(self, config: Dict[str, Any]) -> bool:
         """保存API配置"""
         try:
+            # 先加载现有配置，保留其他提供商的密钥
+            existing_config = self.load_api_config()
+            existing_provider_keys = existing_config.get("provider_keys", {"siliconflow": "", "deepseek": ""})
+            
+            # 确保 provider_keys 存在
+            if "provider_keys" not in config:
+                config["provider_keys"] = existing_provider_keys
+            else:
+                # 合并现有的 provider_keys，保留其他提供商的密钥
+                for provider_name in ["siliconflow", "deepseek"]:
+                    if provider_name in existing_provider_keys and provider_name not in config["provider_keys"]:
+                        config["provider_keys"][provider_name] = existing_provider_keys[provider_name]
+            
+            # 保存当前提供商的密钥到对应的位置
+            provider = config.get("provider", "siliconflow")
+            api_key = config.get("api_key", "")
+            config["provider_keys"][provider] = api_key
+            
             with open(self.api_config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
             self.api_config = config

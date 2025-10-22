@@ -1,23 +1,8 @@
-# 文档文件
-*.md
-*.docx
-*.pdf
-*.doc
-*.rtf
-
-# IDE和编辑器文件
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Python缓存文件
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
-# 分发/打包
 .Python
 build/
 develop-eggs/
@@ -31,6 +16,8 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -38,20 +25,73 @@ MANIFEST
 
 # PyInstaller
 *.manifest
+*.spec
 
-# 单元测试/覆盖率报告
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
 htmlcov/
 .tox/
+.nox/
 .coverage
 .coverage.*
 .cache
 nosetests.xml
 coverage.xml
 *.cover
+*.py,cover
 .hypothesis/
 .pytest_cache/
 
-# 环境变量
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
 .env
 .venv
 env/
@@ -60,14 +100,61 @@ ENV/
 env.bak/
 venv.bak/
 
-# 项目特定的排除项
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
 .cache/
 .codebuddy/
-.trae/
-dist.7z
-assets/
+.qoder/
+build/
+dist/
+*.exe
+*.app
+*.dmg
+*.pkg
 
-# 临时文件
+# Config files with sensitive data
+config/api_config.json
+config/user_config.json
+
+# Temporary files
 *.tmp
 *.temp
+*.bak
+*.backup
+
+# Log files
 *.log
+logs/

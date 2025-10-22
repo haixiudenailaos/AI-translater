@@ -8,17 +8,23 @@ import os
 from pathlib import Path
 from typing import Optional
 import chardet
+import re
+from html import unescape
 
 class FileHandler:
     def __init__(self):
         self.supported_encodings = ['utf-8', 'gbk', 'gb2312', 'utf-16']
         
     def read_file(self, file_path: str) -> str:
-        """读取文件内容，自动检测编码"""
+        """读取文件内容，自动检测编码，支持EPUB格式"""
         try:
             file_path = Path(file_path)
             
-            # 读取文件字节内容
+            # 检查是否为EPUB文件
+            if file_path.suffix.lower() == '.epub':
+                return self._read_epub_file(file_path)
+            
+            # 读取普通文件字节内容
             with open(file_path, 'rb') as f:
                 raw_data = f.read()
                 
@@ -48,6 +54,61 @@ class FileHandler:
                 
         except Exception as e:
             raise Exception(f"读取文件失败: {str(e)}")
+            
+    def _read_epub_file(self, file_path: Path) -> str:
+        """读取EPUB文件内容，提取纯文本，支持多语言编码"""
+        try:
+            import ebooklib
+            from ebooklib import epub
+            from bs4 import BeautifulSoup
+        except ImportError:
+            raise Exception("需要安装ebooklib和beautifulsoup4库来支持EPUB文件")
+            
+        try:
+            # 读取EPUB文件
+            book = epub.read_epub(str(file_path))
+            
+            # 存储所有文本内容
+            text_content = []
+            
+            # 获取所有文档项目
+            for item in book.get_items():
+                if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                    # 获取HTML内容
+                    html_content = item.get_content().decode('utf-8', errors='ignore')
+                    
+                    # 使用BeautifulSoup解析HTML
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    
+                    # 移除脚本和样式标签
+                    for script in soup(["script", "style"]):
+                        script.decompose()
+                    
+                    # 提取纯文本
+                    text = soup.get_text()
+                    
+                    # 清理文本：移除多余的空白字符
+                    text = re.sub(r'\n\s*\n', '\n\n', text)  # 合并多个空行
+                    text = re.sub(r'[ \t]+', ' ', text)      # 合并多个空格
+                    text = text.strip()
+                    
+                    if text:
+                        text_content.append(text)
+            
+            # 合并所有文本内容
+            full_text = '\n\n'.join(text_content)
+            
+            # HTML实体解码，确保特殊字符正确显示
+            full_text = unescape(full_text)
+            
+            # 确保返回的文本是UTF-8编码
+            if isinstance(full_text, bytes):
+                full_text = full_text.decode('utf-8', errors='ignore')
+            
+            return full_text
+            
+        except Exception as e:
+            raise Exception(f"读取EPUB文件失败: {str(e)}")
             
     def write_file(self, file_path: str, content: str, encoding: str = 'utf-8') -> bool:
         """保存文件内容"""
@@ -133,7 +194,7 @@ class FileHandler:
             
     def _is_text_file(self, file_path: Path) -> bool:
         """判断是否为文本文件"""
-        text_extensions = {'.txt', '.md', '.py', '.js', '.html', '.css', '.json', '.xml', '.csv'}
+        text_extensions = {'.txt', '.md', '.py', '.js', '.html', '.css', '.json', '.xml', '.csv', '.epub'}
         
         if file_path.suffix.lower() in text_extensions:
             return True

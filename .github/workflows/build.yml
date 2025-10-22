@@ -1,0 +1,147 @@
+name: 跨平台构建
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  create:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - release
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            artifact_name: 轻小说翻译器V1.1-Windows-x64.exe
+            executable_name: 轻小说翻译器V1.1.exe
+          - os: macos-latest
+            platform: macos
+            artifact_name: 轻小说翻译器V1.1-macOS-Universal.app
+            executable_name: 轻小说翻译器V1.1.app
+          - os: ubuntu-latest
+            platform: linux
+            artifact_name: 轻小说翻译器V1.1-Linux-x64
+            executable_name: 轻小说翻译器V1.1
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 设置Python环境
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: 安装系统依赖 (Linux)
+      if: matrix.platform == 'linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-tk
+
+    - name: 安装Python依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+        pip install -r requirements.txt
+
+    - name: 验证依赖安装
+      run: |
+        python -c "import tkinter; print('tkinter OK')"
+        python -c "import httpx; print('httpx OK')"
+        python -c "import ebooklib; print('ebooklib OK')"
+        python -c "import bs4; print('beautifulsoup4 OK')"
+        python -c "import chardet; print('chardet OK')"
+
+    - name: 构建应用程序
+      run: |
+        pyinstaller translator.spec
+
+    - name: 验证构建结果 (Windows)
+      if: matrix.platform == 'windows'
+      run: |
+        if (Test-Path "dist/${{ matrix.executable_name }}") {
+          Write-Host "构建成功: dist/${{ matrix.executable_name }}"
+          Get-ChildItem dist/
+        } else {
+          Write-Error "构建失败: 找不到可执行文件"
+          exit 1
+        }
+
+    - name: 验证构建结果 (macOS/Linux)
+      if: matrix.platform != 'windows'
+      run: |
+        if [ -e "dist/${{ matrix.executable_name }}" ]; then
+          echo "构建成功: dist/${{ matrix.executable_name }}"
+          ls -la dist/
+        else
+          echo "构建失败: 找不到可执行文件"
+          exit 1
+        fi
+
+    - name: 重命名构建产物
+      shell: bash
+      run: |
+        cd dist
+        if [ "${{ matrix.platform }}" = "windows" ]; then
+          mv "${{ matrix.executable_name }}" "${{ matrix.artifact_name }}"
+        elif [ "${{ matrix.platform }}" = "macos" ]; then
+          # 对于macOS，创建.dmg文件
+          if [ -d "${{ matrix.executable_name }}" ]; then
+            hdiutil create -volname "轻小说翻译器V1.1" -srcfolder "${{ matrix.executable_name }}" -ov -format UDZO "${{ matrix.artifact_name }}.dmg"
+            mv "${{ matrix.artifact_name }}.dmg" "${{ matrix.artifact_name }}"
+          else
+            mv "${{ matrix.executable_name }}" "${{ matrix.artifact_name }}"
+          fi
+        else
+          mv "${{ matrix.executable_name }}" "${{ matrix.artifact_name }}"
+        fi
+
+    - name: 上传构建产物
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: dist/${{ matrix.artifact_name }}
+        retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 下载所有构建产物
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: 创建发布
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/轻小说翻译器V1.1-Windows-x64.exe/轻小说翻译器V1.1-Windows-x64.exe
+          artifacts/轻小说翻译器V1.1-macOS-Universal.app/轻小说翻译器V1.1-macOS-Universal.app
+          artifacts/轻小说翻译器V1.1-Linux-x64/轻小说翻译器V1.1-Linux-x64
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

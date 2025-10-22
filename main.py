@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-轻量级Python翻译工具
+轻小说翻译器V1.1
 主程序入口
 """
 
@@ -25,7 +25,7 @@ class TranslatorApp:
         
     def setup_app(self):
         """设置应用程序基本配置"""
-        self.root.title("轻量级Python翻译工具 v1.0")
+        self.root.title("轻小说翻译器V1.1")
         self.root.geometry("1000x700")
         self.root.minsize(800, 600)
         
