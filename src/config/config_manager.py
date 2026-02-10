@@ -32,6 +32,14 @@ class ConfigManager:
             "provider_keys": {
                 "siliconflow": "",
                 "deepseek": ""
+            },
+            "image_translation": {
+                "provider": "volcengine",
+                "api_key": "",
+                "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                "model_name": "doubao-seedream-4-5-251128",
+                "response_format": "url",
+                "size": "2K"
             }
         }
         
@@ -88,6 +96,9 @@ class ConfigManager:
                     # 确保 provider_keys 存在
                     if "provider_keys" not in config:
                         config["provider_keys"] = {"siliconflow": "", "deepseek": ""}
+
+                    if "image_translation" not in config:
+                        config["image_translation"] = self.default_api_config["image_translation"].copy()
                     
                     merged_config.update(config)
                     
@@ -108,6 +119,7 @@ class ConfigManager:
             # 先加载现有配置，保留其他提供商的密钥
             existing_config = self.load_api_config()
             existing_provider_keys = existing_config.get("provider_keys", {"siliconflow": "", "deepseek": ""})
+            existing_image_config = existing_config.get("image_translation", self.default_api_config["image_translation"].copy())
             
             # 确保 provider_keys 存在
             if "provider_keys" not in config:
@@ -117,6 +129,11 @@ class ConfigManager:
                 for provider_name in ["siliconflow", "deepseek"]:
                     if provider_name in existing_provider_keys and provider_name not in config["provider_keys"]:
                         config["provider_keys"][provider_name] = existing_provider_keys[provider_name]
+
+            image_translation = config.get("image_translation", {})
+            merged_image_translation = existing_image_config.copy()
+            merged_image_translation.update(image_translation)
+            config["image_translation"] = merged_image_translation
             
             # 保存当前提供商的密钥到对应的位置
             provider = config.get("provider", "siliconflow")
