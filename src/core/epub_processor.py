@@ -9,14 +9,19 @@ EPUB解析与映射生成模块
 """
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import json
 import base64
 import datetime
 
+from .image_translator import ImageTranslator
+
 
 class EPUBProcessor:
     BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "caption", "figcaption"}
+
+    def __init__(self, config_manager: Optional[object] = None):
+        self.config_manager = config_manager
 
     @staticmethod
     def _normalize_chapter_id(name: str) -> str:
@@ -294,6 +299,9 @@ class EPUBProcessor:
                         images_mapping[name] = {
                             "original_path": name,
                             "base64_data": f"data:{mime};base64,{b64}",
+                            "translated_base64_data": "",
+                            "ocr_text": "",
+                            "translation_status": "pending",
                             "mime_type": mime,
                             "file_size": len(data)
                         }
@@ -428,6 +436,32 @@ class EPUBProcessor:
         obj["project_info"]["updated_at"] = now
         md.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _resolve_image_mapping(self, image_mappings: Dict[str, Dict], name: str) -> Optional[Dict]:
+        """根据EPUB资源名称匹配 images.json 中的映射。"""
+        if name in image_mappings:
+            return image_mappings[name]
+
+        normalized = name.replace("\\", "/")
+        for key, value in image_mappings.items():
+            k = key.replace("\\", "/")
+            if k == normalized or k.endswith("/" + normalized) or normalized.endswith("/" + k):
+                return value
+            if Path(k).name == Path(normalized).name:
+                return value
+        return None
+
+    def _translate_images_if_needed(self, mapping_dir: str) -> Dict[str, int]:
+        """执行图片OCR和翻译；未配置图片API Key时自动跳过。"""
+        if not self.config_manager:
+            return {"total": 0, "translated": 0, "skipped": 0, "failed": 0}
+
+        api_config = self.config_manager.get_api_config()
+        app_config = self.config_manager.get_app_config()
+        target_language = app_config.get("target_language", "中文")
+
+        image_translator = ImageTranslator(api_config, target_language=target_language)
+        return image_translator.translate_images_in_mapping(mapping_dir)
+
     def export_epub(self, mapping_dir: str, output_path: str) -> str:
         """根据mapping重建并导出EPUB（保留原结构与样式，文本替换为译文）。
 
@@ -461,6 +495,10 @@ class EPUBProcessor:
 
         # 加载原书以保留结构
         book = epub.read_epub(str(original_file))
+
+        image_stats = self._translate_images_if_needed(str(mapping_dir_p))
+        if image_stats.get("total", 0) > 0:
+            print(f"图片处理完成：总计{image_stats['total']}，翻译{image_stats['translated']}，跳过{image_stats['skipped']}，失败{image_stats['failed']}")
 
         # 构造按line_number排序的译文列表（关键：严格按line_number从1开始排序）
         sorted_items = sorted(items.items(), key=lambda x: x[1].get("line_number", 999999))
@@ -551,6 +589,29 @@ class EPUBProcessor:
                             pass
                 except Exception as e:
                     print(f"⚠ 警告：处理文档时出错: {e}")
+                    continue
+
+        images_file = mapping_dir_p / "images.json"
+        image_mappings = {}
+        if images_file.exists():
+            try:
+                image_mappings = json.loads(images_file.read_text(encoding="utf-8")).get("image_mappings", {})
+            except Exception:
+                image_mappings = {}
+
+        for item in book.get_items():
+            if item.get_type() == ebooklib.ITEM_IMAGE:
+                name = getattr(item, "file_name", None) or getattr(item, "href", None) or item.get_name()
+                image_meta = self._resolve_image_mapping(image_mappings, name)
+                if not image_meta:
+                    continue
+                translated_data = image_meta.get("translated_base64_data", "")
+                if not translated_data or "," not in translated_data:
+                    continue
+                try:
+                    _, translated_b64 = translated_data.split(",", 1)
+                    item.set_content(base64.b64decode(translated_b64))
+                except Exception:
                     continue
 
         # 输出路径

@@ -36,7 +36,7 @@ class SettingsWindow:
         # 创建设置窗口
         self.window = tk.Toplevel(parent)
         self.window.title("设置")
-        self.window.geometry("500x600")
+        self.window.geometry("560x700")
         self.window.resizable(False, False)
         self.window.transient(parent)
         self.window.grab_set()
@@ -47,15 +47,16 @@ class SettingsWindow:
         # 加载当前配置
         self.api_config = config_manager.get_api_config()
         self.app_config = config_manager.get_app_config()
+        self.image_config = self.api_config.get("image_translation", {})
         
         self.setup_ui()
         
     def center_window(self):
         """窗口居中显示"""
         self.window.update_idletasks()
-        x = (self.window.winfo_screenwidth() // 2) - (500 // 2)
-        y = (self.window.winfo_screenheight() // 2) - (600 // 2)
-        self.window.geometry(f"500x600+{x}+{y}")
+        x = (self.window.winfo_screenwidth() // 2) - (560 // 2)
+        y = (self.window.winfo_screenheight() // 2) - (700 // 2)
+        self.window.geometry(f"560x700+{x}+{y}")
         
     def setup_ui(self):
         """设置界面"""
@@ -166,6 +167,23 @@ class SettingsWindow:
         self.temp_label = ttk.Label(api_frame, text=f"{self.temperature_var.get():.1f}")
         self.temp_label.grid(row=5, column=2, padx=5, pady=10)
         temperature_scale.configure(command=self.update_temperature_label)
+
+        ttk.Separator(api_frame, orient=tk.HORIZONTAL).grid(row=6, column=0, columnspan=3, sticky="ew", padx=10, pady=(15, 8))
+        ttk.Label(api_frame, text="图片翻译（火山引擎）", font=('TkDefaultFont', 9, 'bold')).grid(row=7, column=0, columnspan=3, sticky=tk.W, padx=10)
+
+        ttk.Label(api_frame, text="图片API Key:").grid(row=8, column=0, sticky=tk.W, padx=10, pady=8)
+        self.image_api_key_var = tk.StringVar(value=self.image_config.get("api_key", ""))
+        ttk.Entry(api_frame, textvariable=self.image_api_key_var, show="*", width=35).grid(row=8, column=1, padx=10, pady=8)
+
+        ttk.Label(api_frame, text="图片模型名称:").grid(row=9, column=0, sticky=tk.W, padx=10, pady=8)
+        self.image_model_var = tk.StringVar(value=self.image_config.get("model_name", "doubao-seedream-4-5-251128"))
+        ttk.Entry(api_frame, textvariable=self.image_model_var, width=35).grid(row=9, column=1, padx=10, pady=8)
+
+        ttk.Label(api_frame, text="图片API Base URL:").grid(row=10, column=0, sticky=tk.W, padx=10, pady=8)
+        self.image_base_url_var = tk.StringVar(value=self.image_config.get("base_url", "https://ark.cn-beijing.volces.com/api/v3"))
+        ttk.Entry(api_frame, textvariable=self.image_base_url_var, width=35).grid(row=10, column=1, padx=10, pady=8)
+
+        ttk.Label(api_frame, text="未填写图片API Key时将自动跳过图片翻译", foreground="#666").grid(row=11, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(0, 8))
         
     def create_translation_tab(self, notebook):
         """创建翻译设置页面"""
@@ -322,7 +340,15 @@ class SettingsWindow:
                 "base_url": self.base_url_var.get(),
                 "model_name": actual_model,
                 "max_tokens": self.max_tokens_var.get(),
-                "temperature": self.temperature_var.get()
+                "temperature": self.temperature_var.get(),
+                "image_translation": {
+                    "provider": "volcengine",
+                    "api_key": self.image_api_key_var.get().strip(),
+                    "base_url": self.image_base_url_var.get().strip(),
+                    "model_name": self.image_model_var.get().strip() or "doubao-seedream-4-5-251128",
+                    "response_format": "url",
+                    "size": "2K"
+                }
             }
             
             # 更新应用配置

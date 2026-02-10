@@ -22,7 +22,7 @@ class MainWindow:
         self.config_manager = config_manager
         self.translator = TranslatorEngine(config_manager)
         self.file_handler = FileHandler()
-        self.epub_processor = EPUBProcessor()
+        self.epub_processor = EPUBProcessor(config_manager)
         
         # 当前会话的原文/译文文件路径
         self.current_source_path = None

@@ -1,4 +1,4 @@
-# 轻小说翻译器 V1.1
+# 轻小说翻译器 V1.2
 
 一个基于Python和tkinter的轻小说翻译工具，支持EPUB格式文件的批量翻译处理。
 
@@ -11,6 +11,7 @@
 - 📖 **术语表管理**: 自定义术语翻译，保持翻译一致性
 - 🎨 **图形界面**: 直观的tkinter GUI界面
 - ⚙️ **配置管理**: 灵活的API配置和应用设置
+- 🖼️ **图片智能翻译**: 本地OCR检测图片文字，有文字才调用火山引擎翻译，无文字自动跳过
 
 ## 🚀 快速开始
 
@@ -50,15 +51,19 @@ python main.py
 
 ```json
 {
-  "deepseek": {
-    "api_key": "your_deepseek_api_key",
-    "base_url": "https://api.deepseek.com",
-    "model": "deepseek-chat"
+  "provider": "siliconflow",
+  "api_key": "your_text_api_key_here",
+  "model_name": "deepseek-ai/DeepSeek-V3.1",
+  "base_url": "https://api.siliconflow.cn/v1",
+  "provider_keys": {
+    "siliconflow": "your_siliconflow_api_key",
+    "deepseek": "your_deepseek_api_key"
   },
-  "siliconflow": {
-    "api_key": "your_siliconflow_api_key",
-    "base_url": "https://api.siliconflow.cn/v1",
-    "model": "deepseek-ai/DeepSeek-V2.5"
+  "image_translation": {
+    "provider": "volcengine",
+    "api_key": "your_volcengine_image_api_key_or_empty",
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "model_name": "doubao-seedream-4-5-251128"
   }
 }
 ```
@@ -97,7 +102,7 @@ python main.py
 ## 🏗️ 项目结构
 
 ```
-轻小说翻译原代码V1.1/
+轻小说翻译原代码V1.2/
 ├── main.py                 # 主程序入口
 ├── requirements.txt        # Python依赖
 ├── translator.spec         # PyInstaller配置
