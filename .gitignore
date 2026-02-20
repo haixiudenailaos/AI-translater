@@ -160,3 +160,4 @@ config/api_presets.json
 # Log files
 *.log
 logs/
+V1.3/

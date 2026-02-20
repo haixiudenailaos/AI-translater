@@ -45,6 +45,7 @@ a = Analysis(
         'chardet',
         'requests',
         'aiohttp',
+        'openai',
         'tkinter',
         'tkinter.ttk',
         'tkinter.messagebox',

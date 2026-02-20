@@ -421,12 +421,20 @@ class MainWindow:
         # 中间进度条
         middle_control = ttk.Frame(control_frame)
         middle_control.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(20, 20))
-        
-        ttk.Label(middle_control, text="翻译进度:").pack(side=tk.LEFT)
+
+        ttk.Label(middle_control, text="文本翻译:").pack(side=tk.LEFT)
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(middle_control, variable=self.progress_var, 
+        self.progress_bar = ttk.Progressbar(middle_control, variable=self.progress_var,
                                            maximum=100, length=200)
         self.progress_bar.pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
+
+        # 分隔符
+        ttk.Label(middle_control, text=" | ").pack(side=tk.LEFT)
+
+        # 图片翻译指示器
+        ttk.Label(middle_control, text="图片翻译:").pack(side=tk.LEFT)
+        self.image_progress_label = ttk.Label(middle_control, text="待机")
+        self.image_progress_label.pack(side=tk.LEFT, padx=(5, 0))
         
         # 底部居中“支持作者”按钮
         support_center = ttk.Frame(parent)
@@ -807,6 +815,7 @@ class MainWindow:
         try:
             # 更新状态
             self.root.after(0, lambda: self.update_status("正在启动插图翻译..."))
+            self.root.after(0, lambda: self.update_image_progress("翻译中..."))
             
             mapping_dir = str(self.current_mapping_dir)
             target_lang = self.config_manager.get_app_config().get("target_language", "中文")
@@ -815,6 +824,7 @@ class MainWindow:
                 translator = ImageTranslator(self.config_manager)
                 
                 def progress_cb(success, total, current):
+                    self.root.after(0, lambda: self.update_image_progress(f"{success}/{total}"))
                     self.root.after(0, lambda: self.update_status(f"插图翻译进度: {success}/{total}"))
                 
                 return await translator.translate_images(mapping_dir, target_lang, progress_cb)
@@ -833,12 +843,15 @@ class MainWindow:
                 
                 count = len(result_map)
                 self.root.after(0, lambda: self.update_status(f"插图翻译完成: {count} 张图片"))
+                self.root.after(0, lambda: self.update_image_progress(f"完成({count}张)"))
             else:
                 self.root.after(0, lambda: self.update_status("插图翻译完成: 无图片处理"))
-                
+                self.root.after(0, lambda: self.update_image_progress("完成(0张)"))
+
         except Exception as e:
             print(f"插图翻译出错: {e}")
             self.root.after(0, lambda: self.update_status(f"插图翻译出错: {str(e)}"))
+            self.root.after(0, lambda: self.update_image_progress("出错"))
 
     def start_image_translation(self):
         """独立的图片翻译入口：弹出选择对话框"""
@@ -925,6 +938,7 @@ class MainWindow:
             return
 
         self.update_status("正在启动智能图片翻译（检测+插图翻译）...")
+        self.update_image_progress("翻译中...")
         worker_thread = threading.Thread(
             target=self._image_text_translation_worker, daemon=True
         )
@@ -945,6 +959,7 @@ class MainWindow:
                 self.root.after(0, lambda: self.update_status(
                     f"图片处理: {current}/{total} - {name}"
                 ))
+                self.root.after(0, lambda c=current, t=total: self.update_image_progress(f"{c}/{t}"))
 
             result_map = translator.process_all_images(
                 str(self.current_mapping_dir), target_lang, progress_cb
@@ -954,6 +969,7 @@ class MainWindow:
             self.root.after(0, lambda: self.update_status(
                 f"图片翻译完成: {count} 张图片已生成翻译图片"
             ))
+            self.root.after(0, lambda: self.update_image_progress(f"完成({count}张)"))
             if count > 0:
                 self.root.after(0, lambda: messagebox.showinfo(
                     "图片翻译",
@@ -968,6 +984,7 @@ class MainWindow:
         except Exception as e:
             print(f"图片翻译出错: {e}")
             self.root.after(0, lambda: self.update_status(f"图片翻译出错: {str(e)}"))
+            self.root.after(0, lambda: self.update_image_progress("出错"))
 
     def continue_translation(self):
         """继续翻译（修复：智能检查空译文行，确保完整翻译）
@@ -1574,6 +1591,10 @@ class MainWindow:
         else:
             self.api_status_label.config(text="API: 未配置")
             
+    def update_image_progress(self, text):
+        """更新图片翻译指示器"""
+        self.image_progress_label.config(text=text)
+
     def update_status(self, message):
         """更新状态栏"""
         self.status_label.config(text=message)

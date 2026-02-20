@@ -72,6 +72,7 @@ jobs:
         python -c "import chardet; print('chardet OK')"
         python -c "import lxml; print('lxml OK')"
         python -c "import PIL; print('Pillow OK')"
+        python -c "import openai; print('openai OK')"
 
     - name: 构建应用程序
       run: |
