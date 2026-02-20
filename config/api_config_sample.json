@@ -1,0 +1,8 @@
+{
+  "provider": "siliconflow",
+  "api_key": "your_api_key_here",
+  "model_name": "deepseek-ai/DeepSeek-V3.1",
+  "base_url": "https://api.siliconflow.cn/v1",
+  "max_tokens": 4000,
+  "temperature": 0.3
+}
