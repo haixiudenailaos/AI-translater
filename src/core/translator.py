@@ -18,7 +18,11 @@ class TranslatorEngine:
         self.config_manager = config_manager
         self.api = None
         self.is_stopped = False
-        
+
+        # 暂停/恢复支持
+        self.pause_event = threading.Event()
+        self.pause_event.set()  # 默认不暂停
+
         # 延迟初始化API与正则（按需构建）
         self._re_many_newlines = None
         # 不在构造时初始化 API，首次使用时再构建
@@ -75,38 +79,43 @@ class TranslatorEngine:
                 # 检查是否停止
                 if self.is_stopped:
                     break
-                
+
+                # 暂停检查：阻塞直到恢复
+                self.pause_event.wait()
+                if self.is_stopped:
+                    break
+
                 # 获取当前批次的原文行
                 batch_end = min(batch_start + batch_lines, total_lines)
                 batch_source_lines = lines[batch_start:batch_end]
-                
+
                 # 翻译当前批次（使用流式输出，传递总行数用于进度计算）
                 batch_translated_lines = self._translate_batch(
-                    batch_source_lines, 
-                    progress_callback, 
+                    batch_source_lines,
+                    progress_callback,
                     batch_start,
                     total_lines  # ✅ 传递总行数
                 )
-                
+
                 # 计算总进度
                 overall_progress = (batch_end / total_lines) * 100
-                
+
                 # 回调：传递批次翻译完成的结果
                 progress_callback(overall_progress, {
                     'batch_start': batch_start,
                     'translated_lines': batch_translated_lines,
                     'streaming': False  # 标记为批次完成
                 })
-                
+
                 # 短暂延迟
                 time.sleep(0.1)
-            
+
             if not self.is_stopped:
                 complete_callback()
-                
+
         except Exception as e:
             raise e
-            
+
     def translate_fast_mode(self, content: str, progress_callback: Callable, complete_callback: Callable):
         """快速翻译模式（重构：分批翻译 + 流式输出）
         
@@ -131,7 +140,12 @@ class TranslatorEngine:
                 # 检查是否停止
                 if self.is_stopped:
                     break
-                
+
+                # 暂停检查：阻塞直到恢复
+                self.pause_event.wait()
+                if self.is_stopped:
+                    break
+
                 # 获取当前批次的原文行
                 batch_end = min(batch_start + batch_lines, total_lines)
                 batch_source_lines = lines[batch_start:batch_end]
@@ -352,13 +366,23 @@ class TranslatorEngine:
     def stop(self):
         """停止翻译"""
         self.is_stopped = True
+        self.pause_event.set()  # 确保不卡在暂停状态
         # 取消所有正在进行的API请求
         if self.api:
             self.api.cancel_requests()
-        
+
+    def pause(self):
+        """暂停翻译（在批次间生效）"""
+        self.pause_event.clear()
+
+    def resume(self):
+        """恢复翻译"""
+        self.pause_event.set()
+
     def reset(self):
         """重置状态"""
         self.is_stopped = False
+        self.pause_event.set()  # 重置暂停状态
         # 重置API取消状态
         if self.api:
             self.api.reset_cancel()

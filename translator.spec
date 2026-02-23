@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-轻小说翻译器V1.3 - PyInstaller 规格文件
+轻小说翻译器V1.4 - PyInstaller 规格文件
 """
 
 import sys
@@ -71,7 +71,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='轻小说翻译器V1.3',
+    name='轻小说翻译器V1.4',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

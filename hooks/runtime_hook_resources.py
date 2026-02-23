@@ -22,7 +22,7 @@ def setup_resource_paths():
             
             # 确保config目录存在于可写位置
             # 使用用户目录而不是临时目录
-            user_config_dir = Path.home() / ".轻小说翻译器V1.3" / "config"
+            user_config_dir = Path.home() / ".轻小说翻译器V1.4" / "config"
             user_config_dir.mkdir(parents=True, exist_ok=True)
             
             # 如果用户配置目录为空，从打包资源复制默认配置

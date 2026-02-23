@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .settings_window import SettingsWindow
 from .glossary_window import GlossaryWindow
+from .concurrent_window import ConcurrentWindow
 from ..core.translator import TranslatorEngine
 from ..utils.file_handler import FileHandler
 from ..core.epub_processor import EPUBProcessor
@@ -93,7 +94,9 @@ class MainWindow:
         right_frame = ttk.Frame(toolbar_frame)
         right_frame.pack(side=tk.RIGHT)
         
-        ttk.Button(right_frame, text="📚 术语库", 
+        ttk.Button(right_frame, text="📋 并发翻译",
+                  command=self.open_concurrent).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(right_frame, text="📚 术语库",
                   command=self.open_glossary).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(right_frame, text="⚙️ 设置", 
                   command=self.open_settings).pack(side=tk.RIGHT, padx=(5, 0))
@@ -1547,6 +1550,10 @@ class MainWindow:
     def open_glossary(self):
         """打开术语库窗口"""
         GlossaryWindow(self.root, self.config_manager)
+
+    def open_concurrent(self):
+        """打开并发翻译管理窗口"""
+        ConcurrentWindow(self.root, self.config_manager)
 
     def open_support_dialog(self):
         """支持作者弹窗：展示邮箱与捐助二维码（微信/支付宝）"""
