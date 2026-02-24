@@ -14,10 +14,10 @@ import json
 import base64
 import datetime
 import logging
+from ..utils.logger import get_logger
 
 
-logging.basicConfig(level=logging.DEBUG, format='[DEBUG] %(message)s')
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class EPUBProcessor:

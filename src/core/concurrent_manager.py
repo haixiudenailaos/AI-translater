@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from .translator import TranslatorEngine
 from ..utils.file_handler import FileHandler
 from .epub_processor import EPUBProcessor
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -37,12 +40,14 @@ class ConcurrentTranslationManager:
         self.config_manager = config_manager
         self.max_concurrent = max_concurrent
         self.tasks: Dict[str, TranslationTask] = {}
+        self._lock = threading.Lock()  # 保护 tasks/engines/threads 的读写
         self._engines: Dict[str, TranslatorEngine] = {}
         self._threads: Dict[str, threading.Thread] = {}
         self._semaphore = threading.Semaphore(max_concurrent)
         self._progress_callback: Optional[Callable] = None
         self._file_handler = FileHandler()
         self._epub_processor = EPUBProcessor()
+
     def set_progress_callback(self, callback: Callable):
         """设置UI进度回调"""
         self._progress_callback = callback
@@ -75,93 +80,108 @@ class ConcurrentTranslationManager:
             task.source_lines = content.splitlines()
             task.target_lines = [""] * len(task.source_lines)
 
-        self.tasks[task_id] = task
+        with self._lock:
+            self.tasks[task_id] = task
         return task
 
     def start_task(self, task_id: str):
         """启动单个任务"""
-        task = self.tasks.get(task_id)
-        if not task or task.status in ("running", "completed"):
-            return
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if not task or task.status in ("running", "completed"):
+                return
+            task.status = "running"
+            task.error_message = None
 
-        task.status = "running"
-        task.error_message = None
+            engine = TranslatorEngine(self.config_manager)
+            self._engines[task_id] = engine
 
-        engine = TranslatorEngine(self.config_manager)
-        self._engines[task_id] = engine
-
-        t = threading.Thread(
-            target=self._run_task, args=(task_id,), daemon=True
-        )
-        self._threads[task_id] = t
+            t = threading.Thread(
+                target=self._run_task, args=(task_id,), daemon=True
+            )
+            self._threads[task_id] = t
         t.start()
 
     def pause_task(self, task_id: str):
         """暂停单个任务"""
-        task = self.tasks.get(task_id)
-        if not task or task.status != "running":
-            return
-        engine = self._engines.get(task_id)
-        if engine:
-            engine.pause()
-        task.status = "paused"
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if not task or task.status != "running":
+                return
+            engine = self._engines.get(task_id)
+            if engine:
+                engine.pause()
+            task.status = "paused"
         self._notify_progress(task_id)
+
     def resume_task(self, task_id: str):
         """恢复暂停的任务"""
-        task = self.tasks.get(task_id)
-        if not task or task.status != "paused":
-            return
-        engine = self._engines.get(task_id)
-        if engine:
-            engine.resume()
-        task.status = "running"
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if not task or task.status != "paused":
+                return
+            engine = self._engines.get(task_id)
+            if engine:
+                engine.resume()
+            task.status = "running"
         self._notify_progress(task_id)
 
     def cancel_task(self, task_id: str):
         """取消任务"""
-        task = self.tasks.get(task_id)
-        if not task or task.status in ("completed", "cancelled"):
-            return
-        engine = self._engines.get(task_id)
-        if engine:
-            engine.stop()
-        task.status = "cancelled"
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if not task or task.status in ("completed", "cancelled"):
+                return
+            engine = self._engines.get(task_id)
+            if engine:
+                engine.stop()
+            task.status = "cancelled"
         self._notify_progress(task_id)
 
     def start_all(self):
         """一键开始所有pending/paused任务"""
-        for task_id, task in self.tasks.items():
-            if task.status == "paused":
+        with self._lock:
+            task_ids = list(self.tasks.keys())
+        for task_id in task_ids:
+            task = self.get_task(task_id)
+            if task and task.status == "paused":
                 self.resume_task(task_id)
-            elif task.status == "pending":
+            elif task and task.status == "pending":
                 self.start_task(task_id)
 
     def pause_all(self):
         """一键暂停所有running任务"""
-        for task_id, task in list(self.tasks.items()):
-            if task.status == "running":
-                self.pause_task(task_id)
+        with self._lock:
+            items = [(tid, t.status) for tid, t in self.tasks.items()]
+        for tid, status in items:
+            if status == "running":
+                self.pause_task(tid)
 
     def cancel_all(self):
         """一键取消所有非completed任务"""
-        for task_id, task in list(self.tasks.items()):
-            if task.status not in ("completed", "cancelled"):
-                self.cancel_task(task_id)
+        with self._lock:
+            items = [(tid, t.status) for tid, t in self.tasks.items()]
+        for tid, status in items:
+            if status not in ("completed", "cancelled"):
+                self.cancel_task(tid)
 
     def get_task(self, task_id: str) -> Optional[TranslationTask]:
-        return self.tasks.get(task_id)
+        with self._lock:
+            return self.tasks.get(task_id)
 
     def get_all_tasks(self) -> List[TranslationTask]:
-        return list(self.tasks.values())
+        with self._lock:
+            return list(self.tasks.values())
 
     def remove_task(self, task_id: str):
         """移除任务（仅限非running状态）"""
-        task = self.tasks.get(task_id)
-        if not task or task.status == "running":
-            return
-        self.tasks.pop(task_id, None)
-        self._engines.pop(task_id, None)
-        self._threads.pop(task_id, None)
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if not task or task.status == "running":
+                return
+            self.tasks.pop(task_id, None)
+            self._engines.pop(task_id, None)
+            self._threads.pop(task_id, None)
 
     def _notify_progress(self, task_id: str):
         """通知UI更新"""
@@ -230,4 +250,4 @@ class ConcurrentTranslationManager:
                 content = "\n".join(task.target_lines)
                 self._file_handler.write_file(str(tgt_path), content)
         except Exception as e:
-            print(f"保存任务结果失败: {e}")
+            logger.error("保存任务结果失败: %s", e)

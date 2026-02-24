@@ -161,3 +161,6 @@ config/api_presets.json
 *.log
 logs/
 V1.3/
+V1.4/
+workspace/
+.claude/

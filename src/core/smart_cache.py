@@ -16,13 +16,10 @@ class SmartCache:
     def __init__(
         self,
         max_memory_size: int = 1000,
-        max_file_size: int = 10000,  # 预留参数，不做文件缓存
-        cache_dir: Optional[str] = None,  # 预留参数
         ttl_hours: int = 24,
+        **_kwargs,
     ):
         self.max_memory_size = max_memory_size
-        self.max_file_size = max_file_size
-        self.cache_dir = cache_dir
         self.ttl_seconds = ttl_hours * 3600
 
         self._store: Dict[str, Dict[str, Any]] = {}

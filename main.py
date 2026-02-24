@@ -13,6 +13,11 @@ import os
 from pathlib import Path
 import sys
 
+# 初始化日志（必须在其他模块导入前）
+from src.utils.logger import setup_logging, get_logger
+setup_logging()
+logger = get_logger(__name__)
+
 # 导入自定义模块
 from src.ui.main_window import MainWindow
 from src.config.config_manager import ConfigManager
@@ -49,7 +54,7 @@ class TranslatorApp:
             self.config_manager.save_config()
             self.root.destroy()
         except Exception as e:
-            print(f"关闭应用时出错: {e}")
+            logger.error("关闭应用时出错: %s", e)
             self.root.destroy()
             
     def run(self):

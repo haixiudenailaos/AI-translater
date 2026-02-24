@@ -10,6 +10,9 @@ from typing import Optional
 import chardet
 import re
 from html import unescape
+from .logger import get_logger
+
+logger = get_logger(__name__)
 
 class FileHandler:
     def __init__(self):
@@ -125,13 +128,9 @@ class FileHandler:
             return True
             
         except Exception as e:
-            print(f"保存文件失败: {e}")
+            logger.error("保存文件失败: %s", e)
             return False
 
-    def save_file(self, file_path: str, content: str, encoding: str = 'utf-8') -> bool:
-        """兼容旧调用：保存文件内容，委托到 write_file"""
-        return self.write_file(file_path, content, encoding)
-            
     def create_comparison_file(self, source_content: str, target_content: str) -> str:
         """创建原文译文对照文件"""
         source_lines = source_content.split('\n')
@@ -242,5 +241,5 @@ class FileHandler:
             return str(backup_path)
             
         except Exception as e:
-            print(f"备份文件失败: {e}")
+            logger.error("备份文件失败: %s", e)
             return None

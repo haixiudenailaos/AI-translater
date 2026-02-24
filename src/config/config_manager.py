@@ -9,6 +9,9 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 class ConfigManager:
     def __init__(self):
@@ -102,8 +105,8 @@ class ConfigManager:
                     
                     return merged_config
         except Exception as e:
-            print(f"加载API配置失败: {e}")
-            
+            logger.error("加载API配置失败: %s", e)
+
         return self.default_api_config.copy()
         
     def save_api_config(self, config: Dict[str, Any]) -> bool:
@@ -132,7 +135,7 @@ class ConfigManager:
             self.api_config = config
             return True
         except Exception as e:
-            print(f"保存API配置失败: {e}")
+            logger.error("保存API配置失败: %s", e)
             return False
             
     def load_app_config(self) -> Dict[str, Any]:
@@ -145,8 +148,8 @@ class ConfigManager:
                     merged_config.update(config)
                     return merged_config
         except Exception as e:
-            print(f"加载应用配置失败: {e}")
-            
+            logger.error("加载应用配置失败: %s", e)
+
         return self.default_app_config.copy()
         
     def save_app_config(self, config: Dict[str, Any]) -> bool:
@@ -157,7 +160,7 @@ class ConfigManager:
             self.app_config = config
             return True
         except Exception as e:
-            print(f"保存应用配置失败: {e}")
+            logger.error("保存应用配置失败: %s", e)
             return False
             
     def load_glossary(self) -> Dict[str, Any]:
@@ -170,8 +173,8 @@ class ConfigManager:
                     merged_glossary.update(glossary)
                     return merged_glossary
         except Exception as e:
-            print(f"加载术语库失败: {e}")
-            
+            logger.error("加载术语库失败: %s", e)
+
         return self.default_glossary.copy()
         
     def save_glossary(self, glossary: Dict[str, Any]) -> bool:
@@ -182,7 +185,7 @@ class ConfigManager:
             self.glossary = glossary
             return True
         except Exception as e:
-            print(f"保存术语库失败: {e}")
+            logger.error("保存术语库失败: %s", e)
             return False
             
     def save_config(self):
@@ -225,9 +228,9 @@ class ConfigManager:
             # 添加新术语
             self.glossary["terms"].append(term)
             return self.save_glossary(self.glossary)
-            
+
         except Exception as e:
-            print(f"添加术语失败: {e}")
+            logger.error("添加术语失败: %s", e)
             return False
             
     def remove_glossary_term(self, source_term: str) -> bool:
@@ -239,7 +242,7 @@ class ConfigManager:
             ]
             return self.save_glossary(self.glossary)
         except Exception as e:
-            print(f"删除术语失败: {e}")
+            logger.error("删除术语失败: %s", e)
             return False
             
     def get_glossary_prompt(self) -> str:
@@ -282,9 +285,9 @@ class ConfigManager:
                 json.dump(presets, f, ensure_ascii=False, indent=2)
                 
             return True
-            
+
         except Exception as e:
-            print(f"保存API预设失败: {e}")
+            logger.error("保存API预设失败: %s", e)
             return False
             
     def load_api_presets(self) -> Dict[str, Dict[str, str]]:
@@ -295,8 +298,8 @@ class ConfigManager:
                 with open(presets_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
         except Exception as e:
-            print(f"加载API预设失败: {e}")
-            
+            logger.error("加载API预设失败: %s", e)
+
         return {}
         
     def delete_api_preset(self, preset_name: str) -> bool:
@@ -316,10 +319,10 @@ class ConfigManager:
                     json.dump(presets, f, ensure_ascii=False, indent=2)
                     
                 return True
-                
+
         except Exception as e:
-            print(f"删除API预设失败: {e}")
-            
+            logger.error("删除API预设失败: %s", e)
+
         return False
 
     def save_volc_key(self, api_key: str) -> bool:
@@ -340,7 +343,7 @@ class ConfigManager:
             os.environ["ARK_API_KEY"] = api_key.strip()
             return True
         except Exception as e:
-            print(f"保存火山引擎Key失败: {e}")
+            logger.error("保存火山引擎Key失败: %s", e)
             return False
 
     def get_volc_key(self) -> str:

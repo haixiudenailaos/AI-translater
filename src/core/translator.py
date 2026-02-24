@@ -12,6 +12,9 @@ import re
 
 from ..api.siliconflow_api import SiliconFlowAPI
 from ..api.deepseek_api import DeepseekAPI
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 class TranslatorEngine:
     def __init__(self, config_manager):
@@ -56,127 +59,61 @@ class TranslatorEngine:
         self._init_api()
             
     def translate_line_by_line(self, content: str, progress_callback: Callable, complete_callback: Callable):
-        """逐行翻译模式（重构：分批翻译 + 流式输出）
-        
-        核心原则：
-        1. 按配置的batch_lines（默认20行）拆分原文
-        2. 每批使用流式翻译，实时显示翻译进度
-        3. 每批翻译完成后，准确写入对应行号位置
-        4. 绝对不依赖换行符拆分，只按行号对应
-        """
-        # 重置状态
-        self.reset()
-        self._ensure_api()
-        
-        try:
-            lines = content.split('\n')
-            total_lines = len(lines)
-            app_config = self.config_manager.get_app_config()
-            batch_lines = app_config.get("batch_lines", 20)  # 每批翻译的行数
-            
-            # 按批次处理
-            for batch_start in range(0, total_lines, batch_lines):
-                # 检查是否停止
-                if self.is_stopped:
-                    break
-
-                # 暂停检查：阻塞直到恢复
-                self.pause_event.wait()
-                if self.is_stopped:
-                    break
-
-                # 获取当前批次的原文行
-                batch_end = min(batch_start + batch_lines, total_lines)
-                batch_source_lines = lines[batch_start:batch_end]
-
-                # 翻译当前批次（使用流式输出，传递总行数用于进度计算）
-                batch_translated_lines = self._translate_batch(
-                    batch_source_lines,
-                    progress_callback,
-                    batch_start,
-                    total_lines  # ✅ 传递总行数
-                )
-
-                # 计算总进度
-                overall_progress = (batch_end / total_lines) * 100
-
-                # 回调：传递批次翻译完成的结果
-                progress_callback(overall_progress, {
-                    'batch_start': batch_start,
-                    'translated_lines': batch_translated_lines,
-                    'streaming': False  # 标记为批次完成
-                })
-
-                # 短暂延迟
-                time.sleep(0.1)
-
-            if not self.is_stopped:
-                complete_callback()
-
-        except Exception as e:
-            raise e
+        """逐行翻译模式（批间延迟 0.1s）"""
+        self._translate(content, progress_callback, complete_callback, batch_delay=0.1)
 
     def translate_fast_mode(self, content: str, progress_callback: Callable, complete_callback: Callable):
-        """快速翻译模式（重构：分批翻译 + 流式输出）
-        
+        """快速翻译模式（批间延迟 0.2s）"""
+        self._translate(content, progress_callback, complete_callback, batch_delay=0.2)
+
+    def _translate(self, content: str, progress_callback: Callable,
+                   complete_callback: Callable, batch_delay: float = 0.1):
+        """统一翻译流程：分批翻译 + 流式输出
+
         核心原则：
-        1. 按配置的batch_lines（默认20行）拆分原文
+        1. 按配置的 batch_lines（默认20行）拆分原文
         2. 每批使用流式翻译，实时显示翻译进度
         3. 每批翻译完成后，准确写入对应行号位置
         4. 绝对不依赖换行符拆分，只按行号对应
         """
-        # 重置状态
         self.reset()
         self._ensure_api()
-        
+
         try:
             lines = content.split('\n')
             total_lines = len(lines)
             app_config = self.config_manager.get_app_config()
-            batch_lines = app_config.get("batch_lines", 20)  # 每批翻译的行数
-            
-            # 按批次处理
+            batch_lines = app_config.get("batch_lines", 20)
+
             for batch_start in range(0, total_lines, batch_lines):
-                # 检查是否停止
                 if self.is_stopped:
                     break
-
-                # 暂停检查：阻塞直到恢复
                 self.pause_event.wait()
                 if self.is_stopped:
                     break
 
-                # 获取当前批次的原文行
                 batch_end = min(batch_start + batch_lines, total_lines)
                 batch_source_lines = lines[batch_start:batch_end]
-                
-                # 翻译当前批次（使用流式输出，传递总行数用于进度计算）
+
                 batch_translated_lines = self._translate_batch(
-                    batch_source_lines, 
-                    progress_callback, 
-                    batch_start,
-                    total_lines  # ✅ 传递总行数
+                    batch_source_lines, progress_callback, batch_start, total_lines
                 )
-                
-                # 计算总进度
+
                 overall_progress = (batch_end / total_lines) * 100
-                
-                # 回调：传递批次翻译完成的结果
                 progress_callback(overall_progress, {
                     'batch_start': batch_start,
                     'translated_lines': batch_translated_lines,
-                    'streaming': False  # 标记为批次完成
+                    'streaming': False,
                 })
-                
-                # 短暂延迟
-                time.sleep(0.2)
-            
+
+                time.sleep(batch_delay)
+
             if not self.is_stopped:
                 complete_callback()
-                
+
         except Exception as e:
             raise e
-            
+
     def _translate_batch(self, batch_lines: List[str], progress_callback: Callable, batch_start: int, total_lines: Optional[int] = None) -> List[str]:
         """翻译一批原文行，使用流式输出提升体验（增强：行号标记机制）
         
@@ -296,12 +233,12 @@ class TranslatorEngine:
                     if not translated_content:
                         # 流式缓冲区也为空，触发重试
                         if retry_count < max_retries - 1:
-                            print(f"翻译结果为空，正在重试 ({retry_count + 1}/{max_retries})...")
+                            logger.warning("翻译结果为空，正在重试 (%s/%s)...", retry_count + 1, max_retries)
                             time.sleep(1)  # 短暂延迟后重试
                             continue
                         else:
                             # 所有重试都失败，返回空行列表
-                            print(f"翻译失败：{max_retries}次重试后仍无结果")
+                            logger.error("翻译失败：%s次重试后仍无结果", max_retries)
                             return [''] * expected_lines
                 else:
                     translated_content = response.strip()
@@ -352,12 +289,12 @@ class TranslatorEngine:
             except Exception as e:
                 # ✅ 增强：捕获异常后重试
                 if retry_count < max_retries - 1:
-                    print(f"翻译请求失败: {str(e)}，正在重试 ({retry_count + 1}/{max_retries})...")
+                    logger.error("翻译请求失败: %s，正在重试 (%s/%s)...", str(e), retry_count + 1, max_retries)
                     time.sleep(1)  # 短暂延迟后重试
                     continue
                 else:
                     # 所有重试都失败，返回空行列表
-                    print(f"翻译失败：{max_retries}次重试后仍失败 - {str(e)}")
+                    logger.error("翻译失败：%s次重试后仍失败 - %s", max_retries, str(e))
                     return [''] * expected_lines
         
         # ✅ 兜底：理论上不会到达这里，但为了安全起见

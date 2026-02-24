@@ -7,6 +7,7 @@
 
 import tkinter as tk
 from tkinter import ttk
+from .table_editor import TableCellEditor
 
 
 class TaskDetailWindow:
@@ -28,10 +29,6 @@ class TaskDetailWindow:
         self.win.title("任务详情")
         self.win.geometry("900x600")
         self.win.minsize(700, 400)
-
-        self.edit_entry = None
-        self.editing_item = None
-        self.editing_column = None
 
         self._build_ui()
         self._load_data()
@@ -92,7 +89,14 @@ class TaskDetailWindow:
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
 
-        self.table.bind("<Double-Button-1>", self._on_cell_double_click)
+        # 使用 TableCellEditor 组件（只允许编辑译文列）
+        self._cell_editor = TableCellEditor(
+            self.table,
+            editable_columns={2},
+            on_save=self._on_cell_edited,
+        )
+        self.table.bind("<Double-Button-1>", self._cell_editor.on_double_click)
+
     # ── 数据加载与刷新 ─────────────────────────────
     def _load_data(self):
         task = self.manager.get_task(self.task_id)
@@ -124,31 +128,28 @@ class TaskDetailWindow:
         is_running = task.status == "running"
         is_paused = task.status == "paused"
         is_pending = task.status == "pending"
-        is_done = task.status in ("completed", "cancelled", "error")
-
         self.start_btn.config(state=tk.NORMAL if (is_pending or is_paused) else tk.DISABLED)
         self.pause_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
-        self.cancel_btn.config(state=tk.NORMAL if not is_done else tk.DISABLED)
+        can_cancel = task.status not in ("completed", "cancelled")
+        self.cancel_btn.config(state=tk.NORMAL if can_cancel else tk.DISABLED)
 
     def _refresh_translations(self):
-        """增量刷新译文列"""
         task = self.manager.get_task(self.task_id)
         if not task:
             return
         items = self.table.get_children()
         for i, item in enumerate(items):
             if i < len(task.target_lines):
-                old_vals = self.table.item(item)["values"]
-                new_tgt = task.target_lines[i]
-                if len(old_vals) > 2 and str(old_vals[2]) != str(new_tgt):
-                    self.table.item(item, values=(old_vals[0], old_vals[1], new_tgt))
+                tgt = task.target_lines[i]
+                vals = list(self.table.item(item)["values"])
+                if str(vals[2]) != str(tgt):
+                    vals[2] = tgt
+                    self.table.item(item, values=vals)
 
-    # ── 控制按钮 ─────────────────────────────────────
+    # ── 操作 ────────────────────────────────────────
     def _on_start(self):
         task = self.manager.get_task(self.task_id)
-        if not task:
-            return
-        if task.status == "paused":
+        if task and task.status == "paused":
             self.manager.resume_task(self.task_id)
         else:
             self.manager.start_task(self.task_id)
@@ -159,55 +160,10 @@ class TaskDetailWindow:
     def _on_cancel(self):
         self.manager.cancel_task(self.task_id)
 
-    # ── 双击编辑译文 ─────────────────────────────────
-    def _on_cell_double_click(self, event):
-        if self.edit_entry:
-            self._save_edit()
-        region = self.table.identify_region(event.x, event.y)
-        if region != "cell":
-            return
-        column = self.table.identify_column(event.x)
-        col_idx = int(column.replace("#", "")) - 1
-        if col_idx != 2:  # 只允许编辑译文列
-            return
-        item = self.table.identify_row(event.y)
-        if not item:
-            return
-        values = self.table.item(item)["values"]
-        if not values:
-            return
-        bbox = self.table.bbox(item, column)
-        if not bbox:
-            return
-        self.editing_item = item
-        self.editing_column = col_idx
-        self.edit_entry = tk.Entry(self.table, font=("微软雅黑", 10), relief=tk.SOLID, borderwidth=1)
-        self.edit_entry.insert(0, values[col_idx])
-        self.edit_entry.select_range(0, tk.END)
-        self.edit_entry.focus_set()
-        self.edit_entry.place(x=bbox[0], y=bbox[1], width=bbox[2], height=bbox[3])
-        self.edit_entry.bind("<Return>", lambda e: self._save_edit())
-        self.edit_entry.bind("<Escape>", lambda e: self._cancel_edit())
-        self.edit_entry.bind("<FocusOut>", lambda e: self._save_edit())
-
-    def _save_edit(self):
-        if not self.edit_entry or not self.editing_item:
-            return
-        new_val = self.edit_entry.get()
-        values = list(self.table.item(self.editing_item)["values"])
-        values[self.editing_column] = new_val
-        self.table.item(self.editing_item, values=values)
-        # 同步回task数据
+    def _on_cell_edited(self, item_id, col_idx, old_value, new_value):
+        """TableCellEditor 回调：同步编辑结果到 task 数据"""
+        values = self.table.item(item_id)["values"]
         row_idx = int(values[0]) - 1
         task = self.manager.get_task(self.task_id)
         if task and row_idx < len(task.target_lines):
-            task.target_lines[row_idx] = new_val
-        self.edit_entry.destroy()
-        self.edit_entry = None
-        self.editing_item = None
-
-    def _cancel_edit(self):
-        if self.edit_entry:
-            self.edit_entry.destroy()
-            self.edit_entry = None
-            self.editing_item = None
+            task.target_lines[row_idx] = new_value
