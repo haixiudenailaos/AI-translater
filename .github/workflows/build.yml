@@ -1,0 +1,151 @@
+name: 跨平台构建
+
+on:
+  push:
+    branches: [ main, master, V1.3, V1.4 ]
+  pull_request:
+    branches: [ main, master, V1.4 ]
+  create:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - release
+
+env:
+  APP_NAME: LightNovelTranslator
+  APP_VERSION: "1.4"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            artifact_suffix: Windows-x64
+          - os: macos-latest
+            platform: macos
+            artifact_suffix: macOS-Universal
+          - os: ubuntu-latest
+            platform: linux
+            artifact_suffix: Linux-x64
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 设置Python环境
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: 安装系统依赖 (Linux)
+      if: matrix.platform == 'linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-tk
+
+    - name: 安装Python依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+        pip install -r requirements.txt
+
+    - name: 验证依赖安装
+      run: |
+        python -c "import tkinter; print('tkinter OK')"
+        python -c "import httpx; print('httpx OK')"
+        python -c "import ebooklib; print('ebooklib OK')"
+        python -c "import bs4; print('beautifulsoup4 OK')"
+        python -c "import chardet; print('chardet OK')"
+        python -c "import lxml; print('lxml OK')"
+        python -c "import PIL; print('Pillow OK')"
+        python -c "import openai; print('openai OK')"
+
+    - name: 构建应用程序
+      run: |
+        pyinstaller translator.spec
+
+    - name: 验证构建结果
+      shell: bash
+      run: |
+        echo "=== dist 目录内容 ==="
+        ls -la dist/
+        # 查找生成的可执行文件
+        if [ "${{ matrix.platform }}" = "windows" ]; then
+          FOUND=$(find dist/ -maxdepth 1 -name "*.exe" | head -1)
+        else
+          FOUND=$(find dist/ -maxdepth 1 -type f ! -name "*.manifest" ! -name "build_info.json" | head -1)
+        fi
+        if [ -z "$FOUND" ]; then
+          echo "构建失败: 找不到可执行文件"
+          exit 1
+        fi
+        echo "构建成功: $FOUND"
+
+    - name: 重命名构建产物
+      shell: bash
+      run: |
+        cd dist
+        if [ "${{ matrix.platform }}" = "windows" ]; then
+          EXE=$(find . -maxdepth 1 -name "*.exe" | head -1)
+          mv "$EXE" "${{ env.APP_NAME }}-${{ env.APP_VERSION }}-${{ matrix.artifact_suffix }}.exe"
+        elif [ "${{ matrix.platform }}" = "macos" ]; then
+          BIN=$(find . -maxdepth 1 -type f ! -name "*.manifest" ! -name "build_info.json" | head -1)
+          mv "$BIN" "${{ env.APP_NAME }}-${{ env.APP_VERSION }}-${{ matrix.artifact_suffix }}"
+          chmod +x "${{ env.APP_NAME }}-${{ env.APP_VERSION }}-${{ matrix.artifact_suffix }}"
+        else
+          BIN=$(find . -maxdepth 1 -type f ! -name "*.manifest" ! -name "build_info.json" | head -1)
+          mv "$BIN" "${{ env.APP_NAME }}-${{ env.APP_VERSION }}-${{ matrix.artifact_suffix }}"
+          chmod +x "${{ env.APP_NAME }}-${{ env.APP_VERSION }}-${{ matrix.artifact_suffix }}"
+        fi
+        echo "=== 重命名后 ==="
+        ls -la
+
+    - name: 上传构建产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-${{ matrix.artifact_suffix }}
+        path: dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-${{ matrix.artifact_suffix }}*
+        retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+    - name: 下载所有构建产物
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        merge-multiple: true
+
+    - name: 列出产物
+      run: |
+        echo "=== 所有构建产物 ==="
+        find artifacts/ -type f
+        ls -laR artifacts/
+
+    - name: 创建发布
+      uses: softprops/action-gh-release@v2
+      with:
+        files: artifacts/*
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
