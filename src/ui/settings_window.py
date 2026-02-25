@@ -17,17 +17,11 @@ class SettingsWindow:
         # 模型名称映射：完整名称 -> 显示名称
         self.model_display_map = {
             # SiliconFlow 模型
-            "deepseek-ai/DeepSeek-V3.2-Exp": "DeepSeek V3.2 Exp",
-            "deepseek-ai/DeepSeek-V3.1-Terminus": "DeepSeek V3.1",
-            "deepseek-ai/DeepSeek-V3": "DeepSeek V3",
-            "moonshotai/Kimi-K2-Instruct-0905": "Kimi K2",
-            "Qwen/Qwen3-Next-80B-A3B-Instruct": "Qwen3 Next 80B",
+            "deepseek-ai/DeepSeek-V3.2": "DeepSeek V3.2（效果最好）",
+            "stepfun-ai/Step-3.5-Flash": "Step 3.5 Flash（性价比高）",
+            "tencent/Hunyuan-MT-7B": "Hunyuan MT 7B（免费）",
             # Deepseek 官方模型
-            "deepseek-ai/DeepSeek-V3.2-Exp": "DeepSeek V3.2 Exp",
             "deepseek-reasoner": "DeepSeek Reasoner",
-            # 保持向后兼容
-            "qwen-turbo": "Qwen Turbo",
-            "glm-4-flash": "GLM-4 Flash"
         }
         
         # 反向映射：显示名称 -> 完整名称
@@ -121,22 +115,20 @@ class SettingsWindow:
         ttk.Label(api_frame, text="模型名称:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=10)
         
         # 获取当前模型名称并转换为显示名称
-        current_model = self.api_config.get("model_name", "deepseek-ai/DeepSeek-V3.1-Terminus")
+        current_model = self.api_config.get("model_name", "deepseek-ai/DeepSeek-V3.2")
         current_display = self.model_display_map.get(current_model, current_model)
         
         self.model_var = tk.StringVar(value=current_display)
         
         # 根据提供商设置模型选项
         self.siliconflow_models = [
-            "DeepSeek V3.2 Exp",
-            "DeepSeek V3.1",
-            "DeepSeek V3",
-            "Kimi K2",
-            "Qwen3 Next 80B"
+            "DeepSeek V3.2（效果最好）",
+            "Step 3.5 Flash（性价比高）",
+            "Hunyuan MT 7B（免费）",
         ]
-        
+
         self.deepseek_models = [
-            "DeepSeek V3.2 Exp",
+            "DeepSeek V3.2（效果最好）",
             "DeepSeek Reasoner"
         ]
         
@@ -203,7 +195,7 @@ class SettingsWindow:
         batch_spin.grid(row=3, column=1, padx=10, pady=10)
         
         # 批次行数提示
-        batch_tip = ttk.Label(trans_frame, text="每批翻译的原文行数，使用流式输出提升体验", 
+        batch_tip = ttk.Label(trans_frame, text="每批翻译的原文行数（部分模型有专属参数，将自动覆盖此设置）",
                              foreground="#666", font=('TkDefaultFont', 8))
         batch_tip.grid(row=4, column=1, sticky=tk.W, padx=10, pady=(0, 10))
         

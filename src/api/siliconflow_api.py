@@ -17,7 +17,7 @@ logger = get_logger(__name__)
 
 class SiliconFlowAPI(BaseAPI):
     DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
-    DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3.1-Terminus"
+    DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3.2"
     DEFAULT_MAX_KEEPALIVE = 20
     DEFAULT_MAX_CONNECTIONS = 50
     DEFAULT_TIMEOUT = 90.0

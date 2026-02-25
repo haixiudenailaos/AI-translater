@@ -382,6 +382,7 @@ class TranslationController:
                         # 否则跳过这个空行
 
                 # 实时显示：不超过预期行数
+                last_item = None
                 for i, line in enumerate(streaming_lines[:expected_lines]):
                     row_index = absolute_start + i
                     if row_index < len(items):
@@ -389,14 +390,17 @@ class TranslationController:
                         values = list(self.translation_table.item(item)['values'])
                         values[2] = line.strip()  # 实时更新译文栏
                         self.translation_table.item(item, values=values)
+                        last_item = item
 
-                        # 滚动到当前行
-                        self.translation_table.see(item)
+                # 只滚动到最后更新的行
+                if last_item is not None:
+                    self.translation_table.see(last_item)
             else:
                 # 批次完成模式：写入最终结果
                 translated_lines = batch_data.get('translated_lines', [])
 
                 # 将翻译结果写回对应的行
+                last_item = None
                 for i, translated_line in enumerate(translated_lines):
                     row_index = absolute_start + i
                     if row_index < len(items):
@@ -404,6 +408,11 @@ class TranslationController:
                         values = list(self.translation_table.item(item)['values'])
                         values[2] = translated_line.strip()  # 更新译文
                         self.translation_table.item(item, values=values)
+                        last_item = item
+
+                # 滚动到最后写入的行
+                if last_item is not None:
+                    self.translation_table.see(last_item)
 
                 # 触发保存
                 self.schedule_save()
@@ -476,6 +485,7 @@ class TranslationController:
                         # 否则跳过这个空行
 
                 # 实时显示：不超过预期行数
+                last_item = None
                 for i, line in enumerate(streaming_lines[:expected_lines]):
                     row_index = batch_start + i
                     if row_index < len(selected_data):
@@ -483,14 +493,17 @@ class TranslationController:
                         values = list(self.translation_table.item(item)['values'])
                         values[2] = line.strip()  # 实时更新译文栏
                         self.translation_table.item(item, values=values)
+                        last_item = item
 
-                        # 滚动到当前行
-                        self.translation_table.see(item)
+                # 只滚动到最后更新的行
+                if last_item is not None:
+                    self.translation_table.see(last_item)
             else:
                 # 批次完成模式：写入最终结果
                 translated_lines = batch_data.get('translated_lines', [])
 
                 # 将翻译结果写回对应的行
+                last_item = None
                 for i, translated_line in enumerate(translated_lines):
                     row_index = batch_start + i
                     if row_index < len(selected_data):
@@ -498,6 +511,11 @@ class TranslationController:
                         values = list(self.translation_table.item(item)['values'])
                         values[2] = translated_line.strip()  # 更新译文
                         self.translation_table.item(item, values=values)
+                        last_item = item
+
+                # 滚动到最后写入的行
+                if last_item is not None:
+                    self.translation_table.see(last_item)
 
                 # 触发保存
                 self.schedule_save()
@@ -628,6 +646,7 @@ class TranslationController:
                 expected_lines = batch_data.get('expected_lines', 1)
                 streaming_lines = [line for line in current_text.split('\n') if line.strip()]
 
+                last_item = None
                 for i, line in enumerate(streaming_lines[:expected_lines]):
                     relative_index = batch_start + i
                     if relative_index < len(missing_indices):
@@ -637,11 +656,16 @@ class TranslationController:
                             values = list(self.translation_table.item(item)['values'])
                             values[2] = line.strip()
                             self.translation_table.item(item, values=values)
-                            self.translation_table.see(item)
+                            last_item = item
+
+                # 只滚动到最后更新的行
+                if last_item is not None:
+                    self.translation_table.see(last_item)
             else:
                 # 批次完成模式
                 translated_lines = batch_data.get('translated_lines', [])
 
+                last_item = None
                 for i, translated_line in enumerate(translated_lines):
                     relative_index = batch_start + i
                     if relative_index < len(missing_indices):
@@ -651,6 +675,11 @@ class TranslationController:
                             values = list(self.translation_table.item(item)['values'])
                             values[2] = translated_line.strip()
                             self.translation_table.item(item, values=values)
+                            last_item = item
+
+                # 滚动到最后写入的行
+                if last_item is not None:
+                    self.translation_table.see(last_item)
 
                 # 保存
                 self.schedule_save()

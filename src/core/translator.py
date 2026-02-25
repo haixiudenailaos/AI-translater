@@ -17,6 +17,26 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 class TranslatorEngine:
+    # 模型专属翻译参数
+    MODEL_PROFILES = {
+        "deepseek-ai/DeepSeek-V3.2": {
+            "batch_lines": 20,
+            "context_lines": 2,
+            "prompt_mode": "full",
+        },
+        "stepfun-ai/Step-3.5-Flash": {
+            "batch_lines": 20,
+            "context_lines": 20,
+            "prompt_mode": "full",
+        },
+        "tencent/Hunyuan-MT-7B": {
+            "batch_lines": 1,
+            "context_lines": 0,
+            "prompt_mode": "simple",
+        },
+    }
+    DEFAULT_PROFILE = {"batch_lines": 20, "context_lines": 2, "prompt_mode": "full"}
+
     def __init__(self, config_manager):
         self.config_manager = config_manager
         self.api = None
@@ -82,8 +102,16 @@ class TranslatorEngine:
         try:
             lines = content.split('\n')
             total_lines = len(lines)
-            app_config = self.config_manager.get_app_config()
-            batch_lines = app_config.get("batch_lines", 20)
+
+            # 获取模型专属参数（覆盖全局配置）
+            api_config = self.config_manager.get_api_config()
+            model_name = api_config.get("model_name", "")
+            profile = self.MODEL_PROFILES.get(model_name, self.DEFAULT_PROFILE)
+            batch_lines = profile["batch_lines"]
+            context_lines_count = profile["context_lines"]
+            prompt_mode = profile["prompt_mode"]
+
+            all_translated = []  # 收集所有已翻译行，用于提供参考上下文
 
             for batch_start in range(0, total_lines, batch_lines):
                 if self.is_stopped:
@@ -95,9 +123,17 @@ class TranslatorEngine:
                 batch_end = min(batch_start + batch_lines, total_lines)
                 batch_source_lines = lines[batch_start:batch_end]
 
+                # 获取参考上下文（前文已翻译的行）
+                ref_start = max(0, batch_start - context_lines_count)
+                ref_source = lines[ref_start:batch_start]
+                ref_translated = all_translated[ref_start:batch_start]
+
                 batch_translated_lines = self._translate_batch(
-                    batch_source_lines, progress_callback, batch_start, total_lines
+                    batch_source_lines, progress_callback, batch_start, total_lines,
+                    ref_source=ref_source, ref_translated=ref_translated,
+                    prompt_mode=prompt_mode, all_translated=all_translated
                 )
+                all_translated.extend(batch_translated_lines)
 
                 overall_progress = (batch_end / total_lines) * 100
                 progress_callback(overall_progress, {
@@ -114,7 +150,12 @@ class TranslatorEngine:
         except Exception as e:
             raise e
 
-    def _translate_batch(self, batch_lines: List[str], progress_callback: Callable, batch_start: int, total_lines: Optional[int] = None) -> List[str]:
+    def _translate_batch(self, batch_lines: List[str], progress_callback: Callable,
+                         batch_start: int, total_lines: Optional[int] = None,
+                         ref_source: Optional[List[str]] = None,
+                         ref_translated: Optional[List[str]] = None,
+                         prompt_mode: str = "full",
+                         all_translated: Optional[List[str]] = None) -> List[str]:
         """翻译一批原文行，使用流式输出提升体验（增强：行号标记机制）
         
         核心逻辑：
@@ -128,35 +169,51 @@ class TranslatorEngine:
         """
         if not batch_lines:
             return []
-        
-        # ✅ 新增：为每行添加行号标记
-        marked_lines = []
-        for i, line in enumerate(batch_lines):
-            line_marker = f"[LINE_{i+1:03d}]"
-            marked_lines.append(f"{line_marker}{line}")
-        
-        # 合并带标记的原文
-        batch_content = '\n'.join(marked_lines)
+
         expected_lines = len(batch_lines)
-        
+
+        # 构建参考上下文文本
+        ref_context = ""
+        if ref_source and ref_translated and len(ref_source) == len(ref_translated):
+            ref_pairs = []
+            for src, tgt in zip(ref_source, ref_translated):
+                if src.strip() or tgt.strip():
+                    ref_pairs.append(f"{src} → {tgt}")
+            if ref_pairs:
+                ref_context = '\n'.join(ref_pairs)
+
         # 构建提示词
         app_config = self.config_manager.get_app_config()
-        base_prompt = app_config.get("translation_prompt", "")
-        glossary_prompt = self.config_manager.get_glossary_prompt()
         target_language = app_config.get("target_language", "中文")
-        
-        full_prompt = f"{base_prompt}\n\n"
-        if glossary_prompt:
-            full_prompt += glossary_prompt + "\n\n"
-        full_prompt += f"""请将以下文本翻译为{target_language}。
+        use_line_markers = (prompt_mode == "full")
 
-重要说明：
-1. 每行文本前都有行号标记 [LINE_XXX]，请在译文中保留这些标记
-2. 保持原文的换行结构，每行对应翻译
-3. 译文格式：[LINE_XXX]译文内容
+        if prompt_mode == "simple":
+            # Hunyuan-MT-7B 专用极简模式：不使用行号标记，不使用复杂提示词，不提供参考前文
+            batch_content = '\n'.join(batch_lines)
+            full_prompt = f"将以下内容翻译为{target_language}，直接输出译文，保持行数一致，不要添加任何说明。\n\n{batch_content}"
+        else:
+            # full 模式：完整提示词 + 行号标记
+            marked_lines = []
+            for i, line in enumerate(batch_lines):
+                line_marker = f"[LINE_{i+1:03d}]"
+                marked_lines.append(f"{line_marker}{line}")
+            batch_content = '\n'.join(marked_lines)
 
-原文：
-{batch_content}"""
+            base_prompt = app_config.get("translation_prompt", "")
+            glossary_prompt = self.config_manager.get_glossary_prompt()
+
+            full_prompt = f"{base_prompt}\n\n"
+            if glossary_prompt:
+                full_prompt += glossary_prompt + "\n\n"
+            full_prompt += f"请将以下文本翻译为{target_language}。\n\n"
+            full_prompt += "重要说明：\n"
+            full_prompt += "1. 每行文本前都有行号标记 [LINE_XXX]，请在译文中保留这些标记\n"
+            full_prompt += "2. 保持原文的换行结构，每行对应翻译\n"
+            full_prompt += "3. 译文格式：[LINE_XXX]译文内容\n"
+            full_prompt += "4. 所有名词（包括人名、地名、组织名、物品名等专有名词）必须翻译为中文，禁止保留原文\n"
+            if ref_context:
+                full_prompt += f"\n以下是前文参考（仅供参考，不需要翻译）：\n{ref_context}\n"
+            full_prompt += f"\n原文：\n{batch_content}"
         
         # ✅ 新增：重试机制（最多5次）
         max_retries = 5
@@ -172,27 +229,26 @@ class TranslatorEngine:
                 def stream_callback(chunk):
                     """流式回调：按完整行更新UI"""
                     nonlocal completed_lines, last_sent_lines
-                    
+
                     stream_buffer.append(chunk)
                     current_text = ''.join(stream_buffer)
-                    
-                    # ✅ 解析当前文本，识别完整的行
+
+                    # 解析当前文本，识别完整的行
                     lines = current_text.split('\n')
-                    
-                    # 检查是否有新的完整行（除了最后一行，因为可能还在输出中）
+
                     if len(lines) > 1:
-                        # 前面的行都是完整的，最后一行可能还在输出中
                         complete_lines_now = lines[:-1]
-                        
-                        # 如果有新的完整行
+
                         if len(complete_lines_now) > len(completed_lines):
-                            # 更新已完成的行列表
                             completed_lines = complete_lines_now[:]
-                            
-                            # 过滤行号标记，只保留译文内容
+
+                            # 过滤行号标记（仅 full 模式有标记）
                             filtered_lines = []
                             for line in completed_lines:
-                                filtered_line = re.sub(r'\[LINE_\d+\]', '', line)
+                                if use_line_markers:
+                                    filtered_line = re.sub(r'\[LINE_\d+\]', '', line)
+                                else:
+                                    filtered_line = line
                                 filtered_lines.append(filtered_line)
                             
                             filtered_text = '\n'.join(filtered_lines)
@@ -243,37 +299,39 @@ class TranslatorEngine:
                 else:
                     translated_content = response.strip()
                 
-                # ✅ 新增：解析行号标记并按序排列译文
+                # 解析翻译结果
                 all_lines = translated_content.split('\n')
-                
-                # 解析行号标记，构建行号到译文的映射
-                line_mapping = {}
-                unmarked_lines = []  # 没有行号标记的行
-                
-                line_marker_pattern = re.compile(r'^\[LINE_(\d+)\](.*)$')
-                
-                for line in all_lines:
-                    match = line_marker_pattern.match(line)
-                    if match:
-                        line_num = int(match.group(1))
-                        content = match.group(2)
-                        line_mapping[line_num] = content
-                    else:
-                        # 没有行号标记的行，可能是API返回格式异常
-                        if line.strip():  # 只保留非空行
-                            unmarked_lines.append(line)
-                
-                # 按行号顺序重建译文列表
-                translated_lines = []
-                for i in range(1, expected_lines + 1):
-                    if i in line_mapping:
-                        translated_lines.append(line_mapping[i])
-                    else:
-                        # 缺失的行号，尝试从未标记行中补充
-                        if unmarked_lines:
-                            translated_lines.append(unmarked_lines.pop(0))
+
+                if use_line_markers:
+                    # full 模式：解析行号标记并按序排列译文
+                    line_mapping = {}
+                    unmarked_lines = []
+
+                    line_marker_pattern = re.compile(r'^\[LINE_(\d+)\](.*)$')
+
+                    for line in all_lines:
+                        match = line_marker_pattern.match(line)
+                        if match:
+                            line_num = int(match.group(1))
+                            content = match.group(2)
+                            line_mapping[line_num] = content
                         else:
-                            translated_lines.append('')  # 空行占位
+                            if line.strip():
+                                unmarked_lines.append(line)
+
+                    # 按行号顺序重建译文列表
+                    translated_lines = []
+                    for i in range(1, expected_lines + 1):
+                        if i in line_mapping:
+                            translated_lines.append(line_mapping[i])
+                        else:
+                            if unmarked_lines:
+                                translated_lines.append(unmarked_lines.pop(0))
+                            else:
+                                translated_lines.append('')
+                else:
+                    # simple 模式：直接按换行分割
+                    translated_lines = all_lines
                 
                 # ✅ 关键：确保译文行数 = 原文行数
                 if len(translated_lines) < expected_lines:
