@@ -137,6 +137,7 @@ jobs:
         with:
           name: LightNovelTranslator V1.6
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'V1.6' }}
+          target_commitish: ${{ github.sha }}
           files: artifacts/*
           draft: false
           prerelease: false
