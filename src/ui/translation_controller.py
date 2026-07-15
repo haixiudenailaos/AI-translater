@@ -9,7 +9,60 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 from pathlib import Path
-from typing import Callable, Tuple, List
+from typing import Callable, Tuple, List, Optional, Any
+
+from ..core.translation_result import BatchTranslationResult, TranslationStatus
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+# BUG-004：自动查漏单行/单批最多补译次数
+MAX_MISSING_CHECK_ROUNDS = 2
+
+
+class TkUpdateCoalescer:
+    """PERF-002：合并 Tk UI 更新，固定节流间隔。
+
+    流式回调可能每秒产生数十到数百个事件，直接调度到主线程会淹没 Tk 事件循环。
+    本类将中间快照覆盖保留，只按固定间隔刷新最新快照；主控制器使用 40ms，
+    让当前行能连续显示，同时避免每个 token 都触发 Tk 重绘。
+    批次完成等最终事件应调用 cancel_pending 后立即渲染，不经过节流。
+    """
+
+    def __init__(self, root: tk.Tk, interval_ms: int = 75):
+        self.root = root
+        self.interval_ms = interval_ms
+        self._pending: dict[Any, tuple] = {}  # coalesce_key -> (render_fn, args)
+        self._after_id: Optional[str] = None
+
+    def submit(
+        self, render_fn: Callable, *args: Any, coalesce_key: Any = None
+    ) -> None:
+        """提交流式快照；同一批次只保留最新快照。"""
+        self._pending[coalesce_key] = (render_fn, args)
+        if self._after_id is None:
+            self._after_id = self.root.after(self.interval_ms, self._flush)
+
+    def cancel_pending(self, coalesce_key: Any = None) -> None:
+        """取消指定批次；不传批次时取消全部待处理快照。"""
+        if coalesce_key is None:
+            self._pending.clear()
+        else:
+            self._pending.pop(coalesce_key, None)
+
+        if not self._pending and self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _flush(self) -> None:
+        self._after_id = None
+        pending = list(self._pending.values())
+        self._pending.clear()
+        for render_fn, args in pending:
+            render_fn(*args)
 
 
 class TranslationController:
@@ -23,7 +76,6 @@ class TranslationController:
         file_handler,
         epub_processor,
         translation_table: ttk.Treeview,
-        translation_mode: tk.StringVar,
         progress_var: tk.DoubleVar,
         progress_bar: ttk.Progressbar,
         translate_btn,
@@ -42,7 +94,6 @@ class TranslationController:
         self.file_handler = file_handler
         self.epub_processor = epub_processor
         self.translation_table = translation_table
-        self.translation_mode = translation_mode
         self.progress_var = progress_var
         self.progress_bar = progress_bar
         self.translate_btn = translate_btn
@@ -58,9 +109,13 @@ class TranslationController:
         # Translation state
         self.is_translating = False
         self._continue_start_line = 0
+        self._continue_missing_indices = []  # R2-BUG-014：续翻缺失行原始索引
         self._selected_translation_data = []
         self._missing_translation_indices = []
         self._is_missing_check = False
+        # BUG-004：自动查漏轮次计数与失败索引记录
+        self._missing_check_rounds = 0
+        self._last_missing_failed_indices = []
 
         # Continuation mode flags
         self._continuing_mode = False
@@ -73,10 +128,14 @@ class TranslationController:
         self.context_menu.add_separator()
         self.context_menu.add_command(label="取消", command=lambda: self.context_menu.unpost())
 
+        # PERF-002：流式 UI 更新节流器（同一时刻只有一种翻译在运行，可共享）
+        self._stream_coalescer = TkUpdateCoalescer(self.root, interval_ms=40)
+
     def start_translation(self):
         """开始翻译（完全重构：分批翻译机制）"""
-        # 从表格获取原文
-        source_lines, _ = self.get_table_data()
+        # UXF-001：默认只处理缺失译文，绝不静默清空已有译文。
+        # 覆盖已有结果应由明确的“重新翻译”操作完成。
+        source_lines, target_lines = self.get_table_data()
         if not source_lines or not any(line.strip() for line in source_lines):
             messagebox.showwarning("翻译警告", "请先输入要翻译的文本")
             return
@@ -92,37 +151,45 @@ class TranslationController:
         self.continue_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
 
-        # ✅ 重置续翻起始行（开始翻译时从0开始）
-        self._continue_start_line = 0
+        pending_indices = [
+            index
+            for index, source_line in enumerate(source_lines)
+            if source_line.strip()
+            and (index >= len(target_lines) or not target_lines[index].strip())
+        ]
+        if not pending_indices:
+            self.is_translating = False
+            self.translate_btn.config(state=tk.NORMAL)
+            self.continue_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            messagebox.showinfo("提示", "所有非空内容均已有译文。")
+            return
 
-        # 清空译文列
-        for item in self.translation_table.get_children():
-            values = list(self.translation_table.item(item)['values'])
-            values[2] = ""  # 清空译文
-            self.translation_table.item(item, values=values)
+        # 通过缺失行索引映射写回，保留已有译文和人工校对结果。
+        self._continue_start_line = 0
+        self._continue_missing_indices = pending_indices
 
         # 在新线程中执行翻译
-        source_content = "\n".join(source_lines)
+        source_content = "\n".join(source_lines[index] for index in pending_indices)
         translation_thread = threading.Thread(
             target=self._translate_worker,
-            args=(source_content, self.translation_mode.get())
+            args=(source_content,)
         )
         translation_thread.daemon = True
         translation_thread.start()
 
     def continue_translation(self):
-        """继续翻译（修复：智能检查空译文行，确保完整翻译）
+        """继续翻译（R2-BUG-014：只处理真正缺失的行，不覆盖已有译文）
 
         核心逻辑：
         1. 检查所有行，找出需要翻译的行（原文不为空但译文为空）
-        2. 如果存在需要翻译的行，则进入翻译流程
-        3. 只有当所有原文行都有对应的非空译文时，才提示翻译完成
-        4. 不清除任何已有的译文，保持已翻译内容不变
+        2. 只提取缺失行的原文，记录其原始索引
+        3. 回调通过索引映射写回，不覆盖已有译文
         """
         # 获取原文和译文
         source_lines, target_lines = self.get_table_data()
 
-        # ✅ 新逻辑：检查所有行，找出需要翻译的行
+        # 检查所有行，找出需要翻译的行（原文不为空但译文为空）
         need_translation_indices = []
         for i in range(len(source_lines)):
             source_text = source_lines[i].strip() if i < len(source_lines) else ""
@@ -137,12 +204,9 @@ class TranslationController:
             messagebox.showinfo("提示", "所有内容已翻译完成。")
             return
 
-        # ✅ 找到第一个需要翻译的行作为起始位置
-        start_idx = need_translation_indices[0]
-
-        # 取剩余原文（从第一个需要翻译的行开始）
-        remaining_lines = source_lines[start_idx:] if start_idx < len(source_lines) else []
-        remaining_content = '\n'.join(remaining_lines).strip()
+        # R2-BUG-014：只提取缺失行的原文，而非从第一个缺口到末尾的全部原文
+        missing_source_lines = [source_lines[i] for i in need_translation_indices]
+        remaining_content = '\n'.join(missing_source_lines).strip()
 
         if not remaining_content:
             messagebox.showinfo("提示", "当前无可继续的原文内容，已全部翻译或原文为空。")
@@ -159,13 +223,14 @@ class TranslationController:
         self.continue_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
 
-        # 记录续译起始行（用于回调中计算绝对位置）
-        self._continue_start_line = start_idx
+        # R2-BUG-014：记录缺失行原始索引，用于回调按索引写回（不再使用连续偏移）
+        self._continue_missing_indices = need_translation_indices
+        self._continue_start_line = 0
 
-        # 在新线程中执行翻译，对剩余内容进行
+        # 在新线程中执行翻译，只翻译缺失行
         translation_thread = threading.Thread(
             target=self._translate_worker,
-            args=(remaining_content, self.translation_mode.get())
+            args=(remaining_content,)
         )
         translation_thread.daemon = True
         translation_thread.start()
@@ -284,33 +349,31 @@ class TranslationController:
         # 在新线程中执行翻译
         translation_thread = threading.Thread(
             target=self._translate_selected_worker,
-            args=(combined_source, self.translation_mode.get())
+            args=(combined_source,)
         )
         translation_thread.daemon = True
         translation_thread.start()
 
-    def _translate_worker(self, content, mode):
+    def _translate_worker(self, content):
         """翻译工作线程"""
         try:
-            self.status_updater("正在翻译...")
+            # R2-BUG-026：后台线程不得直接操作 Tk 控件，调度到主线程
+            self.root.after(0, lambda: self.status_updater("正在翻译..."))
 
-            if mode == "逐行模式":
-                self.translator.translate_line_by_line(
-                    content,
-                    self._on_translation_progress,
-                    self._on_translation_complete
-                )
-            else:
-                self.translator.translate_fast_mode(
-                    content,
-                    self._on_translation_progress,
-                    self._on_translation_complete
-                )
+            # BUG-008：两种模式无真实行为差异，统一使用快速模式
+            self.translator.translate_fast_mode(
+                content,
+                self._on_translation_progress,
+                self._on_translation_complete
+            )
 
-        except Exception as e:
-            self.root.after(0, lambda: self._on_translation_error(str(e)))
+        except Exception as exc:
+            # BUG-002：在离开 except 块前绑定消息，避免 NameError
+            error_message = str(exc)
+            logger.exception("后台翻译失败")
+            self.root.after(0, lambda message=error_message: self._on_translation_error(message))
 
-    def _translate_selected_worker(self, content, mode):
+    def _translate_selected_worker(self, content):
         """选中行翻译工作线程"""
         try:
             self.translator.translate_fast_mode(
@@ -318,11 +381,14 @@ class TranslationController:
                 self._on_selected_translation_progress,
                 self._on_selected_translation_complete
             )
-        except Exception as e:
-            self.root.after(0, lambda: self._on_translation_error(str(e)))
+        except Exception as exc:
+            # BUG-002：在离开 except 块前绑定消息，避免 NameError
+            error_message = str(exc)
+            logger.exception("选中行翻译失败")
+            self.root.after(0, lambda message=error_message: self._on_translation_error(message))
 
     def _on_translation_progress(self, progress, batch_data):
-        """翻译进度回调（修复：确保进度条持续可见，避免多余空行）
+        """翻译进度回调（PERF-002：流式更新节流）
 
         参数：
             progress: 进度百分比
@@ -330,100 +396,135 @@ class TranslationController:
                 'batch_start': 起始行号（0-based）,
                 'streaming': True/False,  # 是否为流式输出
                 'current_text': '当前流式文本',  # streaming=True时有效
+                'preview_lines': ['已完成行', '当前未完成行'],  # 优先使用的完整快照
                 'expected_lines': 预期行数,  # streaming=True时有效
                 'translated_lines': 译文列表  # streaming=False时有效
             }
-
-        核心逻辑：
-        1. 如果streaming=True，实时显示流式翻译结果
-        2. 如果streaming=False，将批次翻译完成的结果写入表格
-        3. 不依赖换行符拆分，只按行号对应
         """
-        def update_ui():
-            # ✅ 修复1：确保进度条始终更新并可见
-            if progress >= 0:
-                self.progress_var.set(progress)
-                # 强制刷新进度条显示
-                self.progress_bar.update_idletasks()
+        is_streaming = batch_data.get('streaming', False) if batch_data else False
+        batch_start = batch_data.get('batch_start', 0) if batch_data else 0
+        if is_streaming:
+            # 并发批次分别合并，避免后到达的批次覆盖其他批次的快照。
+            self._stream_coalescer.submit(
+                self._render_translation_progress, progress, batch_data,
+                coalesce_key=batch_start,
+            )
+        else:
+            # 只丢弃本批次的中间快照，不影响其他并发批次。
+            self._stream_coalescer.cancel_pending(coalesce_key=batch_start)
+            self.root.after(0, lambda: self._render_translation_progress(progress, batch_data))
 
-            if not batch_data or not isinstance(batch_data, dict):
-                return
+    def _render_translation_progress(self, progress, batch_data):
+        """渲染翻译进度（在主线程执行）"""
+        if progress >= 0:
+            self.progress_var.set(progress)
+            # PERF-002：移除 update_idletasks()，让 Tk 事件循环自然刷新
 
-            batch_start = batch_data.get('batch_start', 0)
-            is_streaming = batch_data.get('streaming', False)
+        if not batch_data or not isinstance(batch_data, dict):
+            return
 
-            # 获取所有表格项
-            items = self.translation_table.get_children()
-            if not items:
-                return
+        batch_start = batch_data.get('batch_start', 0)
+        is_streaming = batch_data.get('streaming', False)
 
-            # 计算绝对位置：如果是续翻，需要加上续翻起始偏移
-            continue_offset = getattr(self, '_continue_start_line', 0)
-            absolute_start = continue_offset + batch_start
+        items = self.translation_table.get_children()
+        if not items:
+            return
 
-            if is_streaming:
-                # 流式输出模式：实时显示当前翻译结果
-                current_text = batch_data.get('current_text', '')
-                expected_lines = batch_data.get('expected_lines', 1)
+        # R2-BUG-014：续翻模式通过缺失行索引映射回原位置，不覆盖已有译文
+        continue_missing_indices = getattr(self, '_continue_missing_indices', None)
+        continue_offset = getattr(self, '_continue_start_line', 0)
 
-                # ✅ 彻底过滤空行：将连续的多个空行合并为一个，避免大量空行堆积
-                all_lines = current_text.split('\n')
-                streaming_lines = []
-                prev_empty = False
-                for line in all_lines:
-                    if line.strip():  # 有内容的行
-                        streaming_lines.append(line)
-                        prev_empty = False
-                    else:  # 空行
-                        # 只在前一行不是空行时才保留一个空行
-                        if not prev_empty and streaming_lines:  # 且不是第一行
-                            streaming_lines.append('')
-                            prev_empty = True
-                        # 否则跳过这个空行
+        def resolve_row_index(rel_idx):
+            """将批次内相对索引映射为表格绝对行号"""
+            if continue_missing_indices:
+                if rel_idx < len(continue_missing_indices):
+                    return continue_missing_indices[rel_idx]
+                return None
+            return continue_offset + rel_idx
 
-                # 实时显示：不超过预期行数
-                for i, line in enumerate(streaming_lines[:expected_lines]):
-                    row_index = absolute_start + i
-                    if row_index < len(items):
-                        item = items[row_index]
-                        values = list(self.translation_table.item(item)['values'])
-                        values[2] = line.strip()  # 实时更新译文栏
+        if is_streaming:
+            # PERF-001：新协议只携带新增完整行。保留旧字段回退，
+            # 使 UI 和核心层可以独立升级。
+            expected_lines = batch_data.get('expected_lines', 1)
+            stream_lines, stream_start_line = self._get_stream_snapshot(batch_data)
+
+            # 实时显示：不超过预期行数
+            last_item = None
+            for i, line in enumerate(stream_lines):
+                relative_index = stream_start_line + i
+                if relative_index >= expected_lines:
+                    break
+                row_index = resolve_row_index(batch_start + relative_index)
+                if row_index is not None and row_index < len(items):
+                    item = items[row_index]
+                    values = list(self.translation_table.item(item)['values'])
+                    values[2] = line.strip()
+                    self.translation_table.item(item, values=values)
+                    last_item = item
+            # PERF-002：只滚动到最后一行，不逐行滚动
+            if last_item is not None and self._should_follow_stream(batch_data):
+                self.translation_table.see(last_item)
+        else:
+            # 批次完成模式：写入最终结果
+            translated_lines = batch_data.get('translated_lines', [])
+
+            for i, translated_line in enumerate(translated_lines):
+                row_index = resolve_row_index(batch_start + i)
+                if row_index is not None and row_index < len(items):
+                    item = items[row_index]
+                    values = list(self.translation_table.item(item)['values'])
+                    # R2-BUG-009：只覆盖已确认成功的译文（非空），取消时空批次不覆盖已有译文
+                    new_val = translated_line.strip() if translated_line else ""
+                    if new_val:
+                        values[2] = new_val
                         self.translation_table.item(item, values=values)
 
-                        # 滚动到当前行
-                        self.translation_table.see(item)
-            else:
-                # 批次完成模式：写入最终结果
-                translated_lines = batch_data.get('translated_lines', [])
+            # 触发保存
+            self.schedule_save()
 
-                # 将翻译结果写回对应的行
-                for i, translated_line in enumerate(translated_lines):
-                    row_index = absolute_start + i
-                    if row_index < len(items):
-                        item = items[row_index]
-                        values = list(self.translation_table.item(item)['values'])
-                        values[2] = translated_line.strip()  # 更新译文
-                        self.translation_table.item(item, values=values)
-
-                # 触发保存
-                self.schedule_save()
-
-        self.root.after(0, update_ui)
-
-    def _on_translation_complete(self):
-        """翻译完成回调（新增：自动翻译查漏机制）"""
+    def _on_translation_complete(self, result: BatchTranslationResult):
+        """翻译完成回调（BUG-004：基于结构化结果区分状态）"""
         def update_ui():
             self.is_translating = False
             self.translate_btn.config(state=tk.NORMAL)
             self.continue_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
-            self.progress_var.set(100)
-            self.status_updater("翻译完成")
             # 复位续写标记
             self._continuing_mode = False
             self._continuing_first_insert = False
+            # R2-BUG-014：清理续翻缺失行索引
+            self._continue_missing_indices = []
 
-            # ✅ 新增：启动翻译查漏机制
+            if result.is_cancelled:
+                # 用户取消：不显示完成，不触发查漏
+                self.status_updater("翻译已停止")
+                return
+
+            if result.is_failed:
+                # 全部失败：显示错误，不触发查漏
+                self.status_updater("翻译失败")
+                error_detail = result.error_message or "未知错误"
+                messagebox.showerror("翻译错误", f"翻译失败：{error_detail}")
+                return
+
+            # 成功或部分成功
+            self.progress_var.set(100)
+
+            if result.status == TranslationStatus.PARTIAL:
+                failed_count = len(result.failed_indices)
+                self.status_updater(f"翻译部分完成（{failed_count} 行失败）")
+                # 记录失败索引用于查漏
+                self._last_missing_failed_indices = list(result.failed_indices)
+                messagebox.showwarning(
+                    "翻译部分完成",
+                    f"部分内容翻译失败（{failed_count} 行）。\n将尝试补译失败行。"
+                )
+            else:
+                self.status_updater("翻译完成")
+                self._last_missing_failed_indices = []
+
+            # BUG-004：启动翻译查漏机制（带次数上限）
+            self._missing_check_rounds = 0
             self.root.after(500, self._start_missing_translation_check)
 
         self.root.after(0, update_ui)
@@ -437,84 +538,76 @@ class TranslationController:
         messagebox.showerror("翻译错误", f"翻译过程中出现错误: {error_msg}")
 
     def _on_selected_translation_progress(self, progress, batch_data):
-        """选中行翻译进度回调"""
-        def update_ui():
-            # 更新进度条
-            if progress >= 0:
-                self.progress_var.set(progress)
-                self.progress_bar.update_idletasks()
+        """选中行翻译进度回调（PERF-002：流式更新节流）"""
+        is_streaming = batch_data.get('streaming', False) if batch_data else False
+        batch_start = batch_data.get('batch_start', 0) if batch_data else 0
+        if is_streaming:
+            self._stream_coalescer.submit(
+                self._render_selected_progress, progress, batch_data,
+                coalesce_key=batch_start,
+            )
+        else:
+            self._stream_coalescer.cancel_pending(coalesce_key=batch_start)
+            self.root.after(0, lambda: self._render_selected_progress(progress, batch_data))
 
-            if not batch_data or not isinstance(batch_data, dict):
-                return
+    def _render_selected_progress(self, progress, batch_data):
+        """渲染选中行翻译进度（在主线程执行）"""
+        if progress >= 0:
+            self.progress_var.set(progress)
+            # PERF-002：移除 update_idletasks()
 
-            # 获取选中的数据
-            selected_data = getattr(self, '_selected_translation_data', [])
-            if not selected_data:
-                return
+        if not batch_data or not isinstance(batch_data, dict):
+            return
 
-            batch_start = batch_data.get('batch_start', 0)
-            is_streaming = batch_data.get('streaming', False)
+        selected_data = getattr(self, '_selected_translation_data', [])
+        if not selected_data:
+            return
 
-            if is_streaming:
-                # 流式输出模式：实时显示当前翻译结果
-                current_text = batch_data.get('current_text', '')
-                expected_lines = batch_data.get('expected_lines', 1)
+        batch_start = batch_data.get('batch_start', 0)
+        is_streaming = batch_data.get('streaming', False)
 
-                # ✅ 彻底过滤空行：将连续的多个空行合并为一个，避免大量空行堆积
-                all_lines = current_text.split('\n')
-                streaming_lines = []
-                prev_empty = False
-                for line in all_lines:
-                    if line.strip():  # 有内容的行
-                        streaming_lines.append(line)
-                        prev_empty = False
-                    else:  # 空行
-                        # 只在前一行不是空行时才保留一个空行
-                        if not prev_empty and streaming_lines:  # 且不是第一行
-                            streaming_lines.append('')
-                            prev_empty = True
-                        # 否则跳过这个空行
+        if is_streaming:
+            expected_lines = batch_data.get('expected_lines', 1)
+            stream_lines, stream_start_line = self._get_stream_snapshot(batch_data)
 
-                # 实时显示：不超过预期行数
-                for i, line in enumerate(streaming_lines[:expected_lines]):
-                    row_index = batch_start + i
-                    if row_index < len(selected_data):
-                        item = selected_data[row_index]['item']
-                        values = list(self.translation_table.item(item)['values'])
-                        values[2] = line.strip()  # 实时更新译文栏
+            last_item = None
+            for i, line in enumerate(stream_lines):
+                relative_index = stream_start_line + i
+                if relative_index >= expected_lines:
+                    break
+                row_index = batch_start + relative_index
+                if row_index < len(selected_data):
+                    item = selected_data[row_index]['item']
+                    values = list(self.translation_table.item(item)['values'])
+                    values[2] = line.strip()
+                    self.translation_table.item(item, values=values)
+                    last_item = item
+            # PERF-002：只滚动到最后一行
+            if last_item is not None and self._should_follow_stream(batch_data):
+                self.translation_table.see(last_item)
+        else:
+            translated_lines = batch_data.get('translated_lines', [])
+
+            for i, translated_line in enumerate(translated_lines):
+                row_index = batch_start + i
+                if row_index < len(selected_data):
+                    item = selected_data[row_index]['item']
+                    values = list(self.translation_table.item(item)['values'])
+                    new_val = translated_line.strip() if translated_line else ""
+                    if new_val:
+                        values[2] = new_val
                         self.translation_table.item(item, values=values)
 
-                        # 滚动到当前行
-                        self.translation_table.see(item)
-            else:
-                # 批次完成模式：写入最终结果
-                translated_lines = batch_data.get('translated_lines', [])
+            self.schedule_save()
 
-                # 将翻译结果写回对应的行
-                for i, translated_line in enumerate(translated_lines):
-                    row_index = batch_start + i
-                    if row_index < len(selected_data):
-                        item = selected_data[row_index]['item']
-                        values = list(self.translation_table.item(item)['values'])
-                        values[2] = translated_line.strip()  # 更新译文
-                        self.translation_table.item(item, values=values)
-
-                # 触发保存
-                self.schedule_save()
-
-        self.root.after(0, update_ui)
-
-    def _on_selected_translation_complete(self):
-        """选中行翻译完成回调"""
+    def _on_selected_translation_complete(self, result: BatchTranslationResult):
+        """选中行翻译完成回调（BUG-004：基于结构化结果区分状态）"""
         def complete_ui():
             # 恢复界面状态
             self.is_translating = False
             self.translate_btn.config(state=tk.NORMAL)
             self.continue_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
-
-            # 设置进度为100%
-            self.progress_var.set(100)
 
             # 获取翻译的行数
             selected_count = len(getattr(self, '_selected_translation_data', []))
@@ -526,22 +619,55 @@ class TranslationController:
             # 立即保存
             self.schedule_save(delay_ms=0)
 
-            self.status_updater(f"选中的 {selected_count} 行翻译完成")
-            messagebox.showinfo("翻译完成", f"已完成 {selected_count} 行的翻译")
+            if result.is_cancelled:
+                self.status_updater("已停止选中行翻译")
+                return
+
+            if result.is_failed:
+                self.status_updater("选中行翻译失败")
+                error_detail = result.error_message or "未知错误"
+                messagebox.showerror("翻译错误", f"选中行翻译失败：{error_detail}")
+                return
+
+            # 设置进度为100%
+            self.progress_var.set(100)
+
+            if result.status == TranslationStatus.PARTIAL:
+                failed_count = len(result.failed_indices)
+                self.status_updater(f"选中行翻译部分完成（{failed_count} 行失败）")
+                messagebox.showwarning(
+                    "翻译部分完成",
+                    f"选中 {selected_count} 行，其中 {failed_count} 行翻译失败。"
+                )
+            else:
+                self.status_updater(f"选中的 {selected_count} 行翻译完成")
+                messagebox.showinfo("翻译完成", f"已完成 {selected_count} 行的翻译")
 
         self.root.after(0, complete_ui)
 
     def _start_missing_translation_check(self):
-        """启动翻译查漏机制（新增：自动检测并翻译空行）
+        """启动翻译查漏机制（BUG-004：增加补译次数上限）
 
         核心逻辑：
         1. 检查所有行，找出原文不为空但译文为空的行
         2. 如果存在空行，自动启动翻译
         3. 一次最多翻译20个空行
-        4. 翻译完成后继续检查，直到所有行都翻译完成
+        4. 翻译完成后继续检查，直到所有行都翻译完成或达到补译上限
         """
         # 如果正在翻译，跳过
         if self.is_translating:
+            return
+
+        # BUG-004：达到补译上限后停止自动循环，允许用户手工重试
+        if self._missing_check_rounds >= MAX_MISSING_CHECK_ROUNDS:
+            self.status_updater(f"已达到自动补译上限（{MAX_MISSING_CHECK_ROUNDS} 次），剩余空行可手动重试")
+            messagebox.showwarning(
+                "翻译查漏",
+                f"已达到自动补译上限（{MAX_MISSING_CHECK_ROUNDS} 次）。\n"
+                "仍有部分行未翻译，可点击「继续翻译」手动重试。"
+            )
+            self._missing_check_rounds = 0
+            self._last_missing_failed_indices = []
             return
 
         # 获取原文和译文
@@ -557,11 +683,17 @@ class TranslationController:
         if not empty_indices:
             self.status_updater("翻译完成，无需查漏")
             messagebox.showinfo("翻译完成", "所有内容已翻译完成！")
+            self._missing_check_rounds = 0
+            self._last_missing_failed_indices = []
             return
 
         # 有空行，开始翻译查漏
+        self._missing_check_rounds += 1
         total_empty = len(empty_indices)
-        self.status_updater(f"正在进行翻译查漏：发现 {total_empty} 个空行")
+        self.status_updater(
+            f"正在进行翻译查漏（第 {self._missing_check_rounds}/{MAX_MISSING_CHECK_ROUNDS} 次）："
+            f"发现 {total_empty} 个空行"
+        )
 
         # 一次最多翻译20个空行
         batch_size = 20
@@ -586,12 +718,12 @@ class TranslationController:
         combined_source = '\n'.join(empty_source_lines)
         translation_thread = threading.Thread(
             target=self._translate_missing_worker,
-            args=(combined_source, self.translation_mode.get())
+            args=(combined_source,)
         )
         translation_thread.daemon = True
         translation_thread.start()
 
-    def _translate_missing_worker(self, content, mode):
+    def _translate_missing_worker(self, content):
         """翻译查漏工作线程"""
         try:
             self.translator.translate_fast_mode(
@@ -599,66 +731,102 @@ class TranslationController:
                 self._on_missing_translation_progress,
                 self._on_missing_translation_complete
             )
-        except Exception as e:
-            self.root.after(0, lambda: self._on_translation_error(str(e)))
+        except Exception as exc:
+            # BUG-002：在离开 except 块前绑定消息，避免 NameError
+            error_message = str(exc)
+            logger.exception("翻译查漏失败")
+            self.root.after(0, lambda message=error_message: self._on_translation_error(message))
 
     def _on_missing_translation_progress(self, progress, batch_data):
-        """翻译查漏进度回调"""
-        def update_ui():
-            # 更新进度条
-            if progress >= 0:
-                self.progress_var.set(progress)
-                self.progress_bar.update_idletasks()
+        """翻译查漏进度回调（PERF-002：流式更新节流）"""
+        is_streaming = batch_data.get('streaming', False) if batch_data else False
+        batch_start = batch_data.get('batch_start', 0) if batch_data else 0
+        if is_streaming:
+            self._stream_coalescer.submit(
+                self._render_missing_progress, progress, batch_data,
+                coalesce_key=batch_start,
+            )
+        else:
+            self._stream_coalescer.cancel_pending(coalesce_key=batch_start)
+            self.root.after(0, lambda: self._render_missing_progress(progress, batch_data))
 
-            if not batch_data or not isinstance(batch_data, dict):
-                return
+    def _render_missing_progress(self, progress, batch_data):
+        """渲染翻译查漏进度（在主线程执行）"""
+        if progress >= 0:
+            self.progress_var.set(progress)
+            # PERF-002：移除 update_idletasks()
 
-            # 获取空行位置
-            missing_indices = getattr(self, '_missing_translation_indices', [])
-            if not missing_indices:
-                return
+        if not batch_data or not isinstance(batch_data, dict):
+            return
 
-            batch_start = batch_data.get('batch_start', 0)
-            is_streaming = batch_data.get('streaming', False)
-            items = self.translation_table.get_children()
+        missing_indices = getattr(self, '_missing_translation_indices', [])
+        if not missing_indices:
+            return
 
-            if is_streaming:
-                # 流式输出模式
-                current_text = batch_data.get('current_text', '')
-                expected_lines = batch_data.get('expected_lines', 1)
-                streaming_lines = [line for line in current_text.split('\n') if line.strip()]
+        batch_start = batch_data.get('batch_start', 0)
+        is_streaming = batch_data.get('streaming', False)
+        items = self.translation_table.get_children()
 
-                for i, line in enumerate(streaming_lines[:expected_lines]):
-                    relative_index = batch_start + i
-                    if relative_index < len(missing_indices):
-                        row_index = missing_indices[relative_index]
-                        if row_index < len(items):
-                            item = items[row_index]
-                            values = list(self.translation_table.item(item)['values'])
-                            values[2] = line.strip()
+        if is_streaming:
+            expected_lines = batch_data.get('expected_lines', 1)
+            streaming_lines, stream_start_line = self._get_stream_snapshot(batch_data)
+
+            last_item = None
+            for i, line in enumerate(streaming_lines):
+                stream_index = stream_start_line + i
+                if stream_index >= expected_lines:
+                    break
+                relative_index = batch_start + stream_index
+                if relative_index < len(missing_indices):
+                    row_index = missing_indices[relative_index]
+                    if row_index < len(items):
+                        item = items[row_index]
+                        values = list(self.translation_table.item(item)['values'])
+                        values[2] = line.strip()
+                        self.translation_table.item(item, values=values)
+                        last_item = item
+            # PERF-002：只滚动到最后一行
+            if last_item is not None and self._should_follow_stream(batch_data):
+                self.translation_table.see(last_item)
+        else:
+            translated_lines = batch_data.get('translated_lines', [])
+
+            for i, translated_line in enumerate(translated_lines):
+                relative_index = batch_start + i
+                if relative_index < len(missing_indices):
+                    row_index = missing_indices[relative_index]
+                    if row_index < len(items):
+                        item = items[row_index]
+                        values = list(self.translation_table.item(item)['values'])
+                        new_val = translated_line.strip() if translated_line else ""
+                        if new_val:
+                            values[2] = new_val
                             self.translation_table.item(item, values=values)
-                            self.translation_table.see(item)
-            else:
-                # 批次完成模式
-                translated_lines = batch_data.get('translated_lines', [])
 
-                for i, translated_line in enumerate(translated_lines):
-                    relative_index = batch_start + i
-                    if relative_index < len(missing_indices):
-                        row_index = missing_indices[relative_index]
-                        if row_index < len(items):
-                            item = items[row_index]
-                            values = list(self.translation_table.item(item)['values'])
-                            values[2] = translated_line.strip()
-                            self.translation_table.item(item, values=values)
+            self.schedule_save()
 
-                # 保存
-                self.schedule_save()
+    @staticmethod
+    def _should_follow_stream(batch_data):
+        """仅允许最靠前的未完成并发批次控制表格滚动。"""
+        batch_start = batch_data.get('batch_start', 0)
+        display_batch_start = batch_data.get('display_batch_start')
+        return display_batch_start is None or batch_start == display_batch_start
 
-        self.root.after(0, update_ui)
+    @staticmethod
+    def _get_stream_snapshot(batch_data):
+        """获取最新流式快照及其在当前批次中的起始行。"""
+        preview_lines = batch_data.get('preview_lines')
+        if preview_lines is not None:
+            return preview_lines, 0
 
-    def _on_missing_translation_complete(self):
-        """翻译查漏完成回调：继续检查是否还有空行"""
+        stream_lines = batch_data.get('stream_lines')
+        if stream_lines is not None:
+            return stream_lines, batch_data.get('stream_start_line', 0)
+
+        return batch_data.get('current_text', '').split('\n'), 0
+
+    def _on_missing_translation_complete(self, result: BatchTranslationResult):
+        """翻译查漏完成回调（BUG-004：基于结果状态控制循环）"""
         def update_ui():
             self.is_translating = False
             self.translate_btn.config(state=tk.NORMAL)
@@ -674,7 +842,21 @@ class TranslationController:
             # 立即保存
             self.schedule_save(delay_ms=0)
 
-            # 继续检查是否还有空行（循环执行）
+            # 取消：不继续查漏
+            if result.is_cancelled:
+                self.status_updater("翻译查漏已停止")
+                self._missing_check_rounds = 0
+                return
+
+            # 失败：达到上限或继续受限重试
+            if result.is_failed:
+                error_detail = result.error_message or "未知错误"
+                self.status_updater(f"翻译查漏失败：{error_detail}")
+                # 失败也消耗一次补译机会，由 _start_missing_translation_check 判定上限
+                self.root.after(1000, self._start_missing_translation_check)
+                return
+
+            # 成功或部分成功：继续检查是否还有空行
             self.root.after(1000, self._start_missing_translation_check)
 
         self.root.after(0, update_ui)
@@ -683,6 +865,7 @@ class TranslationController:
         """保存译文。
 
         修复说明：确保译文与原文按行号严格对齐。
+        BUG-006：使用原子写入，失败时显示对话框（不显示成功）。
         """
         try:
             # 从表格获取译文
@@ -700,6 +883,7 @@ class TranslationController:
             )
 
             if file_path:
+                # BUG-006：write_file 现在使用原子写入，失败时抛出异常
                 self.file_handler.write_file(file_path, translated_content)
                 self.status_updater(f"译文已保存: {Path(file_path).name}")
 
@@ -712,7 +896,12 @@ class TranslationController:
                             target_lines
                         )
                     except Exception as e:
-                        pass  # EPUB映射同步失败，忽略
+                        # BUG-006：EPUB映射同步失败需可见，但不影响已保存的txt
+                        logger.error("EPUB映射同步失败: %s", e)
+                        messagebox.showwarning(
+                            "保存警告",
+                            f"译文文件已保存，但EPUB映射同步失败：\n{str(e)}"
+                        )
 
         except Exception as e:
             messagebox.showerror("保存错误", f"保存译文失败: {str(e)}")
@@ -755,13 +944,25 @@ class TranslationController:
             # 先同步一次映射（使用当前表格内容）
             _, target_lines = self.get_table_data()
 
+            # R2-BUG-019：映射保存失败必须中止导出，或由用户明确确认使用旧映射
+            using_stale_mapping = False
             try:
                 self.epub_processor.save_translations(
                     str(current_mapping_dir),
                     target_lines
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("导出前EPUB映射同步失败: %s", e)
+                confirmed = messagebox.askyesno(
+                    "映射保存失败",
+                    f"导出前映射同步失败：\n{str(e)}\n\n"
+                    "继续导出将使用旧映射中的译文，可能与当前表格内容不一致。\n"
+                    "是否仍要继续导出？",
+                )
+                if not confirmed:
+                    self.status_updater("EPUB导出已取消（映射保存失败）")
+                    return
+                using_stale_mapping = True
 
             # ✅ 新增：自动生成默认文件名为"原文_译文"
             default_filename = ""
@@ -787,7 +988,14 @@ class TranslationController:
                     try:
                         import json
                         with open(result_file, "r", encoding="utf-8") as f:
-                            image_map = json.load(f)
+                            raw = json.load(f)
+                        # R2-BUG-018：兼容新旧格式
+                        # 新格式: {"result_map": {...}, "run_at": ..., "result_count": ...}
+                        # 旧格式: {original_path: new_filename}
+                        if isinstance(raw, dict) and "result_map" in raw:
+                            image_map = raw["result_map"]
+                        else:
+                            image_map = raw
                     except Exception:
                         pass
 
@@ -808,7 +1016,16 @@ class TranslationController:
                     str(current_mapping_dir), out_path, image_map, image_text_map
                 )
                 self.status_updater(f"EPUB已导出: {Path(result_path).name}")
-                messagebox.showinfo("导出成功", f"已导出EPUB文件: {Path(result_path).name}")
+                # R2-BUG-019：使用旧映射导出时在提示中明确说明
+                if using_stale_mapping:
+                    messagebox.showwarning(
+                        "导出完成（使用旧映射）",
+                        f"已导出EPUB文件: {Path(result_path).name}\n\n"
+                        "警告：映射保存失败，导出使用的是旧映射中的译文，\n"
+                        "可能与当前表格内容不一致。",
+                    )
+                else:
+                    messagebox.showinfo("导出成功", f"已导出EPUB文件: {Path(result_path).name}")
             except Exception as e:
                 messagebox.showerror("导出错误", f"EPUB导出失败: {str(e)}")
         except Exception as e:

@@ -48,28 +48,33 @@ class SmartCache:
                 del self._store[key]
                 self._misses += 1
                 return None
+            # PERF-009：LRU 淘汰策略，更新最近访问时间
+            item["last_access"] = time.time()
             self._hits += 1
             return item["value"]
 
     def set(self, text: str, value: str, context: Optional[Dict[str, Any]] = None) -> None:
         key = self._make_key(text, context)
         with self._lock:
-            # 简单的容量控制：超过容量时随机淘汰一个（此处直接pop一个最旧键）
-            if len(self._store) >= self.max_memory_size:
+            # PERF-009：LRU 容量控制，优先淘汰过期项，再淘汰最久未访问的项
+            if len(self._store) >= self.max_memory_size and key not in self._store:
                 try:
-                    # 淘汰一个过期的，否则淘汰任意一个
+                    # 优先淘汰过期的
                     expired_keys = [k for k, v in self._store.items() if self._is_expired(v)]
                     if expired_keys:
-                        del self._store[expired_keys[0]]
-                    else:
-                        # pop 任意一个键（Python3.7+为插入顺序，近似FIFO）
-                        self._store.pop(next(iter(self._store)))
+                        for k in expired_keys:
+                            del self._store[k]
+                    # 仍超容量则淘汰最久未访问的
+                    if len(self._store) >= self.max_memory_size:
+                        lru_key = min(self._store, key=lambda k: self._store[k].get("last_access", 0))
+                        del self._store[lru_key]
                 except Exception:
                     pass
 
             self._store[key] = {
                 "value": value,
                 "expire_at": time.time() + self.ttl_seconds,
+                "last_access": time.time(),
             }
 
     def get_stats(self) -> Dict[str, Any]:

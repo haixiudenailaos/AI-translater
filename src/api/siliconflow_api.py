@@ -53,9 +53,10 @@ class SiliconFlowAPI(BaseAPI):
                 max_connections=self._max_connections,
                 keepalive_expiry=expiry,
             )
-            transport = httpx.HTTPTransport(retries=1, limits=limits)
+            # 重试由 BaseAPI 统一处理，transport 不再隐式重复请求。
+            transport = httpx.HTTPTransport(retries=0, limits=limits, http2=True)
             self._current_client = httpx.Client(
-                timeout=self._timeout, transport=transport, http2=True
+                timeout=self._http_timeout, transport=transport, http2=True
             )
         except Exception as e:
             logger.error("重建HTTP客户端失败: %s", e)
@@ -63,12 +64,17 @@ class SiliconFlowAPI(BaseAPI):
                 max_keepalive_connections=self._max_keepalive,
                 max_connections=self._max_connections,
             )
-            self._current_client = httpx.Client(timeout=self._timeout, limits=limits)
+            self._current_client = httpx.Client(timeout=self._http_timeout, limits=limits)
 
     # ── 心跳保活 ────────────────────────────────────────
 
     def _start_heartbeat(self):
-        """使用 HEAD 请求保持连接活跃（不消耗 API 额度）。"""
+        """使用 HEAD 请求保持连接活跃（不消耗 API 额度）。
+
+        R2-BUG-023：心跳失败时不得直接关闭可能处于活动状态的客户端。
+        通过 _recreate_client_if_safe() 检查活动请求计数，仅在没有翻译
+        请求进行时才重建。流式翻译持续超过多个心跳周期也不会被中断。
+        """
         def worker():
             while not self._heartbeat_stop_event.is_set():
                 if self._heartbeat_stop_event.wait(timeout=self._heartbeat_interval):
@@ -77,7 +83,8 @@ class SiliconFlowAPI(BaseAPI):
                     try:
                         self._current_client.head(self.base_url, timeout=3.0)
                     except Exception:
-                        self._recreate_client()
+                        # R2-BUG-023：仅在没有活动请求时重建客户端
+                        self._recreate_client_if_safe()
 
         self._heartbeat_thread = threading.Thread(target=worker, daemon=True)
         self._heartbeat_thread.start()
@@ -86,8 +93,10 @@ class SiliconFlowAPI(BaseAPI):
         if self._heartbeat_thread:
             self._heartbeat_stop_event.set()
             self._heartbeat_thread.join(timeout=2.0)
+            self._heartbeat_thread = None
 
     def close(self):
+        """BUG-005：关闭心跳线程和父类资源，幂等可安全多次调用。"""
         self._stop_heartbeat()
         super().close()
 
@@ -106,54 +115,55 @@ class SiliconFlowAPI(BaseAPI):
             return None
 
         try:
-            client = self._get_client()
-            if self._cancel_event.is_set():
-                return None
+            # R2-BUG-023：跟踪活动请求
+            with self._using_client() as client:
+                if self._cancel_event.is_set():
+                    return None
 
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{image_base64}",
-                                "detail": "high",
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{image_base64}",
+                                    "detail": "high",
+                                },
                             },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ]
+                request_data = {
+                    "model": model_override or self.model_name,
+                    "messages": messages,
+                    "max_tokens": self.max_tokens,
+                    "temperature": 0.3,
+                    "stream": False,
                 }
-            ]
-            request_data = {
-                "model": model_override or self.model_name,
-                "messages": messages,
-                "max_tokens": self.max_tokens,
-                "temperature": 0.3,
-                "stream": False,
-            }
-            logger.debug("[vision_query] model=%s, URL=%s/chat/completions",
-                         request_data["model"], self.base_url)
+                logger.debug("[vision_query] model=%s, URL=%s/chat/completions",
+                             request_data["model"], self.base_url)
 
-            resp = client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self.headers,
-                json=request_data,
-            )
-            logger.debug("[vision_query] 响应状态码: %s", resp.status_code)
+                resp = client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    json=request_data,
+                )
+                logger.debug("[vision_query] 响应状态码: %s", resp.status_code)
 
-            if resp.status_code == 200:
-                result = resp.json()
-                if result.get("choices"):
-                    content = result["choices"][0]["message"]["content"]
-                    logger.debug("[vision_query] 成功获取响应")
-                    return content
+                if resp.status_code == 200:
+                    result = resp.json()
+                    if result.get("choices"):
+                        content = result["choices"][0]["message"]["content"]
+                        logger.debug("[vision_query] 成功获取响应")
+                        return content
+                    else:
+                        logger.warning("[vision_query] 响应中没有choices: %s",
+                                       json.dumps(result, ensure_ascii=False)[:200])
                 else:
-                    logger.warning("[vision_query] 响应中没有choices: %s",
-                                   json.dumps(result, ensure_ascii=False)[:200])
-            else:
-                logger.error("[vision_query] 视觉查询失败: status=%s, text=%s",
-                             resp.status_code, resp.text)
+                    logger.error("[vision_query] 视觉查询失败: status=%s, text=%s",
+                                 resp.status_code, resp.text)
 
         except Exception as e:
             logger.error("[vision_query] 视觉查询请求异常: %s: %s",

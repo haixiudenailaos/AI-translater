@@ -5,14 +5,94 @@
 """
 
 import os
+import tempfile
+import time
 from pathlib import Path
 from typing import Optional
-import chardet
 import re
 from html import unescape
 from .logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# Windows 上并发 os.replace 可能因目标文件被短暂占用而返回 PermissionError，
+# 属于瞬态错误，短暂退避后重试即可成功。这是 R2-BUG-022 并发安全的必要补充。
+_REPLACE_RETRY_COUNT = 8
+_REPLACE_RETRY_BASE_DELAY = 0.005  # 5ms 起步，指数退避
+
+
+def _atomic_replace(src: Path, dst: Path) -> None:
+    """执行 os.replace，并在 Windows 瞬态 PermissionError 上有限重试。"""
+    last_exc: Optional[Exception] = None
+    for attempt in range(_REPLACE_RETRY_COUNT):
+        try:
+            os.replace(str(src), str(dst))
+            return
+        except PermissionError as exc:
+            # Windows：目标文件被其他线程/进程短暂占用
+            last_exc = exc
+            time.sleep(_REPLACE_RETRY_BASE_DELAY * (2 ** attempt))
+        except FileNotFoundError as exc:
+            # 源临时文件被其他写入者删除，属于冲突，不重试
+            last_exc = exc
+            break
+    # 重试耗尽，抛出最后一次异常
+    raise last_exc  # type: ignore[misc]
+
+
+def write_text_atomic(path, content: str, encoding: str = "utf-8") -> None:
+    """原子写入文本文件。
+
+    - BUG-006：原子写入，失败时旧文件保持不变。
+    - R2-BUG-022：使用唯一临时文件名，避免并发写入同一目标时互相覆盖或误删。
+      旧实现使用固定 `<target>.tmp`，自动保存、窗口关闭保存或不同后台任务
+      并发时，一个写入者可能替换或删除另一个写入者的临时文件。
+    - 临时文件与目标文件位于同一目录，保证 `os.replace()` 尽量原子化。
+    - Windows 并发 replace 的瞬态 PermissionError 通过有限重试规避。
+    - 失败时直接抛出异常，由调用方（UI 边界）负责展示。
+    """
+    path = Path(path)
+    # 确保父目录存在
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # R2-BUG-022：使用唯一临时文件名（同目录），避免并发冲突
+    temp_fd = None
+    temp_path = None
+    try:
+        # mkstemp 保证唯一文件名；同目录保证与目标在同一文件系统
+        temp_fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        temp_path = Path(temp_name)
+        # 关闭底层 fd 后用普通写入，确保编码正确处理
+        os.close(temp_fd)
+        temp_fd = None
+        temp_path.write_text(content, encoding=encoding)
+        # 原子替换（同一文件系统内），并处理 Windows 瞬态占用
+        _atomic_replace(temp_path, path)
+    except Exception:
+        # 清理自己创建的临时文件，避免污染目录
+        if temp_path is not None:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+        raise
+    finally:
+        # 兜底：若异常发生在 close 之前，确保不泄漏 fd
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except Exception:
+                pass
+
+
+def write_json_atomic(path, obj, encoding: str = "utf-8") -> None:
+    """BUG-006：原子写入 JSON 文件（ensure_ascii=False, indent=2）。"""
+    import json
+    write_text_atomic(path, json.dumps(obj, ensure_ascii=False, indent=2), encoding)
+
 
 class FileHandler:
     def __init__(self):
@@ -31,7 +111,11 @@ class FileHandler:
             with open(file_path, 'rb') as f:
                 raw_data = f.read()
                 
-            # 检测编码
+            # Encoding detection is only needed after the user imports a file.
+            # Keeping chardet out of module scope shortens GUI startup and also
+            # lets atomic JSON helpers work without the optional detector.
+            import chardet
+
             detected = chardet.detect(raw_data)
             encoding = detected.get('encoding', 'utf-8')
             
@@ -114,22 +198,14 @@ class FileHandler:
             raise Exception(f"读取EPUB文件失败: {str(e)}")
             
     def write_file(self, file_path: str, content: str, encoding: str = 'utf-8') -> bool:
-        """保存文件内容"""
-        try:
-            file_path = Path(file_path)
-            
-            # 确保目录存在
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # 保存文件
-            with open(file_path, 'w', encoding=encoding) as f:
-                f.write(content)
-                
-            return True
-            
-        except Exception as e:
-            logger.error("保存文件失败: %s", e)
-            return False
+        """保存文件内容。
+
+        BUG-006：使用原子写入，失败时抛出异常（不再吞掉异常返回 False）。
+        - 写入失败保留原文件，不显示成功。
+        - 成功返回 True；失败时抛出具体异常，由 UI 边界负责展示。
+        """
+        write_text_atomic(file_path, content, encoding)
+        return True
 
     def create_comparison_file(self, source_content: str, target_content: str) -> str:
         """创建原文译文对照文件"""

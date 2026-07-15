@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 
 class DeepseekAPI(BaseAPI):
     DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
-    DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3.2-Exp"
+    DEFAULT_MODEL = "deepseek-v4-flash"
     DEFAULT_MAX_KEEPALIVE = 10
     DEFAULT_MAX_CONNECTIONS = 20
     DEFAULT_TIMEOUT = 60.0

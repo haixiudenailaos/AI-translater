@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-轻小说翻译器V1.5自动化构建脚本
+轻小说翻译器V1.6 automated build script
 使用 PyInstaller 构建可执行文件，支持清理、构建、信息更新等功能
 """
 
@@ -25,7 +25,7 @@ class BuildManager:
         self.dist_dir = self.project_root / "dist"
         self.spec_file = self.project_root / "translator.spec"
         self.build_info_file = self.dist_dir / "build_info.json"
-        self.version = "1.5"  # 构建脚本版本
+        self.version = "1.6"  # build script version
         
     def print_status(self, message, status="INFO"):
         """打印状态信息"""
@@ -215,7 +215,7 @@ class BuildManager:
     def build(self, clean=True):
         """执行完整构建流程"""
         self.print_status("=" * 60)
-        self.print_status("轻小说翻译器V1.5 - 自动化构建", "INFO")
+        self.print_status("LightNovelTranslator V1.6 - automated build", "INFO")
         self.print_status("=" * 60)
         
         # 1. 清理构建目录（可选）
@@ -249,7 +249,7 @@ class BuildManager:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
-        description="轻小说翻译器V1.4自动化构建脚本",
+        description="LightNovelTranslator V1.6 automated build script",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:

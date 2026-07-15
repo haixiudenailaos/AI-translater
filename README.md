@@ -1,4 +1,4 @@
-# 轻小说翻译器 V1.1
+# 轻小说翻译器 V1.6
 
 一个基于Python和tkinter的轻小说翻译工具，支持EPUB格式文件的批量翻译处理。
 
@@ -35,9 +35,8 @@ python main.py
 
 我们提供了预编译的可执行文件，无需安装Python环境即可使用：
 
-- **Windows**: `轻小说翻译器V1.1-Windows-x64.exe`
-- **macOS**: `轻小说翻译器V1.1-macOS-Universal.app`
-- **Linux**: `轻小说翻译器V1.1-Linux-x64`
+- **Windows**: `LightNovelTranslator-1.6-Windows-x64.exe`
+- **macOS**: `LightNovelTranslator-1.6-macOS-Universal.app.zip`（解压后双击 `.app`）
 
 从 [Releases](https://github.com/haixiudenailaos/AI-translater/releases) 页面下载对应平台的版本。
 
@@ -97,7 +96,7 @@ python main.py
 ## 🏗️ 项目结构
 
 ```
-轻小说翻译原代码V1.1/
+LightNovelTranslator-V1.6/
 ├── main.py                 # 主程序入口
 ├── requirements.txt        # Python依赖
 ├── translator.spec         # PyInstaller配置
@@ -129,7 +128,7 @@ pyinstaller translator.spec
 
 项目配置了GitHub Actions自动化构建，支持：
 
-- ✅ 跨平台构建（Windows/macOS/Linux）
+- ✅ GitHub Actions 构建 Windows `.exe` 和 macOS `.app`
 - ✅ 自动发布Release
 - ✅ 构建产物上传
 

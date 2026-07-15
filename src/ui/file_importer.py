@@ -52,17 +52,26 @@ class FileImporter:
         self.current_mapping_dir = None
         self.current_mapping_keys = []
 
-    def import_file(self):
+    def _safe_after(self, target_window, func):
+        """R2-BUG-026：安全地在主线程调度回调，窗口已销毁时丢弃事件。"""
+        try:
+            if target_window is not None and target_window.winfo_exists():
+                self.root.after(0, func)
+        except Exception:
+            pass
+
+    def import_file(self, file_path=None):
         """导入文件并自动检测/创建对应译文文件，加载译文并定位到末尾"""
         try:
-            file_path = filedialog.askopenfilename(
-                title="选择要翻译的文件",
-                filetypes=[
-                    ("文本文件", "*.txt"),
-                    ("EPUB电子书", "*.epub"),
-                    ("所有文件", "*.*")
-                ]
-            )
+            if file_path is None:
+                file_path = filedialog.askopenfilename(
+                    title="选择要翻译的文件",
+                    filetypes=[
+                        ("所有文件", "*.*"),
+                        ("文本文件", "*.txt"),
+                        ("EPUB电子书", "*.epub"),
+                    ]
+                )
 
             if file_path:
                 # 记录原文路径
@@ -157,12 +166,12 @@ class FileImporter:
             """完全重构：EPUB解析工作线程，简化为纯行号对齐"""
             try:
                 # 更新状态
-                self.root.after(0, lambda: status_label.config(text="正在解析EPUB结构..."))
+                self._safe_after(progress_dialog, lambda: status_label.config(text="正在解析EPUB结构..."))
 
                 # 生成/刷新mapping
                 mapping_info = self.epub_processor.import_epub(str(src_path))
 
-                self.root.after(0, lambda: status_label.config(text="正在加载内容映射..."))
+                self._safe_after(progress_dialog, lambda: status_label.config(text="正在加载内容映射..."))
 
                 # 存储映射目录
                 self.current_mapping_dir = Path(mapping_info["mapping_dir"])
@@ -170,7 +179,7 @@ class FileImporter:
                 # 加载原文和译文列表（完全重构：直接返回原文和译文）
                 originals, translations = self.epub_processor.load_content_mapping(str(self.current_mapping_dir))
 
-                self.root.after(0, lambda: status_label.config(text="正在填充原文区域..."))
+                self._safe_after(progress_dialog, lambda: status_label.config(text="正在填充原文区域..."))
 
                 # 派生译文路径（EPUB模式下，为了避免权限问题，将译文txt保存到mapping目录）
                 # 注意：这个txt只是辅助，真正的译文存储在content_mapping.json中
@@ -215,14 +224,14 @@ class FileImporter:
 
                     self.status_updater(f"已导入EPUB: {src_path.name}（映射目录：{mapping_display}）")
 
-                self.root.after(0, update_ui)
+                self._safe_after(progress_dialog, update_ui)
                 result_container['success'] = True
 
             except Exception as e:
                 result_container['error'] = str(e)
             finally:
                 # 关闭弹窗并恢复UI
-                self.root.after(0, lambda: self._finish_epub_import(progress_dialog, result_container, src_path.name))
+                self._safe_after(progress_dialog, lambda: self._finish_epub_import(progress_dialog, result_container, src_path.name))
 
         # 在新线程中执行解析
         import_thread = threading.Thread(target=epub_import_worker, daemon=True)
@@ -292,21 +301,25 @@ class FileImporter:
         self._check_epub_images_for_text()
 
     def _check_epub_images_for_text(self):
-        """EPUB导入后检查图片是否包含外文文字"""
+        """EPUB 导入后询问是否使用默认图片翻译模块处理。
+
+        接入 Manga 模块后：不再检查火山 Key，直接走默认 Manga 模块。
+        """
         if not self.current_mapping_dir:
-            return
-
-        app_config = self.config_manager.get_app_config()
-        if not app_config.get("image_text_translation_enabled", True):
-            return
-
-        if not self.config_manager.is_api_configured():
             return
 
         # 检查images.json是否有图片
         images_file = self.current_mapping_dir / "images.json"
         if not images_file.exists():
             return
+
+        # PERF-004：迁移旧格式 Base64 图片到二进制资源文件
+        from ..infrastructure.image_asset_store import migrate_legacy_images
+        try:
+            migrate_legacy_images(self.current_mapping_dir)
+        except Exception as e:
+            # 迁移失败不阻断流程，旧格式仍可回退使用
+            pass
 
         import json
         try:
@@ -318,15 +331,15 @@ class FileImporter:
 
         img_count = len(images_data["image_mappings"])
 
-        # 弹出确认对话框
-        do_detect = messagebox.askyesno(
-            "图片文字检测",
-            f"检测到EPUB中包含 {img_count} 张图片。\n"
-            "是否使用视觉模型检测外文文字并自动插图翻译？\n\n"
-            "（需要配置火山引擎API Key，可稍后通过「图片翻译」按钮手动触发）"
+        # 弹出确认对话框：走默认 Manga 模块，不检查火山 Key
+        do_translate = messagebox.askyesno(
+            "图片翻译",
+            f"检测到 EPUB 包含 {img_count} 张图片，"
+            "是否使用默认图片翻译模块处理？\n\n"
+            "（可稍后通过「项目 - 图片翻译」手动触发）"
         )
 
-        if do_detect:
+        if do_translate:
             self.image_translation_starter()
 
     def import_clipboard(self):

@@ -6,7 +6,7 @@
 """
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from .table_editor import TableCellEditor
 
 
@@ -18,6 +18,7 @@ class TaskDetailWindow:
         "running": "翻译中",
         "paused": "已暂停",
         "completed": "已完成",
+        "partial": "部分完成",
         "cancelled": "已取消",
         "error": "出错",
     }
@@ -128,7 +129,9 @@ class TaskDetailWindow:
         is_running = task.status == "running"
         is_paused = task.status == "paused"
         is_pending = task.status == "pending"
-        self.start_btn.config(state=tk.NORMAL if (is_pending or is_paused) else tk.DISABLED)
+        is_partial = task.status == "partial"
+        # R2-BUG-011：partial 状态允许重新开始以继续翻译失败行
+        self.start_btn.config(state=tk.NORMAL if (is_pending or is_paused or is_partial) else tk.DISABLED)
         self.pause_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
         can_cancel = task.status not in ("completed", "cancelled")
         self.cancel_btn.config(state=tk.NORMAL if can_cancel else tk.DISABLED)
@@ -161,9 +164,33 @@ class TaskDetailWindow:
         self.manager.cancel_task(self.task_id)
 
     def _on_cell_edited(self, item_id, col_idx, old_value, new_value):
-        """TableCellEditor 回调：同步编辑结果到 task 数据"""
+        """TableCellEditor 回调：同步编辑结果到 task 数据并持久化（R2-BUG-015）"""
         values = self.table.item(item_id)["values"]
         row_idx = int(values[0]) - 1
         task = self.manager.get_task(self.task_id)
-        if task and row_idx < len(task.target_lines):
-            task.target_lines[row_idx] = new_value
+        if not task or row_idx >= len(task.target_lines):
+            return
+        # R2-BUG-015：运行中任务不允许编辑，避免进度回调覆盖用户编辑
+        if task.status == "running":
+            vals = list(self.table.item(item_id)["values"])
+            vals[col_idx] = old_value
+            self.table.item(item_id, values=vals)
+            messagebox.showwarning(
+                "编辑受限",
+                "任务正在翻译中，请先暂停或取消后再编辑译文。",
+                parent=self.win,
+            )
+            return
+        # 保存新值到内存
+        task.target_lines[row_idx] = new_value
+        # R2-BUG-015：持久化到文件，失败时恢复旧值
+        if not self.manager.save_task(self.task_id):
+            task.target_lines[row_idx] = old_value
+            vals = list(self.table.item(item_id)["values"])
+            vals[col_idx] = old_value
+            self.table.item(item_id, values=vals)
+            messagebox.showwarning(
+                "保存失败",
+                "译文保存失败，已恢复原值。请检查文件权限或磁盘空间。",
+                parent=self.win,
+            )

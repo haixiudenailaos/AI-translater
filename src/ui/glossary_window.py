@@ -9,6 +9,8 @@ from tkinter import ttk, messagebox, filedialog
 import json
 from pathlib import Path
 
+from ..utils.file_handler import write_json_atomic
+
 class GlossaryWindow:
     def __init__(self, parent, config_manager):
         self.parent = parent
@@ -358,11 +360,11 @@ class GlossaryWindow:
         
         if file_path:
             try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.glossary_data, f, ensure_ascii=False, indent=2)
-                    
+                # BUG-006：使用原子写入，失败时旧文件保持不变
+                write_json_atomic(file_path, self.glossary_data)
+
                 messagebox.showinfo("导出成功", f"术语库已导出到: {Path(file_path).name}")
-                
+
             except Exception as e:
                 messagebox.showerror("导出错误", f"导出失败: {str(e)}")
                 

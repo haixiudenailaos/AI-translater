@@ -1,0 +1,62 @@
+# requirements-image-manga.txt
+# ============================================================================
+# 漫画翻译模块 (manga-image-translator) 依赖锁定
+#
+# 用途：为图片翻译默认 Manga Provider 提供深度学习依赖。
+# 本文件与 requirements.txt 互补，仅在需要启用图片翻译功能时安装：
+#   pip install -r requirements-image-manga.txt
+#
+# 设计原则：
+# - 所有版本经过验证，确保 CPU/GPU 均可运行（默认 device=auto）。
+# - 不污染主 requirements.txt，未启用图片翻译的项目无需安装。
+# - 与 src/infrastructure/image_translation/manga_provider.py 的惰性导入对齐：
+#   若本文件未安装，Manga Provider.validate() 会返回明确错误而不是崩溃。
+# ============================================================================
+
+# ── 深度学习框架 ───────────────────────────────────
+# torch 是 manga-image-translator 的核心依赖（detection/ocr/inpainting/upscaling 均使用）
+# CPU 版本默认；GPU 用户可单独安装 torch+cuXXX 覆盖
+torch>=2.1.0,<2.6
+torchvision>=0.16.0,<0.21
+
+# ONNX Runtime：用于部分检测/OCR 模型推理
+# CPU 版本默认；GPU 用户可改装 onnxruntime-gpu
+onnxruntime>=1.16.0,<1.20
+
+# ── 图像处理 ───────────────────────────────────────
+# OpenCV：图像变换、颜色空间处理
+opencv-python>=4.8.0,<4.10
+
+# NumPy：torch/opencv 共同依赖，明确锁定以避免 ABI 冲突
+numpy>=1.24.0,<2.0
+
+# Pillow：图片加载、EXIF 处理（主 requirements.txt 已有，此处冗余声明以防升级冲突）
+Pillow>=9.0.0
+
+# ── 模型与分词 ─────────────────────────────────────
+# HuggingFace Hub：模型下载与缓存
+huggingface-hub>=0.20.0,<0.25
+
+# Safetensors：模型权重安全加载
+safetensors>=0.4.0
+
+# Tokenizers：部分翻译器（m2m100/mbart50/nllb）使用
+tokenizers>=0.15.0,<0.20
+
+# Transformers：m2m100/mbart50/nllb 翻译器依赖
+# 注意：本项目默认使用 external_llm 翻译器（复用主 API 配置），
+# transformers 仅在用户显式切换到本地翻译器时需要。
+transformers>=4.38.0,<4.46
+
+# ── 文本渲染 ───────────────────────────────────────
+# Manga 渲染模块使用 Pillow + FreeType 渲染译文，无需额外包
+
+# ── 辅助 ───────────────────────────────────────────
+# ultralytics：YOLO 检测（CTD detector 可选依赖，缺失时回退到 default detector）
+ultralytics>=8.1.0,<8.4
+
+# ── 不纳入的依赖（按需说明）────────────────────────
+# - PyQt5：manga-image-translator 的独立 GUI，本项目使用 Tkinter，不需要
+# - fastapi / uvicorn：manga-image-translator 的 web 服务模式，本项目不使用
+# - pydensecrf：mask 精化可选依赖，未安装时使用默认精化
+# - waifu2x-ncnn-vulkan：独立可执行文件，由 MangaProvider 在运行时探测

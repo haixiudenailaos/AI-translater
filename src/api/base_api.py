@@ -15,10 +15,13 @@ import httpx
 import json
 import time
 import threading
-from typing import Dict, Any, Optional, List, Callable
+from contextlib import contextmanager
+from typing import Dict, Any, Optional, List, Callable, Generator
 from ..core.smart_cache import SmartCache
 from ..core.batch_processor import get_batch_processor
+from ..domain.errors import TranslationRequestError
 from ..utils.logger import get_logger
+from ..utils.token_estimator import estimate_tokens
 
 logger = get_logger(__name__)
 
@@ -35,7 +38,7 @@ class BaseAPI:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.base_url = config.get("base_url", self.DEFAULT_BASE_URL)
+        self.base_url = config.get("base_url", self.DEFAULT_BASE_URL).strip().rstrip("/")
         self.api_key = config.get("api_key", "").strip()
         self.model_name = config.get("model_name", self.DEFAULT_MODEL)
         self.max_tokens = config.get("max_tokens", 2048)
@@ -43,11 +46,44 @@ class BaseAPI:
         self._cancel_event = threading.Event()
         self._current_client: Optional[httpx.Client] = None
 
+        # R2-BUG-023：活动请求计数器和客户端锁
+        # 心跳线程通过检查 _active_requests 判断是否有翻译请求正在进行，
+        # 避免在流式翻译过程中关闭客户端导致连接中断。
+        self._client_lock = threading.Lock()
+        self._active_requests = 0
+
+        self._max_attempts = max(1, min(5, int(config.get("api_max_attempts", 3))))
+        self._retry_base_delay = max(0.0, float(config.get("retry_base_delay", 1.0)))
+        self._metrics_lock = threading.Lock()
+        self._metrics = {
+            "request_attempts": 0,
+            "successful_requests": 0,
+            "retries": 0,
+            "rate_limit_errors": 0,
+            "input_tokens_estimated": 0,
+            "output_tokens_estimated": 0,
+            "ttft_seconds": 0.0,
+            "generation_seconds": 0.0,
+            "request_seconds": 0.0,
+        }
+        self._rate_limit_pressure = 0.0
+
         # HTTP 连接池配置
         http_limits = config.get("http_limits", {})
         self._max_keepalive = http_limits.get("max_keepalive_connections", self.DEFAULT_MAX_KEEPALIVE)
         self._max_connections = http_limits.get("max_connections", self.DEFAULT_MAX_CONNECTIONS)
-        self._timeout = config.get("http_timeout", self.DEFAULT_TIMEOUT)
+        legacy_timeout = float(config.get("http_timeout", self.DEFAULT_TIMEOUT))
+        self._connect_timeout = float(config.get("http_connect_timeout", 10.0))
+        self._read_timeout = float(config.get("http_read_timeout", legacy_timeout))
+        self._write_timeout = float(config.get("http_write_timeout", 60.0))
+        self._pool_timeout = float(config.get("http_pool_timeout", 10.0))
+        self._timeout = self._read_timeout
+        self._http_timeout = httpx.Timeout(
+            connect=self._connect_timeout,
+            read=self._read_timeout,
+            write=self._write_timeout,
+            pool=self._pool_timeout,
+        )
 
         # 初始化持久客户端
         self._recreate_client()
@@ -57,8 +93,8 @@ class BaseAPI:
         if self.api_key:
             self.headers["Authorization"] = f"Bearer {self.api_key}"
 
-        # 缓存
-        self.enable_cache = config.get("enable_cache", True)
+        # 缓存（BUG-008：主翻译路径调用 translate_stream() 绕过缓存，默认不创建）
+        self.enable_cache = config.get("enable_cache", False)
         if self.enable_cache:
             cc = config.get("cache_config", {})
             self.cache = SmartCache(
@@ -98,36 +134,93 @@ class BaseAPI:
                 max_keepalive_connections=self._max_keepalive,
                 max_connections=self._max_connections,
             )
-            self._current_client = httpx.Client(timeout=self._timeout, limits=limits)
+            self._current_client = httpx.Client(timeout=self._http_timeout, limits=limits)
         except Exception as e:
             logger.error("重建HTTP客户端失败: %s", e)
-            self._current_client = httpx.Client(timeout=self._timeout)
+            self._current_client = httpx.Client(timeout=self._http_timeout)
 
     def _get_client(self) -> httpx.Client:
-        if not self._current_client:
+        """获取当前 HTTP 客户端。
+
+        R2-BUG-008：不仅判断是否为 None，还要判断 is_closed。
+        取消操作会关闭并置空客户端，下次请求必须重建，否则复用已关闭客户端
+        会导致连续失败。
+        """
+        client = self._current_client
+        if client is None or getattr(client, "is_closed", False):
             self._recreate_client()
         return self._current_client
 
+    @contextmanager
+    def _using_client(self) -> Generator[httpx.Client, None, None]:
+        """上下文管理器：跟踪活动请求，防止心跳线程关闭活动客户端。
+
+        R2-BUG-023：翻译线程在使用客户端期间增加 _active_requests 计数，
+        心跳线程通过 _recreate_client_if_safe() 检查此计数，仅在无活动请求时
+        才重建客户端。这样流式翻译持续超过多个心跳周期也不会被中断。
+        """
+        with self._client_lock:
+            self._active_requests += 1
+        try:
+            yield self._get_client()
+        finally:
+            with self._client_lock:
+                if self._active_requests > 0:
+                    self._active_requests -= 1
+
+    def _recreate_client_if_safe(self):
+        """仅在无活动请求时重建客户端（供心跳线程使用）。
+
+        R2-BUG-023：心跳失败时如果直接关闭活动客户端，会中断正在进行的
+        流式翻译。此方法检查活动请求计数，仅在没有活动请求时才重建。
+        有活动请求时跳过并记录日志，等下一个心跳周期再尝试。
+        """
+        with self._client_lock:
+            if self._active_requests > 0:
+                logger.debug("心跳检测到 %d 个活动请求，跳过客户端重建", self._active_requests)
+                return
+            # 保持锁直到替换完成，避免检查后有新请求拿到即将关闭的客户端。
+            self._recreate_client()
+
     def cancel_requests(self):
+        """取消所有进行中的请求。
+
+        R2-BUG-008：关闭客户端后立即置空，确保下次 _get_client() 会重建。
+        旧实现只关闭不置空，_get_client() 仅判断 None，导致复用已关闭客户端。
+        """
         self._cancel_event.set()
-        if self._current_client:
+        client = self._current_client
+        if client is not None:
             try:
-                self._current_client.close()
+                client.close()
             except Exception:
                 pass
+            self._current_client = None
 
     def reset_cancel(self):
+        """BUG-005：只重置取消标记，不承担客户端重建/丢弃职责。
+
+        R2-BUG-008：取消时客户端已被置空，下次 _get_client() 会自动重建，
+        因此此处无需重建客户端。
+        """
         self._cancel_event.clear()
-        self._current_client = None
 
     def close(self):
-        """释放资源。子类可扩展。"""
+        """BUG-005：释放 HTTP 客户端和批处理线程池，幂等可安全多次调用。"""
+        # 关闭 HTTP 客户端
         if self._current_client:
             try:
                 self._current_client.close()
             except Exception:
                 pass
             self._current_client = None
+        # 关闭批处理线程池
+        if self.batch_processor:
+            try:
+                self.batch_processor.close()
+            except Exception:
+                pass
+            self.batch_processor = None
 
     # ── 连接测试 ────────────────────────────────────────
 
@@ -178,7 +271,9 @@ class BaseAPI:
                 return None
 
         for attempt in range(2):
-            result = _check_once(self._get_client())
+            # R2-BUG-023：跟踪活动请求
+            with self._using_client() as client:
+                result = _check_once(client)
             if result is True:
                 return True
             if result is False:
@@ -204,11 +299,16 @@ class BaseAPI:
         if self._cancel_event.is_set():
             return None
 
+        context = context or {}
+        messages = []
+        if context.get("system_prompt"):
+            messages.append({"role": "system", "content": context["system_prompt"]})
+        messages.append({"role": "user", "content": text})
         request_data = {
-            "model": context.get("model", self.model_name) if context else self.model_name,
-            "messages": [{"role": "user", "content": text}],
-            "max_tokens": context.get("max_tokens", self.max_tokens) if context else self.max_tokens,
-            "temperature": context.get("temperature", self.temperature) if context else self.temperature,
+            "model": context.get("model", self.model_name),
+            "messages": messages,
+            "max_tokens": context.get("max_tokens", self.max_tokens),
+            "temperature": context.get("temperature", self.temperature),
             "stream": False,
         }
 
@@ -216,23 +316,24 @@ class BaseAPI:
             if self._cancel_event.is_set():
                 return None
             try:
-                client = self._get_client()
-                resp = client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=self.headers,
-                    json=request_data,
-                )
-                if resp.status_code == 200:
-                    result = resp.json()
-                    if result.get("choices"):
-                        return result["choices"][0]["message"]["content"]
-                else:
-                    logger.error("API请求失败: %s - %s", resp.status_code, resp.text)
+                # R2-BUG-023：跟踪活动请求
+                with self._using_client() as client:
+                    resp = client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=self.headers,
+                        json=request_data,
+                    )
+                    if resp.status_code == 200:
+                        result = resp.json()
+                        if result.get("choices"):
+                            return result["choices"][0]["message"]["content"]
+                    else:
+                        logger.error("API请求失败: %s - %s", resp.status_code, resp.text)
                 if attempt == 0:
-                    self._recreate_client()
+                    self._recreate_client_if_safe()
             except httpx.ConnectError:
                 if attempt == 0:
-                    self._recreate_client()
+                    self._recreate_client_if_safe()
                     continue
                 return None
             except Exception as e:
@@ -243,93 +344,179 @@ class BaseAPI:
 
     # ── 流式翻译 ────────────────────────────────────────
 
-    def translate_stream(self, text: str, callback=None) -> Optional[str]:
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        return status_code in (408, 425, 429) or 500 <= status_code <= 599
+
+    def _retry_delay(self, attempt: int, response=None) -> float:
+        if response is not None:
+            retry_after = response.headers.get("retry-after")
+            if retry_after:
+                try:
+                    return min(30.0, max(0.0, float(retry_after)))
+                except ValueError:
+                    pass
+        return min(20.0, self._retry_base_delay * (2 ** attempt))
+
+    def _record_attempt(self, input_tokens: int) -> None:
+        with self._metrics_lock:
+            self._metrics["request_attempts"] += 1
+            self._metrics["input_tokens_estimated"] += input_tokens
+
+    def _record_retry(self, *, rate_limited: bool = False) -> None:
+        with self._metrics_lock:
+            self._metrics["retries"] += 1
+            if rate_limited:
+                self._metrics["rate_limit_errors"] += 1
+                self._rate_limit_pressure = min(8.0, self._rate_limit_pressure + 1.0)
+
+    def _record_rate_limit(self) -> None:
+        with self._metrics_lock:
+            self._metrics["rate_limit_errors"] += 1
+            self._rate_limit_pressure = min(8.0, self._rate_limit_pressure + 1.0)
+
+    def _record_success(
+        self, *, started_at: float, first_token_at: float, output_text: str
+    ) -> None:
+        finished_at = time.perf_counter()
+        output_tokens = estimate_tokens(output_text)
+        with self._metrics_lock:
+            self._metrics["successful_requests"] += 1
+            self._metrics["output_tokens_estimated"] += output_tokens
+            self._metrics["ttft_seconds"] += max(0.0, first_token_at - started_at)
+            self._metrics["generation_seconds"] += max(0.0, finished_at - first_token_at)
+            self._metrics["request_seconds"] += max(0.0, finished_at - started_at)
+            self._rate_limit_pressure = max(0.0, self._rate_limit_pressure - 0.25)
+
+    def recommended_concurrency(self, configured: int) -> int:
+        """Reduce new request fan-out while the provider is returning 429s."""
+        with self._metrics_lock:
+            pressure = self._rate_limit_pressure
+        if pressure >= 0.5:
+            return 1
+        return max(1, configured)
+
+    def recommended_input_budget(self, configured: int) -> int:
+        """Use a smaller next-run batch budget after token/rate pressure."""
+        with self._metrics_lock:
+            pressure = self._rate_limit_pressure
+        return max(512, int(configured * 0.75)) if pressure >= 0.5 else configured
+
+    def translate_stream(
+        self, text: str, callback=None, system_prompt: str = None
+    ) -> Optional[str]:
         if self._cancel_event.is_set():
             return None
 
-        max_retries = 5
-        for retry in range(max_retries):
-            try:
-                client = self._get_client()
-                if self._cancel_event.is_set():
-                    return None
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": text})
+        input_tokens = estimate_tokens((system_prompt or "") + "\n" + text)
 
-                with client.stream(
-                    "POST",
-                    f"{self.base_url}/chat/completions",
-                    headers=self.headers,
-                    json={
-                        "model": self.model_name,
-                        "messages": [{"role": "user", "content": text}],
-                        "max_tokens": self.max_tokens,
-                        "temperature": self.temperature,
-                        "stream": True,
-                    },
-                ) as response:
-                    if response.status_code != 200:
-                        if retry < max_retries - 1:
-                            logger.warning("流式请求失败 (HTTP %s)，正在重试 (%s/%s)...",
-                                           response.status_code, retry + 1, max_retries)
-                            self._recreate_client()
-                            time.sleep(1)
-                            continue
-                        logger.error("流式请求失败: %s次重试后仍失败 (HTTP %s)",
-                                     max_retries, response.status_code)
+        for attempt in range(self._max_attempts):
+            started_at = time.perf_counter()
+            first_token_at = None
+            content_parts: List[str] = []
+            self._record_attempt(input_tokens)
+            try:
+                # R2-BUG-023：使用 _using_client 跟踪活动请求，
+                # 防止心跳线程在流式翻译期间关闭客户端
+                with self._using_client() as client:
+                    if self._cancel_event.is_set():
                         return None
 
-                    full_content = ""
-                    for line in response.iter_lines():
-                        if self._cancel_event.is_set():
-                            return None
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            if data_str.strip() == "[DONE]":
-                                break
-                            try:
-                                data = json.loads(data_str)
-                                choices = data.get("choices", [])
-                                if choices:
-                                    delta = choices[0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        full_content += content
-                                        if callback:
-                                            callback(content)
-                            except json.JSONDecodeError:
+                    with client.stream(
+                        "POST",
+                        f"{self.base_url}/chat/completions",
+                        headers=self.headers,
+                        json={
+                            "model": self.model_name,
+                            "messages": messages,
+                            "max_tokens": self.max_tokens,
+                            "temperature": self.temperature,
+                            "stream": True,
+                        },
+                    ) as response:
+                        if response.status_code != 200:
+                            response.read()
+                            status_code = response.status_code
+                            rate_limited = status_code == 429
+                            if self._is_retryable_status(status_code) and attempt < self._max_attempts - 1:
+                                self._record_retry(rate_limited=rate_limited)
+                                delay = self._retry_delay(attempt, response)
+                                logger.warning(
+                                    "流式请求失败 (HTTP %s)，%.1f 秒后重试 (%s/%s)",
+                                    status_code, delay, attempt + 1, self._max_attempts,
+                                )
+                                self._cancel_event.wait(delay)
                                 continue
-                    return full_content
+                            if rate_limited:
+                                self._record_rate_limit()
+                            body = response.text[:500]
+                            raise TranslationRequestError(
+                                f"API 请求失败 (HTTP {status_code}): {body}",
+                                status_code=status_code,
+                            )
 
-            except httpx.ConnectError as e:
+                        # PERF-001：用列表累积避免字符串拼接 O(n²)
+                        for line in response.iter_lines():
+                            if self._cancel_event.is_set():
+                                return None
+                            if line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str.strip() == "[DONE]":
+                                    break
+                                try:
+                                    data = json.loads(data_str)
+                                    choices = data.get("choices", [])
+                                    if choices:
+                                        delta = choices[0].get("delta", {})
+                                        content = delta.get("content", "")
+                                        if content:
+                                            if first_token_at is None:
+                                                first_token_at = time.perf_counter()
+                                            content_parts.append(content)
+                                            if callback:
+                                                callback(content)
+                                except json.JSONDecodeError:
+                                    continue
+                        result = "".join(content_parts)
+                        if not result:
+                            if attempt < self._max_attempts - 1:
+                                self._record_retry()
+                                self._cancel_event.wait(self._retry_delay(attempt))
+                                continue
+                            raise TranslationRequestError("API 未返回任何翻译内容")
+                        self._record_success(
+                            started_at=started_at,
+                            first_token_at=first_token_at or time.perf_counter(),
+                            output_text=result,
+                        )
+                        return result
+
+            except TranslationRequestError:
+                raise
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
                 if self._cancel_event.is_set():
                     return None
-                if retry < max_retries - 1:
-                    logger.warning("连接错误: %s，正在重试 (%s/%s)...", e, retry + 1, max_retries)
-                    self._recreate_client()
-                    time.sleep(1)
-                else:
-                    logger.error("流式翻译失败: %s次重试后仍无法连接 - %s", max_retries, e)
-                    return None
-            except httpx.TimeoutException as e:
-                if self._cancel_event.is_set():
-                    return None
-                if retry < max_retries - 1:
-                    logger.warning("请求超时: %s，正在重试 (%s/%s)...", e, retry + 1, max_retries)
-                    self._recreate_client()
-                    time.sleep(1)
-                else:
-                    logger.error("流式翻译失败: %s次重试后仍超时 - %s", max_retries, e)
-                    return None
+                # 已产生内容时不重试，避免把同一批译文重复回放到 UI。
+                if not content_parts and attempt < self._max_attempts - 1:
+                    self._record_retry()
+                    self._recreate_client_if_safe()
+                    delay = self._retry_delay(attempt)
+                    logger.warning(
+                        "网络请求失败: %s，%.1f 秒后重试 (%s/%s)",
+                        e, delay, attempt + 1, self._max_attempts,
+                    )
+                    self._cancel_event.wait(delay)
+                    continue
+                raise TranslationRequestError(f"网络请求失败: {e}") from e
             except Exception as e:
                 if self._cancel_event.is_set():
                     return None
-                if retry < max_retries - 1:
-                    logger.warning("流式翻译异常: %s，正在重试 (%s/%s)...", e, retry + 1, max_retries)
-                    self._recreate_client()
-                    time.sleep(1)
-                else:
-                    logger.error("流式翻译失败: %s次重试后仍失败 - %s", max_retries, e)
-                    return None
-        return None
+                raise TranslationRequestError(f"流式翻译异常: {e}") from e
+        raise TranslationRequestError("API 重试耗尽")
 
     # ── 视觉查询 ────────────────────────────────────────
 
@@ -341,39 +528,40 @@ class BaseAPI:
         if self._cancel_event.is_set():
             return None
         try:
-            client = self._get_client()
-            if self._cancel_event.is_set():
-                return None
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{image_base64}"},
-                        },
-                    ],
+            # R2-BUG-023：跟踪活动请求
+            with self._using_client() as client:
+                if self._cancel_event.is_set():
+                    return None
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime_type};base64,{image_base64}"},
+                            },
+                        ],
+                    }
+                ]
+                request_data = {
+                    "model": model_override or self.model_name,
+                    "messages": messages,
+                    "max_tokens": self.max_tokens,
+                    "temperature": 0.3,
+                    "stream": False,
                 }
-            ]
-            request_data = {
-                "model": model_override or self.model_name,
-                "messages": messages,
-                "max_tokens": self.max_tokens,
-                "temperature": 0.3,
-                "stream": False,
-            }
-            resp = client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self.headers,
-                json=request_data,
-            )
-            if resp.status_code == 200:
-                result = resp.json()
-                if result.get("choices"):
-                    return result["choices"][0]["message"]["content"]
-            else:
-                logger.error("视觉查询失败: %s - %s", resp.status_code, resp.text)
+                resp = client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    json=request_data,
+                )
+                if resp.status_code == 200:
+                    result = resp.json()
+                    if result.get("choices"):
+                        return result["choices"][0]["message"]["content"]
+                else:
+                    logger.error("视觉查询失败: %s - %s", resp.status_code, resp.text)
         except Exception as e:
             if not self._cancel_event.is_set():
                 logger.error("视觉查询请求失败: %s", e)
@@ -405,15 +593,16 @@ class BaseAPI:
             self.cache.set(text, result, context)
         return result
 
-    def translate_batch(self, texts: List[str], contexts: List[Dict[str, Any]] = None,
-                        priority: int = 0) -> List[Optional[str]]:
+    def translate_batch(self, texts: List[str], contexts: List[Dict[str, Any]] = None) -> List[Optional[str]]:
         if not self.batch_processor:
             return [self.translate_with_cache(t, contexts[i] if contexts and i < len(contexts) else None)
                     for i, t in enumerate(texts)]
         futures = []
         for i, text in enumerate(texts):
             ctx = contexts[i] if contexts and i < len(contexts) else {}
-            futures.append(self.batch_processor.submit_request(text, ctx, priority=priority))
+            futures.append(self.batch_processor.submit_request(text, ctx))
+        # PERF-010：立即刷新尾批，避免等待 max_wait_time 造成不必要延迟
+        self.batch_processor.flush()
         results = []
         for f in futures:
             try:
@@ -423,10 +612,18 @@ class BaseAPI:
                 results.append(None)
         return results
 
-    def translate_stream_enhanced(self, text: str, callback: Callable[[str], None] = None,
-                                  context: Dict[str, Any] = None, stream_id: str = None) -> Optional[str]:
+    def translate_stream_enhanced(
+        self,
+        text: str,
+        callback: Callable[[str], None] = None,
+        context: Dict[str, Any] = None,
+        stream_id: str = None,
+        system_prompt: str = None,
+    ) -> Optional[str]:
         if not self.enable_stream:
-            result = self.translate_with_cache(text, context)
+            direct_context = dict(context or {})
+            direct_context["system_prompt"] = system_prompt
+            result = self._direct_translate(text, direct_context)
             if callback and result:
                 callback(result)
             return result
@@ -434,16 +631,21 @@ class BaseAPI:
             cached = self.cache.get(text, context)
             if cached:
                 if callback:
-                    self._simulate_stream_output(cached, callback)
+                    # 缓存命中应在返回前同步回放，避免后台回调在任务已经
+                    # 完成后继续修改 UI。
+                    callback(cached)
                 return cached
         if stream_id and callback:
             self.stream_callbacks[stream_id] = callback
-        result = self.translate_stream(text, callback)
-        if result and self.cache:
-            self.cache.set(text, result, context)
-        if stream_id and stream_id in self.stream_callbacks:
-            del self.stream_callbacks[stream_id]
-        return result
+        try:
+            result = self.translate_stream(text, callback, system_prompt=system_prompt)
+            # PERF-009：不缓存取消、空响应的翻译结果
+            if result and self.cache and not self._cancel_event.is_set():
+                self.cache.set(text, result, context)
+            return result
+        finally:
+            if stream_id:
+                self.stream_callbacks.pop(stream_id, None)
 
     def _simulate_stream_output(self, text: str, callback: Callable[[str], None],
                                 chunk_size: int = 3, delay: float = 0.05):
@@ -472,10 +674,6 @@ class BaseAPI:
         if self.cache:
             self.cache.optimize_cache()
 
-    def flush_batch(self):
-        if self.batch_processor:
-            self.batch_processor.flush_pending()
-
     def get_enhanced_stats(self) -> Dict[str, Any]:
         stats = {
             "cache_enabled": self.enable_cache,
@@ -487,4 +685,24 @@ class BaseAPI:
             stats["cache_stats"] = self.get_cache_stats()
         if self.batch_processor:
             stats["batch_stats"] = self.get_batch_stats()
+        stats["performance"] = self.get_performance_metrics()
         return stats
+
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        with self._metrics_lock:
+            metrics = dict(self._metrics)
+            pressure = self._rate_limit_pressure
+        successes = metrics["successful_requests"]
+        generation_seconds = metrics["generation_seconds"]
+        metrics["average_ttft_seconds"] = (
+            metrics["ttft_seconds"] / successes if successes else 0.0
+        )
+        metrics["average_request_seconds"] = (
+            metrics["request_seconds"] / successes if successes else 0.0
+        )
+        metrics["output_tokens_per_second"] = (
+            metrics["output_tokens_estimated"] / generation_seconds
+            if generation_seconds > 0 else 0.0
+        )
+        metrics["rate_limit_pressure"] = pressure
+        return metrics
