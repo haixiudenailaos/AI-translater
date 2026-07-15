@@ -3,12 +3,11 @@ name: Build V1.6
 on:
   push:
     branches: [V1.6]
-  pull_request:
-    branches: [V1.6]
-  create:
     tags:
       - 'v*'
       - 'V*'
+  pull_request:
+    branches: [V1.6]
   workflow_dispatch:
 
 env:
@@ -123,7 +122,7 @@ jobs:
   release:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/V1.6' || startsWith(github.ref, 'refs/tags/'))
     permissions:
       contents: write
     steps:
@@ -136,6 +135,8 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          name: LightNovelTranslator V1.6
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'V1.6' }}
           files: artifacts/*
           draft: false
           prerelease: false
