@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 目标语言映射
 
@@ -8,9 +7,6 @@ manga-image-translator 流水线识别的 VALID_LANGUAGES 代码。
 
 未映射语言在执行前报配置错误，不得静默回退为中文或英文。
 """
-
-from typing import Optional
-
 
 # 本项目值 -> Manga 代码
 LANGUAGE_TO_MANGA_CODE: dict[str, str] = {
@@ -52,7 +48,7 @@ STAGE_LABELS: dict[str, str] = {
 }
 
 
-def to_manga_lang(project_lang: str) -> Optional[str]:
+def to_manga_lang(project_lang: str) -> str | None:
     """将本项目语言值映射为 Manga 代码，未映射返回 None。"""
     if not project_lang:
         return None

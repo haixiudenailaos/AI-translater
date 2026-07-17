@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 TranslatorEngine 取消信号与缺失译文检测测试
 
@@ -15,21 +14,22 @@ R2-BUG-010（缺失译文检测）的修复行为。
 
 import pytest
 
-from src.core.translator import TranslatorEngine
 from src.core.translation_result import (
-    TranslationStatus,
-    TranslationRequestError,
     TranslationCancelled,
+    TranslationRequestError,
+    TranslationStatus,
 )
-
+from src.core.translator import TranslatorEngine
 
 # ── Fakes ─────────────────────────────────────────────
+
 
 class FakeApi:
     """最小化的 API 替身，记录调用次数并按预设返回流式响应。"""
 
-    def __init__(self, response_text: str = "", raise_exc: Exception = None,
-                 return_none: bool = False):
+    def __init__(
+        self, response_text: str = "", raise_exc: Exception = None, return_none: bool = False
+    ):
         self.response_text = response_text
         self.raise_exc = raise_exc
         self.return_none = return_none
@@ -119,11 +119,13 @@ def _no_op_progress(progress, data):
 
 # ── _translate_batch 单元测试 ────────────────────────
 
+
 class TestTranslateBatchSuccess:
     """R2-BUG-010：成功路径验证"""
 
     def test_stream_progress_only_contains_new_completed_lines(self):
         """PERF-001：流式事件不重建历史文本，只发送新增完整行。"""
+
         class ChunkedApi(FakeApi):
             def translate_stream(self, prompt, callback):
                 self.call_count += 1
@@ -143,9 +145,7 @@ class TestTranslateBatchSuccess:
             if data.get("streaming"):
                 progress_events.append(data)
 
-        result = engine._translate_batch(
-            ["one", "two", "three"], progress_hook, 0, 3
-        )
+        result = engine._translate_batch(["one", "two", "three"], progress_hook, 0, 3)
 
         assert result.status == TranslationStatus.SUCCEEDED
         assert [event["stream_lines"] for event in progress_events] == [["甲"], ["乙"]]
@@ -287,13 +287,12 @@ class TestTranslateBatchRequestError:
 
 # ── _translate 整合测试 ──────────────────────────────
 
+
 class TestTranslateFlow:
     """多批次编排与取消传播"""
 
     def test_full_flow_success(self, monkeypatch):
         """完整翻译流程：所有批次成功 → SUCCEEDED"""
-        monkeypatch.setattr("src.core.translator.time.sleep", lambda _: None)
-
         # batch_lines=2，4 行原文 → 2 个批次
         api = FakeApi(response_text="[LINE_001]你好\n[LINE_002]世界")
         engine = _make_engine(batch_lines=2, api=api)
@@ -316,8 +315,6 @@ class TestTranslateFlow:
 
         R2-BUG-009 协作点：取消不发送成功批次回调，不覆盖已确认译文。
         """
-        monkeypatch.setattr("src.core.translator.time.sleep", lambda _: None)
-
         api = FakeApi(response_text="[LINE_001]你好\n[LINE_002]世界")
         engine = _make_engine(batch_lines=2, api=api)
 
@@ -347,13 +344,13 @@ class TestTranslateFlow:
 
     def test_partial_flow_with_missing_translation(self, monkeypatch):
         """一批成功一批有缺失译文 → PARTIAL + 全局 failed_indices"""
-        monkeypatch.setattr("src.core.translator.time.sleep", lambda _: None)
-
         # 第一批成功，第二批缺失 [LINE_002]
-        api = SequenceApi([
-            ("[LINE_001]你好\n[LINE_002]世界", False, None),
-            ("[LINE_001]foo译文", False, None),
-        ])
+        api = SequenceApi(
+            [
+                ("[LINE_001]你好\n[LINE_002]世界", False, None),
+                ("[LINE_001]foo译文", False, None),
+            ]
+        )
         engine = _make_engine(batch_lines=2, api=api)
 
         completed = []
@@ -374,13 +371,13 @@ class TestTranslateFlow:
 
     def test_failed_batch_does_not_block_subsequent(self, monkeypatch):
         """某批次彻底失败时记录失败行，继续处理后续批次 → PARTIAL"""
-        monkeypatch.setattr("src.core.translator.time.sleep", lambda _: None)
-
         # 第一批异常，第二批成功；翻译层不重复第一批。
-        api = SequenceApi([
-            ("", False, RuntimeError("network down")),
-            ("[LINE_001]foo译文\n[LINE_002]bar译文", False, None),  # 第二批成功
-        ])
+        api = SequenceApi(
+            [
+                ("", False, RuntimeError("network down")),
+                ("[LINE_001]foo译文\n[LINE_002]bar译文", False, None),  # 第二批成功
+            ]
+        )
         engine = _make_engine(batch_lines=2, api=api)
 
         completed = []
@@ -402,8 +399,6 @@ class TestTranslateFlow:
 
     def test_all_batches_fail_returns_failed(self, monkeypatch):
         """所有批次都失败 → FAILED"""
-        monkeypatch.setattr("src.core.translator.time.sleep", lambda _: None)
-
         # 两批各调用一次，重试已经收敛到 API 层。
         responses = [("", False, RuntimeError("err"))] * 2
         api = SequenceApi(responses)
@@ -424,6 +419,7 @@ class TestTranslateFlow:
 
 # ── R2-BUG-008：取消后客户端重建 ─────────────────────
 
+
 class TestCancelRecreatesClient:
     """R2-BUG-008：取消后 base_api 客户端状态正确重建
 
@@ -436,13 +432,15 @@ class TestCancelRecreatesClient:
         """取消后 _get_client 返回新的客户端实例"""
         from src.api.base_api import BaseAPI
 
-        api = BaseAPI({
-            "base_url": "http://localhost",
-            "api_key": "test-key",
-            "model_name": "gpt-4",
-            "enable_cache": False,
-            "enable_batch": False,
-        })
+        api = BaseAPI(
+            {
+                "base_url": "http://localhost",
+                "api_key": "test-key",
+                "model_name": "gpt-4",
+                "enable_cache": False,
+                "enable_batch": False,
+            }
+        )
 
         try:
             client_before = api._get_client()
@@ -466,13 +464,15 @@ class TestCancelRecreatesClient:
         """显式 close() 后 _get_client 也能重建"""
         from src.api.base_api import BaseAPI
 
-        api = BaseAPI({
-            "base_url": "http://localhost",
-            "api_key": "test-key",
-            "model_name": "gpt-4",
-            "enable_cache": False,
-            "enable_batch": False,
-        })
+        api = BaseAPI(
+            {
+                "base_url": "http://localhost",
+                "api_key": "test-key",
+                "model_name": "gpt-4",
+                "enable_cache": False,
+                "enable_batch": False,
+            }
+        )
 
         try:
             client1 = api._get_client()

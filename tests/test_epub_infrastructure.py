@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 阶段 4（EPUB 拆分）infrastructure 层模块测试
 
@@ -10,34 +9,31 @@
 - image_rewriter：图片路径匹配
 """
 
-import json
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
 from src.infrastructure.document_order import (
+    get_item_media_type,
+    get_item_name,
     iter_spine_documents,
     normalize_chapter_id,
-    get_item_name,
-    get_item_media_type,
+)
+from src.infrastructure.image_rewriter import (
+    inject_figcaption,
+    match_and_get_new_path,
+)
+from src.infrastructure.mapping_repository import (
+    load_content_mapping,
+    load_old_translations,
+    save_translations,
 )
 from src.infrastructure.segment_extractor import (
     BLOCK_TAGS,
     compute_source_checksum,
-    is_leaf_block,
     extract_segments_from_document,
+    is_leaf_block,
     match_existing_translation,
 )
-from src.infrastructure.mapping_repository import (
-    load_content_mapping,
-    save_translations,
-    load_old_translations,
-)
-from src.infrastructure.image_rewriter import (
-    match_and_get_new_path,
-    inject_figcaption,
-)
-
 
 # ── document_order 测试 ────────────────────────────────
 
@@ -123,6 +119,7 @@ class TestIterSpineDocuments:
     def test_string_spine(self):
         """字符串 idref 通过 get_item_with_id 解析"""
         import ebooklib
+
         book = MagicMock()
         doc = MagicMock()
         doc.get_type.return_value = ebooklib.ITEM_DOCUMENT
@@ -136,7 +133,6 @@ class TestIterSpineDocuments:
 
     def test_skip_nonlinear(self):
         """linear='no' 的条目被跳过"""
-        import ebooklib
         book = MagicMock()
         book.get_item_with_id.return_value = None
         book.spine = [("c1", "no")]
@@ -147,6 +143,7 @@ class TestIterSpineDocuments:
     def test_dedup(self):
         """重复 idref 去重"""
         import ebooklib
+
         book = MagicMock()
         doc = MagicMock()
         doc.get_type.return_value = ebooklib.ITEM_DOCUMENT
@@ -190,12 +187,14 @@ class TestComputeSourceChecksum:
 class TestIsLeafBlock:
     def test_p_without_block_children(self):
         from bs4 import BeautifulSoup
+
         soup = BeautifulSoup("<p>text</p>", "html.parser")
         p = soup.find("p")
         assert is_leaf_block(p) is True
 
     def test_div_with_p_child(self):
         from bs4 import BeautifulSoup
+
         soup = BeautifulSoup("<div><p>text</p></div>", "html.parser")
         div = soup.find("div")
         assert is_leaf_block(div) is False
@@ -204,6 +203,7 @@ class TestIsLeafBlock:
 class TestExtractSegments:
     def test_extract_from_simple_doc(self):
         from bs4 import BeautifulSoup
+
         soup = BeautifulSoup("<html><body><p>hello</p><p>world</p></body></html>", "html.parser")
         segments, next_line, count = extract_segments_from_document(soup, "ch1", 1)
         assert count == 2
@@ -214,12 +214,14 @@ class TestExtractSegments:
 
     def test_skip_empty_text(self):
         from bs4 import BeautifulSoup
+
         soup = BeautifulSoup("<html><body><p></p><p>text</p></body></html>", "html.parser")
         segments, _, count = extract_segments_from_document(soup, "ch1", 1)
         assert count == 1
 
     def test_skip_nested_blocks(self):
         from bs4 import BeautifulSoup
+
         soup = BeautifulSoup("<div><p>inner</p></div>", "html.parser")
         segments, _, count = extract_segments_from_document(soup, "ch1", 1)
         # div 有 p 子标签，不是叶子块，被跳过；p 是叶子块
@@ -228,31 +230,63 @@ class TestExtractSegments:
 
 class TestMatchExistingTranslation:
     def test_locator_match(self):
-        existing_by_locator = {"ch1|0|abc12345": {"translated_text": "你好", "translated_at": "2024"}}
+        existing_by_locator = {
+            "ch1|0|abc12345": {"translated_text": "你好", "translated_at": "2024"}
+        }
         text_occ: dict = {}
         result = match_existing_translation(
-            "ch1", 0, "abc12345", "hello",
-            existing_by_locator, {}, {}, text_occ,
+            "ch1",
+            0,
+            "abc12345",
+            "hello",
+            existing_by_locator,
+            {},
+            {},
+            text_occ,
         )
         assert result == ("你好", "2024")
 
     def test_seq_match_with_checksum(self):
-        existing_by_seq = {"ch1|0": {"translated_text": "你好", "translated_at": "2024",
-                                      "source_checksum": "abc12345", "original_text": "hello"}}
+        existing_by_seq = {
+            "ch1|0": {
+                "translated_text": "你好",
+                "translated_at": "2024",
+                "source_checksum": "abc12345",
+                "original_text": "hello",
+            }
+        }
         text_occ: dict = {}
         result = match_existing_translation(
-            "ch1", 0, "abc12345", "hello",
-            {}, existing_by_seq, {}, text_occ,
+            "ch1",
+            0,
+            "abc12345",
+            "hello",
+            {},
+            existing_by_seq,
+            {},
+            text_occ,
         )
         assert result == ("你好", "2024")
 
     def test_seq_match_rejects_changed_source(self):
-        existing_by_seq = {"ch1|0": {"translated_text": "旧译文", "translated_at": "2024",
-                                      "source_checksum": "oldcheck", "original_text": "old text"}}
+        existing_by_seq = {
+            "ch1|0": {
+                "translated_text": "旧译文",
+                "translated_at": "2024",
+                "source_checksum": "oldcheck",
+                "original_text": "old text",
+            }
+        }
         text_occ: dict = {}
         result = match_existing_translation(
-            "ch1", 0, "newcheck", "new text",
-            {}, existing_by_seq, {}, text_occ,
+            "ch1",
+            0,
+            "newcheck",
+            "new text",
+            {},
+            existing_by_seq,
+            {},
+            text_occ,
         )
         assert result == ("", "")
 
@@ -260,8 +294,14 @@ class TestMatchExistingTranslation:
         existing_translations = {"hello": {"translated_text": "你好", "translated_at": "2024"}}
         text_occ: dict = {}
         result = match_existing_translation(
-            "ch1", 0, "abc12345", "hello",
-            {}, {}, existing_translations, text_occ,
+            "ch1",
+            0,
+            "abc12345",
+            "hello",
+            {},
+            {},
+            existing_translations,
+            text_occ,
         )
         assert result == ("你好", "2024")
         assert text_occ["hello"] == 1
@@ -269,8 +309,14 @@ class TestMatchExistingTranslation:
     def test_no_match(self):
         text_occ: dict = {}
         result = match_existing_translation(
-            "ch1", 0, "abc12345", "hello",
-            {}, {}, {}, text_occ,
+            "ch1",
+            0,
+            "abc12345",
+            "hello",
+            {},
+            {},
+            {},
+            text_occ,
         )
         assert result == ("", "")
 
@@ -282,6 +328,7 @@ class TestMappingRepository:
     def test_save_and_load(self, tmp_path):
         """保存后加载，译文按行号对齐"""
         from src.infrastructure.mapping_repository import save_content_mapping
+
         content_mappings = {
             "line_000001": {"original_text": "a", "translated_text": "", "line_number": 1},
             "line_000002": {"original_text": "b", "translated_text": "", "line_number": 2},
@@ -297,11 +344,16 @@ class TestMappingRepository:
     def test_load_old_translations(self, tmp_path):
         """加载旧翻译数据用于 reimport"""
         from src.infrastructure.mapping_repository import save_content_mapping
+
         content_mappings = {
             "line_000001": {
-                "original_text": "hello", "translated_text": "你好",
-                "line_number": 1, "chapter_id": "ch1", "block_index": 0,
-                "source_checksum": "abc12345", "translated_at": "2024",
+                "original_text": "hello",
+                "translated_text": "你好",
+                "line_number": 1,
+                "chapter_id": "ch1",
+                "block_index": 0,
+                "source_checksum": "abc12345",
+                "translated_at": "2024",
             },
         }
         save_content_mapping(tmp_path, content_mappings, {"project_id": "test"})
@@ -325,7 +377,7 @@ class TestMappingRepository:
 class TestMatchAndGetNewPath:
     def test_exact_match(self):
         path_mapping = {"images/cover.jpg": "images/cover_new.jpg"}
-        matched, rel = match_and_get_new_path("cover.jpg", path_mapping, Path("."))
+        matched, rel = match_and_get_new_path("images/cover.jpg", path_mapping, Path("."))
         assert matched is True
         assert "cover_new.jpg" in rel
 
@@ -343,7 +395,11 @@ class TestMatchAndGetNewPath:
 class TestInjectFigcaption:
     def test_inject_when_matched(self):
         from bs4 import BeautifulSoup
-        soup = BeautifulSoup("<html><body><img src='images/cover.jpg'></body></html>", "html.parser")
+
+        soup = BeautifulSoup(
+            "<html><body><p>正文</p><img src='images/cover.jpg'></body></html>",
+            "html.parser",
+        )
         image_text_map = {"images/cover.jpg": {"translated_text": "封面", "original_text": "Cover"}}
         inject_figcaption(soup, image_text_map, "ch1")
         figcaption = soup.find("figcaption")
@@ -352,6 +408,7 @@ class TestInjectFigcaption:
 
     def test_no_inject_when_no_match(self):
         from bs4 import BeautifulSoup
+
         soup = BeautifulSoup("<html><body><img src='other.jpg'></body></html>", "html.parser")
         image_text_map = {"images/cover.jpg": {"translated_text": "封面"}}
         inject_figcaption(soup, image_text_map, "ch1")
@@ -359,6 +416,7 @@ class TestInjectFigcaption:
 
     def test_no_inject_when_empty_map(self):
         from bs4 import BeautifulSoup
+
         soup = BeautifulSoup("<html><body><img src='cover.jpg'></body></html>", "html.parser")
         inject_figcaption(soup, {}, "ch1")
         assert soup.find("figcaption") is None

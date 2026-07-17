@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 PERF-004：图片二进制资源存储
 
@@ -17,13 +16,14 @@ PERF-004：图片二进制资源存储
 """
 
 import base64
+import binascii
 import hashlib
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
-from .atomic_file import write_bytes_atomic, write_json_atomic
 from ..utils.logger import get_logger
+from .atomic_file import write_bytes_atomic, write_json_atomic
 
 logger = get_logger(__name__)
 
@@ -39,6 +39,54 @@ _EXT_MAP = {
     "image/bmp": ".bmp",
     "image/tiff": ".tiff",
 }
+
+
+class ImagePathValidationError(Exception):
+    """P1-9：图片 local_path 信任边界校验失败。"""
+
+
+def _validate_local_path(mapping_dir: Path, local_path: str) -> Path:
+    """P1-9：验证 local_path 受控于 assets 根目录。
+
+    拒绝绝对路径、包含 ``..`` 的相对路径，以及 resolve 后逃逸出
+    ``mapping_dir/assets`` 的路径。错误消息不泄露 mapping_dir 完整路径。
+
+    Args:
+        mapping_dir: 映射目录（受控根）。
+        local_path: images.json 中记录的相对路径（如 ``assets/000001.png``）。
+
+    Returns:
+        校验通过后的绝对 Path。
+
+    Raises:
+        ImagePathValidationError: 路径非法或逃逸。
+    """
+    if not local_path:
+        raise ImagePathValidationError("local_path 为空")
+
+    # 拒绝绝对路径（Windows 与 POSIX）
+    candidate = Path(local_path)
+    if candidate.is_absolute():
+        raise ImagePathValidationError("local_path 不得为绝对路径")
+
+    # 拒绝包含 .. 的路径组件（防目录穿越）
+    parts = candidate.parts
+    if any(part == ".." for part in parts):
+        raise ImagePathValidationError("local_path 不得包含父目录引用")
+
+    # resolve 后必须仍位于 mapping_dir 下
+    assets_root = (mapping_dir / _ASSETS_DIR).resolve()
+    resolved = (mapping_dir / candidate).resolve()
+    try:
+        resolved.relative_to(assets_root)
+    except ValueError:
+        raise ImagePathValidationError("local_path 逃逸出 assets 受控目录") from None
+
+    # 拒绝符号链接逃逸（解析后路径不在 assets_root 下）
+    if not resolved.is_relative_to(assets_root):
+        raise ImagePathValidationError("local_path 解析后位于 assets 目录外")
+
+    return resolved
 
 
 def _safe_filename(index: int, mime_type: str, original_name: str) -> str:
@@ -102,6 +150,9 @@ def load_image_base64(mapping_dir: Path, image_info: Dict) -> str:
 
     优先从 local_path 读取二进制文件，回退到 base64_data（旧格式）。
 
+    P1-9：local_path 必须通过信任边界校验，拒绝绝对路径、``..`` 和
+    符号链接逃逸。校验失败时记录警告并回退到 base64_data。
+
     Args:
         mapping_dir: 映射目录
         image_info: 图片元数据
@@ -113,25 +164,32 @@ def load_image_base64(mapping_dir: Path, image_info: Dict) -> str:
     # 优先从二进制文件加载
     local_path = image_info.get("local_path", "")
     if local_path:
-        file_path = mapping_dir / local_path
+        try:
+            file_path = _validate_local_path(mapping_dir, local_path)
+        except ImagePathValidationError as e:
+            logger.warning("local_path 校验失败，拒绝读取: %s", e)
+            return ""
         if file_path.exists():
             try:
                 data = file_path.read_bytes()
                 mime = image_info.get("mime_type", "image/png")
                 b64 = base64.b64encode(data).decode("ascii")
                 return f"data:{mime};base64,{b64}"
-            except Exception as e:
-                logger.warning("读取图片二进制失败: %s: %s", local_path, e)
+            except OSError as e:
+                logger.warning("读取图片二进制失败: %s", e)
 
     # 回退到旧格式 base64_data
     b64_data = image_info.get("base64_data", "")
     return b64_data
 
 
-def load_image_bytes(mapping_dir: Path, image_info: Dict) -> Optional[bytes]:
+def load_image_bytes(mapping_dir: Path, image_info: Dict) -> bytes | None:
     """PERF-004：按需加载图片二进制数据。
 
     优先从 local_path 读取，回退解码 base64_data。
+
+    P1-9：local_path 必须通过信任边界校验，拒绝绝对路径、``..`` 和
+    符号链接逃逸。校验失败时记录警告并回退到 base64_data。
 
     Args:
         mapping_dir: 映射目录
@@ -142,12 +200,16 @@ def load_image_bytes(mapping_dir: Path, image_info: Dict) -> Optional[bytes]:
     """
     local_path = image_info.get("local_path", "")
     if local_path:
-        file_path = mapping_dir / local_path
-        if file_path.exists():
+        try:
+            file_path = _validate_local_path(mapping_dir, local_path)
+        except ImagePathValidationError as e:
+            logger.warning("local_path 校验失败，拒绝读取: %s", e)
+            file_path = None
+        if file_path is not None and file_path.exists():
             try:
                 return file_path.read_bytes()
-            except Exception as e:
-                logger.warning("读取图片二进制失败: %s: %s", local_path, e)
+            except OSError as e:
+                logger.warning("读取图片二进制失败: %s", e)
 
     # 回退解码 base64_data
     b64_data = image_info.get("base64_data", "")
@@ -156,7 +218,7 @@ def load_image_bytes(mapping_dir: Path, image_info: Dict) -> Optional[bytes]:
             b64_data = b64_data.split(",", 1)[1]
         try:
             return base64.b64decode(b64_data)
-        except Exception as e:
+        except (binascii.Error, ValueError) as e:
             logger.warning("Base64 解码失败: %s", e)
 
     return None
@@ -180,7 +242,7 @@ def migrate_legacy_images(mapping_dir: Path) -> bool:
 
     try:
         images_data = json.loads(images_file.read_text(encoding="utf-8"))
-    except Exception as e:
+    except (OSError, json.JSONDecodeError) as e:
         logger.warning("读取 images.json 失败，跳过迁移: %s", e)
         return False
 
@@ -192,8 +254,15 @@ def migrate_legacy_images(mapping_dir: Path) -> bool:
     for idx, (image_path, info) in enumerate(image_mappings.items()):
         # 已有 local_path 且文件存在，跳过
         local_path = info.get("local_path", "")
-        if local_path and (mapping_dir / local_path).exists():
-            continue
+        if local_path:
+            # P1-9：迁移时也要校验 local_path 信任边界
+            try:
+                validated = _validate_local_path(mapping_dir, local_path)
+            except ImagePathValidationError as e:
+                logger.warning("迁移时 local_path 校验失败，跳过: %s", e)
+                continue
+            if validated.exists():
+                continue
 
         # 没有 base64_data，无法迁移
         b64_data = info.get("base64_data", "")
@@ -204,14 +273,12 @@ def migrate_legacy_images(mapping_dir: Path) -> bool:
         b64_str = b64_data.split(",", 1)[1] if "," in b64_data else b64_data
         try:
             image_data = base64.b64decode(b64_str)
-        except Exception as e:
+        except (binascii.Error, ValueError) as e:
             logger.warning("迁移图片解码失败: %s: %s", image_path, e)
             continue
 
         mime_type = info.get("mime_type", "image/png")
-        new_info = save_image_binary(
-            mapping_dir, idx, image_path, image_data, mime_type
-        )
+        new_info = save_image_binary(mapping_dir, idx, image_path, image_data, mime_type)
         # 保留原有 translated_path 等字段
         for k in ("translated_path",):
             if k in info:

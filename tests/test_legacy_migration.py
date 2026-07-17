@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 R2-BUG-020：迁移旧打包版实际配置目录
 
@@ -56,7 +55,8 @@ class TestLegacyMigration:
         )
         # 示例文件不应被迁移
         (old_config / "api_config_sample.json").write_text(
-            json.dumps({"api_key": "sample"}), encoding="utf-8",
+            json.dumps({"api_key": "sample"}),
+            encoding="utf-8",
         )
 
         app_paths.migrate_legacy_config()
@@ -88,7 +88,8 @@ class TestLegacyMigration:
         unrelated_cwd.mkdir()
         (unrelated_cwd / "config").mkdir()
         (unrelated_cwd / "config" / "unrelated.json").write_text(
-            json.dumps({"should_not": "migrate"}), encoding="utf-8",
+            json.dumps({"should_not": "migrate"}),
+            encoding="utf-8",
         )
         monkeypatch.chdir(unrelated_cwd)
 
@@ -111,14 +112,17 @@ class TestLegacyMigration:
         old_config = fake_home / ".轻小说翻译器V1.4" / "config"
         old_config.mkdir(parents=True)
         (old_config / "good.json").write_text(
-            json.dumps({"ok": True}), encoding="utf-8",
+            json.dumps({"ok": True}),
+            encoding="utf-8",
         )
         (old_config / "bad.json").write_text(
-            json.dumps({"bad": True}), encoding="utf-8",
+            json.dumps({"bad": True}),
+            encoding="utf-8",
         )
 
         # 模拟复制 bad.json 时失败
         import shutil as _shutil
+
         real_copy2 = _shutil.copy2
 
         def flaky_copy2(src, dst, *, follow_symlinks=True):
@@ -146,7 +150,8 @@ class TestLegacyMigration:
         old_config = fake_home / ".轻小说翻译器V1.4" / "config"
         old_config.mkdir(parents=True)
         (old_config / "api_config.json").write_text(
-            json.dumps({"v": 1}), encoding="utf-8",
+            json.dumps({"v": 1}),
+            encoding="utf-8",
         )
 
         # 第一次迁移
@@ -156,6 +161,7 @@ class TestLegacyMigration:
 
         # 删除旧源，确保第二次不会找到源
         import shutil
+
         shutil.rmtree(old_config)
 
         # 第二次调用应直接跳过
@@ -171,18 +177,18 @@ class TestLegacyMigration:
         old_config = fake_home / ".轻小说翻译器V1.4" / "config"
         old_config.mkdir(parents=True)
         (old_config / "api_config.json").write_text(
-            json.dumps({"old": True}), encoding="utf-8",
+            json.dumps({"old": True}),
+            encoding="utf-8",
         )
 
         # 新目录已有同名文件
         (app_paths.config_dir / "api_config.json").write_text(
-            json.dumps({"new": True}), encoding="utf-8",
+            json.dumps({"new": True}),
+            encoding="utf-8",
         )
 
         app_paths.migrate_legacy_config()
 
         # 新文件不应被覆盖
-        data = json.loads(
-            (app_paths.config_dir / "api_config.json").read_text(encoding="utf-8")
-        )
+        data = json.loads((app_paths.config_dir / "api_config.json").read_text(encoding="utf-8"))
         assert data == {"new": True}

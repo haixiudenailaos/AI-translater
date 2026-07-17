@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 主窗口界面模块
 UI 骨架：只负责布局和组件创建，业务逻辑委托给各 controller。
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox
 import queue
 import threading
-import time
+import tkinter as tk
 from pathlib import Path
+from tkinter import messagebox, ttk
 
-from .table_editor import TableCellEditor
-from .translation_controller import TranslationController
+from ..application.autosave import (
+    CLEAN,
+    DIRTY,
+    SAVE_FAILED,
+    SAVING,
+    AutosaveCoordinator,
+    SaveResult,
+)
+from ..application.translation_document import TranslationDocument
+from ..utils.logger import get_logger
 from .file_importer import FileImporter
 from .image_translation_handler import ImageTranslationHandler
 from .lazy_service import LazyService
-from ..utils.logger import get_logger
+from .onboarding import OnboardingController, OnboardingPanel
+from .table_editor import TableCellEditor
+from .translation_controller import TranslationController
+from .translation_table_adapter import TranslationTableAdapter
 
 logger = get_logger(__name__)
 
@@ -27,20 +36,23 @@ class MainWindow:
         self.root = root
         self.config_manager = config_manager
         self.app_paths = app_paths
+        from ..core.queue_provider import ProviderLimiterRegistry
+
+        # 应用级文本请求额度：主编辑器和后台队列通过同一注册表取槽。
+        self._provider_limiter_registry = ProviderLimiterRegistry()
         self.translator = LazyService(
-            "src.core.translator", "TranslatorEngine", config_manager
+            "src.core.translator",
+            "TranslatorEngine",
+            config_manager,
+            limiter_registry=self._provider_limiter_registry,
         )
-        self.file_handler = LazyService(
-            "src.utils.file_handler", "FileHandler"
-        )
+        self.file_handler = LazyService("src.utils.file_handler", "FileHandler")
         self.epub_processor = LazyService(
             "src.core.epub_processor", "EPUBProcessor", app_paths=app_paths
         )
 
-        # PERF-003：自动保存单飞化状态
-        self._save_in_progress = False
-        self._save_dirty_again = False
-        self._save_thread = None
+        # PERF §8：自动保存状态由 AutosaveCoordinator 管理（generation 状态机），
+        # 旧的 _save_in_progress / _save_dirty_again / _save_thread 跨线程布尔标志已移除。
         self._undo_stack = []
         self._redo_stack = []
         self._manually_edited_items = set()
@@ -54,12 +66,22 @@ class MainWindow:
         self._api_status_thread = None
         self._api_status_after_id = None
         self._closed = False
+        self._image_translation_busy = False
+        # P0-5：独立于 autosave 的未保存编辑标记
+        self._unsaved_edits = False
         self._review_filter_var = tk.StringVar(value="全部")
         self._search_var = tk.StringVar()
         self._search_case_var = tk.BooleanVar(value=False)
         self._search_regex_var = tk.BooleanVar(value=False)
+        # 新手指导自动展示仅在首次 API 状态返回后评估一次
+        self._onboarding_auto_evaluated = False
 
         self.setup_ui()
+
+        # PERF §7：文档状态模型（业务状态唯一真相来源）和表格适配器。
+        # _document 在 Tk 主线程修改，后台保存只接收不可变快照。
+        self._document = TranslationDocument()
+        self._table_adapter = TranslationTableAdapter(self.translation_table)
 
         # ── 初始化控制器 ────────────────────────────
         self.file_importer = FileImporter(
@@ -79,11 +101,14 @@ class MainWindow:
             image_progress_updater=self.update_image_progress,
             get_mapping_dir=lambda: self.file_importer.current_mapping_dir,
             open_settings=self.open_settings,
-            app_paths=getattr(self, 'app_paths', None),
+            busy_state_updater=self._set_image_translation_busy,
+            app_paths=getattr(self, "app_paths", None),
         )
 
         # 延迟绑定：file_importer 需要 image_handler，走 Manga 默认模块
-        self.file_importer.image_translation_starter = lambda: self.image_handler.start_default_image_translation()
+        self.file_importer.image_translation_starter = lambda: (
+            self.image_handler.start_default_image_translation()
+        )
 
         self.translation_controller = TranslationController(
             root=self.root,
@@ -103,6 +128,46 @@ class MainWindow:
             open_settings=self.open_settings,
             get_source_path=lambda: self.file_importer.current_source_path,
             get_mapping_dir=lambda: self.file_importer.current_mapping_dir,
+            document=self._document,
+            table_adapter=self._table_adapter,
+        )
+
+        # PERF §8：自动保存协调器（generation 状态机 + 单飞 + debounce）。
+        # 工作线程只做文件 I/O，通过队列返回结果，主线程轮询更新状态。
+        # cancel_callback 用于实际取消已调度的 debounce/max_delay 回调（§8 D-1）。
+        self._autosave = AutosaveCoordinator(
+            document=self._document,
+            file_handler=self.file_handler,
+            epub_processor=self.epub_processor,
+            schedule_callback=self.root.after,
+            result_callback=self._on_save_result,
+            cancel_callback=self.root.after_cancel,
+        )
+
+        # 新手指导控制器：在全部控件与控制器创建完成后初始化。
+        # 面板回调通过 lambda 延迟引用 self.onboarding，避免初始化顺序问题。
+        self.onboarding = OnboardingController(
+            root=self.root,
+            panel=OnboardingPanel(
+                self._onboarding_host,
+                on_back=lambda: self.onboarding.back(),
+                on_next=lambda: self.onboarding.next(),
+                on_postpone=lambda: self.onboarding.postpone(),
+                on_dismiss=lambda: self.onboarding.dismiss(),
+            ),
+            config_manager=self.config_manager,
+            targets={
+                "settings": lambda: self.settings_btn,
+                "import": lambda: self.import_file_btn,
+                "translate": lambda: self.translate_btn,
+                "review": lambda: self.review_filter,
+            },
+            actions={
+                "open_settings": self.open_settings,
+                "import_file": self.file_importer.import_file,
+                "paste_text": self.file_importer.import_clipboard,
+            },
+            status_updater=self.update_status,
         )
 
         self.setup_bindings()
@@ -117,9 +182,22 @@ class MainWindow:
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.create_menu()
         self.create_toolbar(main_frame)
+
+        # Reserve the footer before packing the expandable work area.  When
+        # Windows display scaling increases Tk's requested widget sizes, a
+        # footer packed after the work area can fall outside the client area.
+        footer_frame = ttk.Frame(main_frame)
+        footer_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self.create_control_panel(footer_frame)
+        self.create_status_bar(footer_frame)
+
+        self.create_onboarding_host(main_frame)
         self.create_work_area(main_frame)
-        self.create_control_panel(main_frame)
-        self.create_status_bar(main_frame)
+
+    def create_onboarding_host(self, parent):
+        """新手指导面板宿主：始终 pack，面板未显示时不占视觉空间。"""
+        self._onboarding_host = ttk.Frame(parent)
+        self._onboarding_host.pack(fill=tk.X, pady=(0, 6))
 
     def create_toolbar(self, parent):
         toolbar_frame = ttk.Frame(parent)
@@ -127,8 +205,29 @@ class MainWindow:
 
         left_frame = ttk.Frame(toolbar_frame)
         left_frame.pack(side=tk.LEFT)
-        ttk.Button(left_frame, text="导入文件", command=lambda: self.file_importer.import_file()).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(left_frame, text="粘贴文本", command=lambda: self.file_importer.import_clipboard()).pack(side=tk.LEFT, padx=(0, 5))
+        self.import_file_btn = ttk.Button(
+            left_frame, text="导入文件", command=lambda: self.file_importer.import_file()
+        )
+        self.import_file_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.paste_text_btn = ttk.Button(
+            left_frame, text="粘贴文本", command=lambda: self.file_importer.import_clipboard()
+        )
+        self.paste_text_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.queue_translate_btn = tk.Button(
+            left_frame,
+            text="批量翻译队列",
+            command=self.open_concurrent,
+            background="#0D9488",
+            foreground="white",
+            activebackground="#0F766E",
+            activeforeground="white",
+            borderwidth=0,
+            cursor="hand2",
+            font=("TkDefaultFont", 10, "bold"),
+            padx=12,
+            pady=5,
+        )
+        self.queue_translate_btn.pack(side=tk.LEFT, padx=(7, 0))
 
         middle_frame = ttk.Frame(toolbar_frame)
         middle_frame.pack(side=tk.LEFT, expand=True)
@@ -141,17 +240,30 @@ class MainWindow:
         self.model_label.pack(side=tk.LEFT, padx=(0, 12))
         self.save_status_label = ttk.Label(right_frame, text="保存: 未保存")
         self.save_status_label.pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(right_frame, text="设置", command=self.open_settings).pack(side=tk.RIGHT, padx=(5, 0))
+        self.settings_btn = ttk.Button(right_frame, text="设置", command=self.open_settings)
+        self.settings_btn.pack(side=tk.RIGHT, padx=(5, 0))
 
     def create_menu(self):
         menu_bar = tk.Menu(self.root)
         file_menu = tk.Menu(menu_bar, tearoff=0)
-        file_menu.add_command(label="导入文件", accelerator="Ctrl+O", command=lambda: self.file_importer.import_file())
-        file_menu.add_command(label="粘贴文本", command=lambda: self.file_importer.import_clipboard())
-        file_menu.add_command(label="保存译文", accelerator="Ctrl+S", command=lambda: self.translation_controller.save_translation())
+        file_menu.add_command(
+            label="导入文件", accelerator="Ctrl+O", command=lambda: self.file_importer.import_file()
+        )
+        file_menu.add_command(
+            label="粘贴文本", command=lambda: self.file_importer.import_clipboard()
+        )
+        file_menu.add_command(
+            label="保存译文",
+            accelerator="Ctrl+S",
+            command=lambda: self.translation_controller.save_translation(),
+        )
         export_menu = tk.Menu(file_menu, tearoff=0)
-        export_menu.add_command(label="导出对照文件", command=lambda: self.translation_controller.export_comparison())
-        export_menu.add_command(label="导出 EPUB", command=lambda: self.translation_controller.export_epub_file())
+        export_menu.add_command(
+            label="导出对照文件", command=lambda: self.translation_controller.export_comparison()
+        )
+        export_menu.add_command(
+            label="导出 EPUB", command=lambda: self.translation_controller.export_epub_file()
+        )
         file_menu.add_cascade(label="导出", menu=export_menu)
         menu_bar.add_cascade(label="文件", menu=file_menu)
 
@@ -160,27 +272,44 @@ class MainWindow:
         edit_menu.add_command(label="重做", accelerator="Ctrl+Y", command=self.redo)
         edit_menu.add_separator()
         edit_menu.add_command(label="查找", accelerator="Ctrl+F", command=self.focus_search)
-        edit_menu.add_command(label="编辑当前行", accelerator="F2", command=self.open_context_editor)
+        edit_menu.add_command(
+            label="编辑当前行", accelerator="F2", command=self.open_context_editor
+        )
         edit_menu.add_command(label="清空选中译文", command=self.clear_selected_translations)
-        edit_menu.add_command(label="翻译选中行", command=lambda: self.translation_controller.translate_selected_rows())
+        edit_menu.add_command(
+            label="翻译选中行",
+            command=lambda: self.translation_controller.translate_selected_rows(),
+        )
         menu_bar.add_cascade(label="编辑", menu=edit_menu)
 
-        project_menu = tk.Menu(menu_bar, tearoff=0)
-        project_menu.add_command(label="翻译未完成行", accelerator="F5", command=self._run_primary_action)
-        project_menu.add_command(label="继续翻译", accelerator="F6", command=self._continue_translation)
-        project_menu.add_command(label="运行质检", command=self.run_quality_check)
-        project_menu.add_command(label="图片翻译", command=lambda: self.image_handler.start_image_translation())
-        project_menu.add_command(label="AI 图片翻译...", command=lambda: self.image_handler.start_ai_image_translation())
-        menu_bar.add_cascade(label="项目", menu=project_menu)
+        self.project_menu = tk.Menu(menu_bar, tearoff=0)
+        self.project_menu.add_command(
+            label="翻译未完成行", accelerator="F5", command=self._run_primary_action
+        )
+        self.project_menu.add_command(
+            label="继续翻译", accelerator="F6", command=self._continue_translation
+        )
+        self.project_menu.add_command(label="运行质检", command=self.run_quality_check)
+        self.project_menu.add_command(
+            label="本地模块图片翻译", command=lambda: self.image_handler.start_image_translation()
+        )
+        self._project_local_image_action_index = self.project_menu.index("end")
+        self.project_menu.add_command(
+            label="AI 图片翻译...", command=lambda: self.image_handler.start_ai_image_translation()
+        )
+        self._project_ai_image_action_index = self.project_menu.index("end")
+        menu_bar.add_cascade(label="项目", menu=self.project_menu)
 
         tools_menu = tk.Menu(menu_bar, tearoff=0)
-        tools_menu.add_command(label="翻译队列", command=self.open_concurrent)
+        tools_menu.add_command(label="批量翻译队列...", command=self.open_concurrent)
         tools_menu.add_command(label="术语库", command=self.open_glossary)
         tools_menu.add_separator()
         tools_menu.add_command(label="设置", command=self.open_settings)
         menu_bar.add_cascade(label="工具", menu=tools_menu)
 
         help_menu = tk.Menu(menu_bar, tearoff=0)
+        help_menu.add_command(label="新手指导", command=self.open_onboarding)
+        help_menu.add_separator()
         help_menu.add_command(label="支持作者", command=self.open_support_dialog)
         menu_bar.add_cascade(label="帮助", menu=help_menu)
         self.root.config(menu=menu_bar)
@@ -192,59 +321,93 @@ class MainWindow:
         review_bar = ttk.Frame(work_frame)
         review_bar.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(review_bar, text="筛选:").pack(side=tk.LEFT)
-        self.review_filter = ttk.Combobox(review_bar, textvariable=self._review_filter_var,
-                                          values=("全部", "未翻译", "手工修改", "质检问题"), state="readonly", width=11)
+        self.review_filter = ttk.Combobox(
+            review_bar,
+            textvariable=self._review_filter_var,
+            values=("全部", "未翻译", "手工修改", "质检问题"),
+            state="readonly",
+            width=11,
+        )
         self.review_filter.pack(side=tk.LEFT, padx=(4, 12))
         self.review_filter.bind("<<ComboboxSelected>>", lambda _event: self.apply_review_filter())
         ttk.Label(review_bar, text="搜索:").pack(side=tk.LEFT)
         self.search_entry = ttk.Entry(review_bar, textvariable=self._search_var, width=28)
         self.search_entry.pack(side=tk.LEFT, padx=(4, 4))
         self.search_entry.bind("<Return>", lambda _event: self.find_next())
-        ttk.Checkbutton(review_bar, text="区分大小写", variable=self._search_case_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(review_bar, text="区分大小写", variable=self._search_case_var).pack(
+            side=tk.LEFT
+        )
         ttk.Checkbutton(review_bar, text="正则", variable=self._search_regex_var).pack(side=tk.LEFT)
-        ttk.Button(review_bar, text="上一个", command=lambda: self.find_next(reverse=True)).pack(side=tk.RIGHT)
-        ttk.Button(review_bar, text="下一个", command=self.find_next).pack(side=tk.RIGHT, padx=(0, 4))
+        ttk.Button(review_bar, text="上一个", command=lambda: self.find_next(reverse=True)).pack(
+            side=tk.RIGHT
+        )
+        ttk.Button(review_bar, text="下一个", command=self.find_next).pack(
+            side=tk.RIGHT, padx=(0, 4)
+        )
 
         self.empty_state = ttk.Frame(work_frame, padding=28)
-        ttk.Label(self.empty_state, text="导入内容后即可开始翻译", font=("TkDefaultFont", 12, "bold")).pack(pady=(10, 16))
+        ttk.Label(
+            self.empty_state, text="导入内容后即可开始翻译", font=("TkDefaultFont", 12, "bold")
+        ).pack(pady=(10, 16))
         empty_actions = ttk.Frame(self.empty_state)
         empty_actions.pack()
-        ttk.Button(empty_actions, text="导入文件", command=lambda: self.file_importer.import_file()).pack(side=tk.LEFT, padx=4)
-        ttk.Button(empty_actions, text="粘贴文本", command=lambda: self.file_importer.import_clipboard()).pack(side=tk.LEFT, padx=4)
-        ttk.Button(empty_actions, text="打开最近项目", command=self.open_recent_project).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            empty_actions, text="导入文件", command=lambda: self.file_importer.import_file()
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            empty_actions, text="粘贴文本", command=lambda: self.file_importer.import_clipboard()
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(empty_actions, text="打开最近项目", command=self.open_recent_project).pack(
+            side=tk.LEFT, padx=4
+        )
         self.empty_state.pack(fill=tk.X, pady=(12, 20))
 
         table_container = ttk.Frame(work_frame)
         table_container.pack(fill=tk.BOTH, expand=True)
 
-        columns = ('line_number', 'source_text', 'target_text')
+        columns = ("line_number", "source_text", "target_text")
         self.translation_table = ttk.Treeview(
-            table_container, columns=columns, show='headings', selectmode='extended')
-        self.translation_table.heading('line_number', text='行号')
-        self.translation_table.heading('source_text', text='原文')
-        self.translation_table.heading('target_text', text='译文')
-        self.translation_table.column('line_number', width=60, minwidth=50, anchor='center', stretch=False)
-        self.translation_table.column('source_text', width=400, minwidth=200, anchor='w')
-        self.translation_table.column('target_text', width=400, minwidth=200, anchor='w')
+            table_container,
+            columns=columns,
+            show="headings",
+            selectmode="extended",
+            # The table expands into all remaining space.  A smaller requested
+            # row count keeps the complete footer visible on high-DPI displays.
+            height=5,
+        )
+        self.translation_table.heading("line_number", text="行号")
+        self.translation_table.heading("source_text", text="原文")
+        self.translation_table.heading("target_text", text="译文")
+        self.translation_table.column(
+            "line_number", width=60, minwidth=50, anchor="center", stretch=False
+        )
+        self.translation_table.column("source_text", width=400, minwidth=200, anchor="w")
+        self.translation_table.column("target_text", width=400, minwidth=200, anchor="w")
 
-        vsb = ttk.Scrollbar(table_container, orient="vertical", command=self.translation_table.yview)
-        hsb = ttk.Scrollbar(table_container, orient="horizontal", command=self.translation_table.xview)
+        vsb = ttk.Scrollbar(
+            table_container, orient="vertical", command=self.translation_table.yview
+        )
+        hsb = ttk.Scrollbar(
+            table_container, orient="horizontal", command=self.translation_table.xview
+        )
         self.translation_table.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.translation_table.grid(row=0, column=0, sticky='nsew')
-        vsb.grid(row=0, column=1, sticky='ns')
-        hsb.grid(row=1, column=0, sticky='ew')
+        self.translation_table.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
         table_container.grid_rowconfigure(0, weight=1)
         table_container.grid_columnconfigure(0, weight=1)
 
         # 单元格编辑
         self._cell_editor = TableCellEditor(
-            self.translation_table, editable_columns={1, 2},
-            on_save=self._on_cell_edited)
-        self.translation_table.bind('<Double-Button-1>', self._cell_editor.on_double_click)
-        self.translation_table.bind('<F2>', lambda _event: self.open_context_editor())
+            self.translation_table, editable_columns={1, 2}, on_save=self._on_cell_edited
+        )
+        self.translation_table.bind("<Double-Button-1>", self._cell_editor.on_double_click)
+        self.translation_table.bind("<F2>", lambda _event: self.open_context_editor())
 
         # 右键菜单（由 TranslationController 管理）
-        self.translation_table.bind('<Button-3>', lambda e: self.translation_controller.show_context_menu(e))
+        self.translation_table.bind(
+            "<Button-3>", lambda e: self.translation_controller.show_context_menu(e)
+        )
 
         self.setup_table_styles()
 
@@ -252,12 +415,21 @@ class MainWindow:
         style = ttk.Style()
         font_family = self.config_manager.get_app_config().get("ui_font_family", "TkDefaultFont")
         font_size = self.config_manager.get_app_config().get("ui_font_size", 10)
-        style.configure("Treeview", font=(font_family, font_size), rowheight=max(28, font_size * 3), background="white")
-        style.configure("Treeview.Heading", font=(font_family, font_size, 'bold'),
-                        background="#e0e0e0", foreground="#333")
-        style.map('Treeview',
-                  background=[('selected', '#0078D7')],
-                  foreground=[('selected', 'white')])
+        style.configure(
+            "Treeview",
+            font=(font_family, font_size),
+            rowheight=max(28, font_size * 3),
+            background="white",
+        )
+        style.configure(
+            "Treeview.Heading",
+            font=(font_family, font_size, "bold"),
+            background="#e0e0e0",
+            foreground="#333",
+        )
+        style.map(
+            "Treeview", background=[("selected", "#0078D7")], foreground=[("selected", "white")]
+        )
 
     def create_control_panel(self, parent):
         control_frame = ttk.Frame(parent)
@@ -266,24 +438,40 @@ class MainWindow:
         left_control = ttk.Frame(control_frame)
         left_control.pack(side=tk.LEFT)
 
-        self.translate_btn = ttk.Button(left_control, text="翻译未完成行", command=self._run_primary_action)
+        self.translate_btn = ttk.Button(
+            left_control, text="翻译未完成行", command=self._run_primary_action
+        )
         self.translate_btn.pack(side=tk.LEFT, padx=(0, 5))
-        self.continue_btn = ttk.Button(left_control, text="继续翻译",
-                                        command=self._continue_translation)
+        self.continue_btn = ttk.Button(
+            left_control, text="继续翻译", command=self._continue_translation
+        )
         self.continue_btn.pack(side=tk.LEFT, padx=(0, 5))
-        self.stop_btn = ttk.Button(left_control, text="停止", state=tk.DISABLED,
-                                    command=lambda: self.translation_controller.stop_translation())
+        self.stop_btn = ttk.Button(
+            left_control,
+            text="停止",
+            state=tk.DISABLED,
+            command=lambda: self.translation_controller.stop_translation(),
+        )
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 5))
 
         right_control = ttk.Frame(control_frame)
         right_control.pack(side=tk.RIGHT)
-        ttk.Button(right_control, text="保存", command=lambda: self.translation_controller.save_translation()).pack(side=tk.RIGHT, padx=(5, 0))
+        self.export_epub_btn = ttk.Button(
+            right_control,
+            text="导出 EPUB",
+            command=lambda: self.translation_controller.export_epub_file(),
+        )
+        self.export_epub_btn.pack(side=tk.RIGHT, padx=(5, 0))
         self.more_actions_menu = tk.Menu(right_control, tearoff=0)
         self.more_actions_menu.add_command(label="运行质检", command=self.run_quality_check)
         self.more_actions_menu.add_command(
-            label="图片翻译", command=lambda: self.image_handler.start_image_translation()
+            label="本地模块图片翻译", command=lambda: self.image_handler.start_image_translation()
         )
-        self._image_action_index = self.more_actions_menu.index("end")
+        self._local_image_action_index = self.more_actions_menu.index("end")
+        self.more_actions_menu.add_command(
+            label="AI 图片翻译...", command=lambda: self.image_handler.start_ai_image_translation()
+        )
+        self._ai_image_action_index = self.more_actions_menu.index("end")
         self.more_actions_menu.add_separator()
         self.more_actions_menu.add_command(
             label="导出对照文件", command=lambda: self.translation_controller.export_comparison()
@@ -292,16 +480,35 @@ class MainWindow:
             label="导出 EPUB", command=lambda: self.translation_controller.export_epub_file()
         )
         self._epub_action_index = self.more_actions_menu.index("end")
-        ttk.Menubutton(
-            right_control, text="更多操作", menu=self.more_actions_menu
-        ).pack(side=tk.RIGHT)
+        ttk.Menubutton(right_control, text="更多操作", menu=self.more_actions_menu).pack(
+            side=tk.RIGHT
+        )
+
+        image_control = ttk.Frame(parent)
+        image_control.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(image_control, text="图片翻译方式:").pack(side=tk.LEFT)
+        self.local_image_translate_btn = ttk.Button(
+            image_control,
+            text="本地模块翻译",
+            width=16,
+            command=lambda: self.image_handler.start_image_translation(),
+        )
+        self.local_image_translate_btn.pack(side=tk.LEFT, padx=(8, 5))
+        self.ai_image_translate_btn = ttk.Button(
+            image_control,
+            text="AI 图片翻译",
+            width=16,
+            command=lambda: self.image_handler.start_ai_image_translation(),
+        )
+        self.ai_image_translate_btn.pack(side=tk.LEFT)
 
         middle_control = ttk.Frame(control_frame)
         middle_control.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(20, 20))
         ttk.Label(middle_control, text="文本翻译:").pack(side=tk.LEFT)
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(middle_control, variable=self.progress_var,
-                                            maximum=100, length=200)
+        self.progress_bar = ttk.Progressbar(
+            middle_control, variable=self.progress_var, maximum=100, length=200
+        )
         self.progress_bar.pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
         ttk.Label(middle_control, text=" | ").pack(side=tk.LEFT)
         ttk.Label(middle_control, text="图片翻译:").pack(side=tk.LEFT)
@@ -321,24 +528,32 @@ class MainWindow:
     # ── 绑定 & 回调 ────────────────────────────────────
 
     def setup_bindings(self):
-        self.root.bind('<F5>', lambda e: self._run_primary_action())
-        self.root.bind('<F6>', lambda e: self._continue_translation())
-        self.root.bind('<Control-o>', lambda e: self.file_importer.import_file())
-        self.root.bind('<Control-s>', lambda e: self.translation_controller.save_translation())
-        self.root.bind('<Control-f>', lambda e: self.focus_search())
-        self.root.bind('<Control-z>', lambda e: self.undo())
-        self.root.bind('<Control-y>', lambda e: self.redo())
-        self.root.bind('<FocusOut>', lambda e: self._schedule_save_to_target(0))
+        self.root.bind("<F5>", lambda e: self._run_primary_action())
+        self.root.bind("<F6>", lambda e: self._continue_translation())
+        self.root.bind("<Control-o>", lambda e: self.file_importer.import_file())
+        self.root.bind("<Control-s>", lambda e: self.translation_controller.save_translation())
+        self.root.bind("<Control-f>", lambda e: self.focus_search())
+        self.root.bind("<Control-z>", lambda e: self.undo())
+        self.root.bind("<Control-y>", lambda e: self.redo())
+        self.root.bind("<FocusOut>", lambda e: self._schedule_save_to_target(0))
 
     def _on_cell_edited(self, item_id, col_idx, old_value, new_value):
-        self._record_edit(item_id, col_idx, old_value, new_value)
-        self._manually_edited_items.add(item_id)
-        self._schedule_save_to_target()
-        self.refresh_action_state()
+        """P0-2：人工编辑写回唯一模型。
+
+        TableCellEditor 不再直接修改 Treeview，而是通过此回调提交 edit command。
+        _apply_cell_value 同时更新 Treeview 和 TranslationDocument，
+        确保模型与视图保持一致，避免已编辑内容按旧值保存或导出。
+        """
+        self._apply_cell_value(item_id, col_idx, new_value)
 
     # ── 表格数据操作 ───────────────────────────────────
 
     def load_data_to_table(self, source_lines, target_lines=None):
+        # P0-4：替换文档前使翻译控制器的当前 run_id 失效，
+        # 防止旧翻译任务的迟到事件写入新文档的行索引。
+        if hasattr(self, "translation_controller"):
+            self.translation_controller.invalidate_session()
+
         self._table_load_generation += 1
         generation = self._table_load_generation
         if self._table_load_after_id is not None:
@@ -356,6 +571,8 @@ class MainWindow:
         self._manually_edited_items.clear()
         self._hidden_items.clear()
         self._all_items.clear()
+        # PERF §7.5 步骤2：同步重置表格适配器（item ID 映射）。
+        self._table_adapter.reset()
 
         # Work on copies: callers retain ownership of their parsed content.
         source_lines = list(source_lines)
@@ -369,22 +586,25 @@ class MainWindow:
         while len(target_lines) < len(source_lines):
             target_lines.append("")
         if len(target_lines) > len(source_lines):
-            target_lines = target_lines[:len(source_lines)]
+            target_lines = target_lines[: len(source_lines)]
+
+        # PERF §7.5 步骤2：导入时同时填充模型（唯一真相来源）。
+        # Treeview 分块加载在 _load_table_chunk 中追加 item ID 到适配器。
+        self._document.replace(source_lines, target_lines)
+
+        # 新手指导：确认非空内容后通知导入完成事件。空内容不完成本步骤。
+        onboarding = getattr(self, "onboarding", None)
+        if onboarding is not None and source_lines:
+            onboarding.notify("content_loaded", count=len(source_lines))
 
         self._table_loading = True
         self.translate_btn.config(text="正在加载", state=tk.DISABLED)
         self.continue_btn.config(state=tk.DISABLED)
         self.update_status(f"正在加载 0/{len(source_lines)} 行")
-        source_path = getattr(
-            getattr(self, 'file_importer', None), 'current_source_path', None
-        )
-        self._load_table_chunk(
-            source_lines, target_lines, 0, generation, source_path
-        )
+        source_path = getattr(getattr(self, "file_importer", None), "current_source_path", None)
+        self._load_table_chunk(source_lines, target_lines, 0, generation, source_path)
 
-    def _load_table_chunk(
-        self, source_lines, target_lines, start, generation, source_path
-    ):
+    def _load_table_chunk(self, source_lines, target_lines, start, generation, source_path):
         if generation != self._table_load_generation:
             return
 
@@ -395,9 +615,14 @@ class MainWindow:
             line_num = i + 1
             target = target_lines[i] if i < len(target_lines) else ""
             item = self.translation_table.insert(
-                '', 'end', values=(line_num, source, target),
-                tags=('evenrow' if i % 2 == 0 else 'oddrow',))
+                "",
+                "end",
+                values=(line_num, source, target),
+                tags=("evenrow" if i % 2 == 0 else "oddrow",),
+            )
             self._all_items.append(item)
+            # PERF §7.5 步骤2：同步维护适配器的行号→item ID 映射。
+            self._table_adapter.append_item(item)
 
         if end < len(source_lines):
             self.update_status(f"正在加载 {end}/{len(source_lines)} 行")
@@ -411,9 +636,11 @@ class MainWindow:
 
         self._table_load_after_id = None
         self._table_loading = False
-        self.translation_table.tag_configure('evenrow', background='#f9f9f9')
-        self.translation_table.tag_configure('oddrow', background='white')
-        self.project_label.config(text=source_path.name if source_path else f"临时文本 ({len(source_lines)} 行)")
+        self.translation_table.tag_configure("evenrow", background="#f9f9f9")
+        self.translation_table.tag_configure("oddrow", background="white")
+        self.project_label.config(
+            text=source_path.name if source_path else f"临时文本 ({len(source_lines)} 行)"
+        )
         if source_path:
             self._remember_recent_file(source_path)
         if source_lines:
@@ -432,7 +659,7 @@ class MainWindow:
         self._redo_stack.clear()
 
     def _apply_cell_value(self, item_id, col_idx, value, *, record=True):
-        values = list(self.translation_table.item(item_id, 'values'))
+        values = list(self.translation_table.item(item_id, "values"))
         if not values or col_idx >= len(values):
             return
         old_value = values[col_idx]
@@ -440,11 +667,26 @@ class MainWindow:
             return
         values[col_idx] = value
         self.translation_table.item(item_id, values=values)
+        # PERF §7.4/§7.5 步骤5：人工编辑同时更新文档模型，
+        # 保持模型与 Treeview 一致。撤销/重做也走此路径。
+        row_index = self._row_index_of(item_id)
+        if row_index is not None:
+            if col_idx == 2:
+                self._document.update_target(row_index, value, manually_edited=True)
+            elif col_idx == 1:
+                self._document.update_source(row_index, value)
         if record:
             self._record_edit(item_id, col_idx, old_value, value)
         self._manually_edited_items.add(item_id)
         self._schedule_save_to_target()
         self.refresh_action_state()
+
+    def _row_index_of(self, item_id) -> int | None:
+        """根据 item ID 查找行号（线性查找，仅用于低频的单元格编辑）。"""
+        try:
+            return self._all_items.index(item_id)
+        except ValueError:
+            return None
 
     def undo(self):
         if not self._undo_stack:
@@ -471,6 +713,7 @@ class MainWindow:
 
     def find_next(self, reverse=False):
         import re
+
         query = self._search_var.get()
         if not query:
             return self.focus_search()
@@ -482,10 +725,18 @@ class MainWindow:
             return
         items = list(self.translation_table.get_children())
         current = self.translation_table.selection()
-        start = items.index(current[-1]) if current and current[-1] in items else (-1 if not reverse else 0)
-        ordered = items[start + 1:] + items[:start + 1] if not reverse else list(reversed(items[:start])) + list(reversed(items[start:]))
+        start = (
+            items.index(current[-1])
+            if current and current[-1] in items
+            else (-1 if not reverse else 0)
+        )
+        ordered = (
+            items[start + 1 :] + items[: start + 1]
+            if not reverse
+            else list(reversed(items[:start])) + list(reversed(items[start:]))
+        )
         for item in ordered:
-            values = self.translation_table.item(item, 'values')
+            values = self.translation_table.item(item, "values")
             if matcher.search(str(values[1])) or matcher.search(str(values[2])):
                 self.translation_table.selection_set(item)
                 self.translation_table.focus(item)
@@ -496,7 +747,7 @@ class MainWindow:
     def apply_review_filter(self):
         mode = self._review_filter_var.get()
         for item in self._all_items:
-            values = self.translation_table.item(item, 'values')
+            values = self.translation_table.item(item, "values")
             source, target = str(values[1]).strip(), str(values[2]).strip()
             visible = mode == "全部"
             if mode == "未翻译":
@@ -506,7 +757,7 @@ class MainWindow:
             elif mode == "质检问题":
                 visible = bool(source and (not target or source == target))
             if visible and item in self._hidden_items:
-                self.translation_table.reattach(item, '', 'end')
+                self.translation_table.reattach(item, "", "end")
                 self._hidden_items.discard(item)
             elif not visible and item not in self._hidden_items:
                 self.translation_table.detach(item)
@@ -527,7 +778,7 @@ class MainWindow:
             self.update_status("请先选择一行")
             return
         item = selected[0]
-        values = self.translation_table.item(item, 'values')
+        values = self.translation_table.item(item, "values")
         items = self._all_items
         index = items.index(item) if item in items else 0
         dialog = tk.Toplevel(self.root)
@@ -536,35 +787,55 @@ class MainWindow:
         dialog.transient(self.root)
         frame = ttk.Frame(dialog, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
-        before = self.translation_table.item(items[index - 1], 'values') if index else None
-        after = self.translation_table.item(items[index + 1], 'values') if index + 1 < len(items) else None
-        ttk.Label(frame, text=f"上一行: {before[1] if before else '无'}", wraplength=780).pack(anchor=tk.W)
+        before = self.translation_table.item(items[index - 1], "values") if index else None
+        after = (
+            self.translation_table.item(items[index + 1], "values")
+            if index + 1 < len(items)
+            else None
+        )
+        ttk.Label(frame, text=f"上一行: {before[1] if before else '无'}", wraplength=780).pack(
+            anchor=tk.W
+        )
         ttk.Label(frame, text="原文").pack(anchor=tk.W, pady=(10, 2))
         source = tk.Text(frame, height=7, wrap=tk.WORD, state=tk.NORMAL)
-        source.insert('1.0', values[1])
+        source.insert("1.0", values[1])
         source.configure(state=tk.DISABLED)
         source.pack(fill=tk.X)
         ttk.Label(frame, text="译文").pack(anchor=tk.W, pady=(10, 2))
         target = tk.Text(frame, height=10, wrap=tk.WORD)
-        target.insert('1.0', values[2])
+        target.insert("1.0", values[2])
         target.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text=f"下一行: {after[1] if after else '无'}", wraplength=780).pack(anchor=tk.W, pady=(8, 0))
+        ttk.Label(frame, text=f"下一行: {after[1] if after else '无'}", wraplength=780).pack(
+            anchor=tk.W, pady=(8, 0)
+        )
+
         def save_and_close():
-            self._apply_cell_value(item, 2, target.get('1.0', tk.END).rstrip('\n'))
+            self._apply_cell_value(item, 2, target.get("1.0", tk.END).rstrip("\n"))
             dialog.destroy()
+
         buttons = ttk.Frame(frame)
         buttons.pack(fill=tk.X, pady=(10, 0))
         ttk.Button(buttons, text="保存", command=save_and_close).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 5))
         target.focus_set()
-        dialog.bind('<Control-s>', lambda _event: save_and_close())
+        dialog.bind("<Control-s>", lambda _event: save_and_close())
 
     def run_quality_check(self):
+        # PERF §7：从文档模型查找问题行，再映射回 item ID。
         issues = []
-        for item in self._all_items:
-            values = self.translation_table.item(item, 'values')
-            if str(values[1]).strip() and (not str(values[2]).strip() or values[1] == values[2]):
-                issues.append(item)
+        source_lines = self._document.source_lines()
+        target_lines = self._document.target_lines()
+        for index, (source, target) in enumerate(zip(source_lines, target_lines, strict=True)):
+            src = source.strip()
+            tgt = target.strip()
+            if src and (not tgt or source == target):
+                item = self._table_adapter.item_id(index)
+                if item is not None:
+                    issues.append(item)
+        # 新手指导：通知质检已接触，不自动把总状态改为 completed
+        onboarding = getattr(self, "onboarding", None)
+        if onboarding is not None:
+            onboarding.notify("quality_check_run", issue_count=len(issues))
         if issues:
             self._review_filter_var.set("质检问题")
             self.apply_review_filter()
@@ -587,6 +858,10 @@ class MainWindow:
         elif not self._api_configured:
             self.open_settings()
         else:
+            # 新手指导：即将开始真实翻译前通知里程碑事件
+            onboarding = getattr(self, "onboarding", None)
+            if onboarding is not None:
+                onboarding.notify("translation_started")
             self.translation_controller.start_translation()
 
     def _remember_recent_file(self, source_path):
@@ -597,14 +872,19 @@ class MainWindow:
         self.config_manager.save_app_config(config)
 
     def open_recent_project(self):
-        recent_files = [Path(path) for path in self.config_manager.get_app_config().get("recent_files", [])]
+        recent_files = [
+            Path(path) for path in self.config_manager.get_app_config().get("recent_files", [])
+        ]
         recent_files = [path for path in recent_files if path.exists()]
         if not recent_files:
             self.update_status("没有可打开的最近项目")
             return
         menu = tk.Menu(self.root, tearoff=0)
         for path in recent_files:
-            menu.add_command(label=path.name, command=lambda selected=path: self.file_importer.import_file(str(selected)))
+            menu.add_command(
+                label=path.name,
+                command=lambda selected=path: self.file_importer.import_file(str(selected)),
+            )
         try:
             menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
         finally:
@@ -623,16 +903,26 @@ class MainWindow:
         if self._table_loading:
             self.translate_btn.config(text="正在加载", state=tk.DISABLED)
             return
-        items = self._all_items
-        has_content = bool(items)
+        # PERF §7：从文档模型读取统计，避免逐行调用 Tk item()。
+        source_lines = self._document.source_lines()
+        target_lines = self._document.target_lines()
+        has_content = bool(source_lines)
         api_configured = self._api_configured
         pending = 0
         completed = 0
-        for item in items:
-            values = self.translation_table.item(item, 'values')
-            pending += bool(str(values[1]).strip() and not str(values[2]).strip())
-            completed += bool(str(values[1]).strip() and str(values[2]).strip())
-        is_epub = bool(getattr(self.file_importer, 'current_mapping_dir', None)) if hasattr(self, 'file_importer') else False
+        for source, target in zip(source_lines, target_lines, strict=True):
+            src = source.strip()
+            tgt = target.strip()
+            if src:
+                if tgt:
+                    completed += 1
+                else:
+                    pending += 1
+        is_epub = (
+            bool(getattr(self.file_importer, "current_mapping_dir", None))
+            if hasattr(self, "file_importer")
+            else False
+        )
         if not has_content:
             label, state = "导入文件", tk.NORMAL
         elif api_configured is None:
@@ -640,125 +930,190 @@ class MainWindow:
         elif not api_configured:
             label, state = "配置 API", tk.NORMAL
         elif pending:
-            label, state = ("重试失败行" if self._review_filter_var.get() == "质检问题" else "翻译未完成行"), tk.NORMAL
+            label, state = (
+                ("重试失败行" if self._review_filter_var.get() == "质检问题" else "翻译未完成行"),
+                tk.NORMAL,
+            )
         else:
             label, state = "运行质检", tk.NORMAL
-        self.translate_btn.config(text=label, state=state,
-                                  command=self.run_quality_check if not pending and has_content and api_configured else self._run_primary_action)
-        if hasattr(self, 'more_actions_menu'):
+        self.translate_btn.config(
+            text=label,
+            state=state,
+            command=self.run_quality_check
+            if not pending and has_content and api_configured
+            else self._run_primary_action,
+        )
+        if hasattr(self, "more_actions_menu"):
             menu_state = tk.NORMAL if is_epub else tk.DISABLED
-            self.more_actions_menu.entryconfigure(
-                self._epub_action_index, state=menu_state
+            if hasattr(self, "export_epub_btn"):
+                self.export_epub_btn.config(state=menu_state)
+            self.more_actions_menu.entryconfigure(self._epub_action_index, state=menu_state)
+            image_state = tk.DISABLED if self._image_translation_busy else menu_state
+            self.more_actions_menu.entryconfigure(self._local_image_action_index, state=image_state)
+            self.more_actions_menu.entryconfigure(self._ai_image_action_index, state=image_state)
+        if hasattr(self, "local_image_translate_btn"):
+            image_state = tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
+            self.local_image_translate_btn.config(state=image_state)
+            self.ai_image_translate_btn.config(state=image_state)
+        if hasattr(self, "project_menu"):
+            project_image_state = (
+                tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
             )
-            self.more_actions_menu.entryconfigure(
-                self._image_action_index, state=menu_state
+            self.project_menu.entryconfigure(
+                self._project_local_image_action_index, state=project_image_state
             )
-        if hasattr(self, 'task_summary_label'):
+            self.project_menu.entryconfigure(
+                self._project_ai_image_action_index, state=project_image_state
+            )
+        if hasattr(self, "task_summary_label"):
             self.task_summary_label.config(text=f"待翻译 {pending} · 已完成 {completed}")
 
     def _set_save_status(self, status):
-        if hasattr(self, 'save_status_label'):
+        if hasattr(self, "save_status_label"):
             self.save_status_label.config(text=f"保存: {status}")
 
     def get_table_data(self):
-        source_lines, target_lines = [], []
-        for item in self._all_items:
-            values = self.translation_table.item(item)['values']
-            if values:
-                source_lines.append(values[1])
-                target_lines.append(values[2] if len(values) > 2 else "")
-        return source_lines, target_lines
+        """PERF §7.5 步骤3：从文档模型返回副本，不调用 Tk API。
+
+        保留方法签名以降低调用方改动。模型数据是业务状态的唯一真相来源。
+        """
+        return self._document.source_lines(), self._document.target_lines()
 
     # ── 实时保存 ───────────────────────────────────────
 
     def _schedule_save_to_target(self, delay_ms: int = 1000):
-        """PERF-003：调度自动保存。
+        """PERF §8：调度自动保存（委托给 AutosaveCoordinator）。
 
-        - 默认 debounce 从 400ms 提升至 1000ms，减少翻译期间的写入频率。
-        - delay_ms=0 表示立即保存（窗口关闭、停止翻译等关键事件）。
+        - 默认 debounce 1000ms（人工编辑），最大延迟 5000ms。
+        - delay_ms=0 表示立即保存（窗口关闭、停止翻译等关键事件），
+          映射到 ``source="flush"`` 跳过 debounce 直接启动。
+        - 保存期间的新编辑只增加 document.version，不启动并行写入（单飞）。
+        - P0-5：auto_save=False 时仍跟踪 dirty 状态，只是不自动触发保存。
         """
-        # BUG-008：尊重 auto_save 配置，禁用时不执行后台写入
         if self._table_loading:
             return
         app_config = self.config_manager.get_app_config()
-        if not app_config.get("auto_save", True):
-            return
-        if getattr(self, '_disable_auto_save', False):
-            return
-        tgt_path = getattr(self.file_importer, 'current_target_path', None)
+        auto_save_enabled = app_config.get("auto_save", True)
+        if getattr(self, "_disable_auto_save", False):
+            auto_save_enabled = False
+        tgt_path = getattr(self.file_importer, "current_target_path", None)
         if not tgt_path:
             return
-        self._set_save_status("有未保存更改")
-        self._debounce('save_tgt', delay_ms, self._atomic_save_target)
 
-    def _atomic_save_target(self):
-        """PERF-003：单飞化后台保存，避免阻塞 UI 主线程。
+        # P0-5：无论自动保存是否开启，编辑都标记会话为脏
+        if delay_ms != 0:
+            self._set_save_status("有未保存更改")
+            self._unsaved_edits = True
 
-        - 保存正在进行时只标记 dirty_again，不启动第二次保存。
-        - 在主线程捕获不可变快照，后台线程只做文件 I/O。
-        - 保存完成后检查 dirty_again，若有新变更则再次保存。
+        # auto_save=False 时只跟踪 dirty 状态，不触发后台写入
+        if not auto_save_enabled:
+            return
+
+        # 同步保存路径到协调器（文件导入后路径可能变化）
+        self._autosave.set_save_paths(
+            tgt_path,
+            getattr(self.file_importer, "current_mapping_dir", None),
+        )
+
+        if delay_ms == 0:
+            # 立即保存：停止/完成/关闭/显式保存
+            self._autosave.mark_dirty(source="flush")
+        else:
+            self._autosave.mark_dirty(source="edit", debounce_ms=delay_ms)
+
+    def _on_save_result(self, result: SaveResult) -> None:
+        """PERF §8：保存结果回调（在主线程调用）。
+
+        根据协调器状态更新保存状态标签。``AutosaveCoordinator`` 已完成
+        状态转换，这里只负责 UI 展示。
         """
-        # 单飞：保存正在进行时只标记 dirty
-        if self._save_in_progress:
-            self._save_dirty_again = True
-            return
+        state = self._autosave.state
+        if state == CLEAN:
+            self._set_save_status("已保存")
+            # P0-5：保存成功时清除未保存标记
+            self._unsaved_edits = False
+        elif state == SAVING:
+            self._set_save_status("正在保存")
+        elif state == SAVE_FAILED:
+            self._set_save_status("保存失败")
+            if result and result.error_message:
+                self.update_status(f"⚠ 自动保存失败: {result.error_message}")
+        elif state == DIRTY:
+            self._set_save_status("有未保存更改")
+        # SAVE_SCHEDULED 视为等待保存
+        if state == "SAVE_SCHEDULED":
+            self._set_save_status("等待保存")
 
-        tgt_path = getattr(self.file_importer, 'current_target_path', None)
+    @property
+    def has_unsaved_changes(self) -> bool:
+        """P0-5：检查是否有未保存的更改。
+
+        dirty 独立于 autosave：自动保存关闭时仍能检测未保存状态；
+        保存失败时也视为有未保存更改。
+        """
+        if self._unsaved_edits:
+            return True
+        state = self._autosave.state
+        return state in (DIRTY, SAVE_FAILED, "SAVE_SCHEDULED")
+
+    def flush_pending_save(self, timeout: float = 5.0) -> bool:
+        """PERF §8：等待后台保存完成（窗口关闭时调用）。
+
+        委托给 ``AutosaveCoordinator.flush``，超时返回 False 且明确提示，
+        绝不假装已保存。
+        """
+        if self._autosave.state == CLEAN:
+            return True
+        ok = self._autosave.flush(timeout=timeout)
+        if not ok:
+            logger.error("等待自动保存超时（%.1fs），可能丢失未保存数据", timeout)
+            self.update_status("⚠ 自动保存超时，部分数据可能未保存")
+        return ok
+
+    def confirm_save_before_close(self) -> str:
+        """P0-5：关闭前检查未保存更改，返回用户选择。
+
+        返回值：
+        - "save"：用户选择保存（调用方应执行保存并检查结果）
+        - "discard"：用户选择放弃更改
+        - "cancel"：用户取消关闭
+        - "proceed"：无需保存，直接继续
+        """
+        if not self.has_unsaved_changes:
+            return "proceed"
+        result = messagebox.askyesnocancel(
+            "未保存的更改",
+            "当前文档有未保存的更改。\n\n是否在关闭前保存？",
+            icon=messagebox.WARNING,
+        )
+        if result is None:
+            return "cancel"
+        if result:
+            return "save"
+        return "discard"
+
+    def save_and_flush(self) -> bool:
+        """P0-5：执行同步保存并等待完成。返回是否成功。"""
+        tgt_path = getattr(self.file_importer, "current_target_path", None)
         if not tgt_path:
-            return
-
-        # 在主线程捕获数据快照（Tkinter 非线程安全）
-        try:
-            _, target_lines = self.get_table_data()
-        except Exception as e:
-            logger.error("获取表格数据失败: %s", e)
-            return
-
-        # 不可变快照，避免后台线程遍历期间主线程修改列表
-        target_snapshot = list(target_lines)
-        mapping_dir = self.file_importer.current_mapping_dir
-
-        self._save_in_progress = True
-        self._save_dirty_again = False
-        self._set_save_status("正在保存")
-
-        def _save_worker():
-            try:
-                content = "\n".join(target_snapshot)
-                # write_file 内部已使用原子写入（临时文件+replace）
-                self.file_handler.write_file(str(tgt_path), content)
-
-                if mapping_dir:
-                    try:
-                        self.epub_processor.save_translations(str(mapping_dir), target_snapshot)
-                    except Exception as e:
-                        logger.error("自动保存EPUB映射失败: %s", e)
-                        self.root.after(0, lambda msg=str(e): self.update_status(f"⚠ 自动保存EPUB映射失败: {msg}"))
-                self.root.after(0, lambda: self._set_save_status("已保存"))
-            except Exception as e:
-                logger.error("自动保存失败: %s", e)
-                self.root.after(0, lambda msg=str(e): self.update_status(f"⚠ 自动保存失败: {msg}"))
-                self.root.after(0, lambda: self._set_save_status("保存失败"))
-            finally:
-                self._save_in_progress = False
-                # 保存期间有新变更请求时，再次调度保存
-                if self._save_dirty_again:
-                    self._save_dirty_again = False
-                    self.root.after(0, self._atomic_save_target)
-
-        self._save_thread = threading.Thread(target=_save_worker, daemon=True)
-        self._save_thread.start()
-
-    def flush_pending_save(self, timeout: float = 5.0):
-        """PERF-003：等待后台保存完成（窗口关闭时调用）。"""
-        if not self._save_in_progress:
-            return
-        deadline = time.time() + timeout
-        while self._save_in_progress and time.time() < deadline:
-            time.sleep(0.05)
+            # 无目标路径，无法保存
+            messagebox.showwarning("保存失败", "没有可用的保存路径，请先导入文件。")
+            return False
+        self._autosave.set_save_paths(
+            tgt_path,
+            getattr(self.file_importer, "current_mapping_dir", None),
+        )
+        self._autosave.mark_dirty(source="flush")
+        ok = self.flush_pending_save(timeout=10.0)
+        if not ok:
+            messagebox.showwarning(
+                "保存失败",
+                "保存超时或失败，请检查文件权限或磁盘空间。",
+            )
+        return ok
 
     def _debounce(self, key, delay_ms, callback):
-        attr = f'_debounce_{key}'
+        attr = f"_debounce_{key}"
         old_id = getattr(self, attr, None)
         if old_id:
             self.root.after_cancel(old_id)
@@ -771,16 +1126,23 @@ class MainWindow:
 
         SettingsWindow(self.root, self.config_manager, self._on_settings_updated)
 
+    def open_onboarding(self):
+        """帮助 > 新手指导：手动重新打开引导，忽略自动展示条件。"""
+        onboarding = getattr(self, "onboarding", None)
+        if onboarding is not None:
+            onboarding.start(force=True)
+
     def open_glossary(self):
         from .glossary_window import GlossaryWindow
 
         GlossaryWindow(self.root, self.config_manager)
 
     def open_concurrent(self):
+        from ..core.concurrent_manager import ConcurrentTranslationManager
         from .concurrent_window import ConcurrentWindow
 
         # R2-BUG-013：只允许一个队列窗口，避免旧窗口管理器泄漏
-        cw = getattr(self, '_concurrent_window', None)
+        cw = getattr(self, "_concurrent_window", None)
         if cw is not None and not cw._closed:
             try:
                 if cw.win.winfo_exists():
@@ -789,7 +1151,21 @@ class MainWindow:
                     return
             except Exception:
                 pass
-        self._concurrent_window = ConcurrentWindow(self.root, self.config_manager, app_paths=self.app_paths)
+
+        # P1-3：manager 归应用生命周期所有，窗口只订阅快照。
+        # 首次打开时懒创建，后续打开复用同一 manager，任务在窗口关闭后继续运行。
+        if getattr(self, "_queue_manager", None) is None:
+            self._queue_manager = ConcurrentTranslationManager(
+                self.config_manager,
+                app_paths=self.app_paths,
+                limiter_registry=self._provider_limiter_registry,
+            )
+        self._concurrent_window = ConcurrentWindow(
+            self.root,
+            self.config_manager,
+            app_paths=self.app_paths,
+            manager=self._queue_manager,
+        )
 
     def open_support_dialog(self):
         win = tk.Toplevel(self.root)
@@ -801,7 +1177,9 @@ class MainWindow:
         email_frame = ttk.Frame(container)
         email_frame.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(email_frame, text="作者邮箱：", font=("微软雅黑", 10, "bold")).pack(side=tk.LEFT)
-        ttk.Label(email_frame, text="996043050@qq.com", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=(5, 10))
+        ttk.Label(email_frame, text="996043050@qq.com", font=("微软雅黑", 10)).pack(
+            side=tk.LEFT, padx=(5, 10)
+        )
 
         def copy_email():
             try:
@@ -864,16 +1242,35 @@ class MainWindow:
             api_config = self.config_manager.get_api_config(load_secret=False)
             model_name = api_config.get("model_name", "未知模型")
             self.api_status_label.config(text=f"API: 已配置 ({model_name})")
-            self.model_label.config(text=f"{self.config_manager.get_app_config().get('target_language', '中文')} / {model_name}")
+            self.model_label.config(
+                text=f"{self.config_manager.get_app_config().get('target_language', '中文')} / {model_name}"
+            )
         else:
             self.api_status_label.config(text="API: 未配置")
             self.model_label.config(text="请配置 API")
         self.setup_table_styles()
-        if hasattr(self, 'translate_btn'):
+        if hasattr(self, "translate_btn"):
             self.refresh_action_state()
+
+        # 新手指导：自动展示仅在首次 API 状态返回后评估一次，
+        # 避免在 Tk 主线程启动阶段同步读取系统密钥环。
+        onboarding = getattr(self, "onboarding", None)
+        if onboarding is not None:
+            if not self._onboarding_auto_evaluated:
+                self._onboarding_auto_evaluated = True
+                has_recent = bool(self.config_manager.get_app_config().get("recent_files"))
+                onboarding.maybe_start(
+                    api_configured=self._api_configured,
+                    has_recent_files=has_recent,
+                )
+            onboarding.notify("api_status_changed", configured=self._api_configured)
 
     def update_image_progress(self, text):
         self.image_progress_label.config(text=text)
+
+    def _set_image_translation_busy(self, busy: bool) -> None:
+        self._image_translation_busy = bool(busy)
+        self.refresh_action_state()
 
     def update_status(self, message):
         self.status_label.config(text=message)
@@ -896,29 +1293,76 @@ class MainWindow:
             self._table_load_after_id = None
             self._table_load_generation += 1
 
+        # 新手指导：关闭面板并解除快捷键绑定，避免残留 after 回调
+        onboarding = getattr(self, "onboarding", None)
+        if onboarding is not None:
+            try:
+                onboarding.close()
+            except Exception as e:
+                logger.warning("关闭新手指导失败: %s", e)
+
         # 1. 停止主翻译引擎
         try:
             self.translator.call_if_initialized("stop")
         except Exception as e:
             logger.warning("停止翻译引擎失败: %s", e)
 
+        # PERF：关闭翻译控制器的事件泵并使当前 run_id 失效，
+        # 避免残留 after 回调和迟到事件污染（见 §6.6 步骤 8）。
+        try:
+            self.translation_controller.close()
+        except Exception as e:
+            logger.warning("关闭翻译控制器失败: %s", e)
+
         # 2. 关闭队列翻译管理器（如有）
+        # P1-3：manager 归应用生命周期所有，应用退出时真正停止任务。
+        # 先关闭队列窗口（销毁 UI），再关闭 manager（停止任务、释放资源）。
         # R2-BUG-013：窗口可能已通过 WM_DELETE_WINDOW 关闭，需检查 _closed 标志
-        cw = getattr(self, '_concurrent_window', None)
-        if cw is not None and not cw._closed and hasattr(cw, 'manager'):
+        cw = getattr(self, "_concurrent_window", None)
+        if cw is not None and not cw._closed:
             try:
                 cw._on_close()
             except Exception as e:
+                logger.warning("关闭队列窗口失败: %s", e)
+        # P1-3：关闭应用级 manager（真正停止后台任务）
+        queue_manager = getattr(self, "_queue_manager", None)
+        if queue_manager is not None:
+            try:
+                queue_manager.close()
+            except Exception as e:
                 logger.warning("关闭队列翻译管理器失败: %s", e)
+            finally:
+                self._queue_manager = None
 
         # 3. 关闭主翻译引擎的 API 资源
         try:
             self.translator.call_if_initialized("close")
         except Exception as e:
             logger.warning("关闭翻译引擎API失败: %s", e)
+        try:
+            self._provider_limiter_registry.close_all()
+        except Exception as e:
+            logger.warning("关闭共享翻译限流器失败: %s", e)
 
-        # PERF-003：等待后台保存完成，避免关闭时丢失数据
+        # 4. 关闭图片翻译 Provider（包括本地模型运行时）
+        try:
+            self.image_handler.close()
+        except Exception as e:
+            logger.warning("关闭图片翻译 Provider 失败: %s", e)
+
+        # P1-1：关闭文件导入控制器的 UI 回调事件泵
+        try:
+            self.file_importer.close()
+        except Exception as e:
+            logger.warning("关闭文件导入 UI 事件泵失败: %s", e)
+
+        # PERF §8：等待后台保存完成（generation 状态机 flush），避免关闭时丢失数据。
+        # 先 flush 再 close，确保未完成的保存有机会写入；close 只阻止新保存请求。
         try:
             self.flush_pending_save(timeout=5.0)
         except Exception as e:
             logger.warning("等待后台保存完成失败: %s", e)
+        try:
+            self._autosave.close()
+        except Exception as e:
+            logger.warning("关闭自动保存协调器失败: %s", e)

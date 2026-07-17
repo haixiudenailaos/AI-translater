@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Deepseek API接口模块
 继承 BaseAPI，仅保留差异配置（默认URL和模型名）。
 """
 
-from typing import Dict, Any
-from .base_api import BaseAPI
 from ..utils.logger import get_logger
+from .base_api import BaseAPI
 
 logger = get_logger(__name__)
 

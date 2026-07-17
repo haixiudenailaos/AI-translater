@@ -1,13 +1,16 @@
+import tempfile
+import tkinter as tk
+import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-import tempfile
-import unittest
 from unittest.mock import patch
 
+from src.application.translation_document import TranslationDocument
 from src.config.config_manager import ConfigManager
 from src.ui.lazy_service import LazyService
 from src.ui.main_window import MainWindow
+from src.ui.translation_table_adapter import TranslationTableAdapter
 
 
 class LazyServiceTests(unittest.TestCase):
@@ -46,19 +49,54 @@ class LazyServiceTests(unittest.TestCase):
 
 class ConfigStartupTests(unittest.TestCase):
     def test_credential_lookup_is_deferred_and_cached(self):
-        with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "src.config.config_manager.get_key", return_value="sk-test"
-        ) as get_key_mock:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("src.config.config_manager.get_key", return_value="sk-test") as get_key_mock,
+        ):
             paths = SimpleNamespace(config_dir=Path(temp_dir))
             manager = ConfigManager(app_paths=paths)
 
             self.assertEqual(get_key_mock.call_count, 0)
-            self.assertEqual(
-                manager.get_api_config(load_secret=False)["api_key"], ""
-            )
+            self.assertEqual(manager.get_api_config(load_secret=False)["api_key"], "")
             self.assertTrue(manager.is_api_configured())
             self.assertEqual(manager.get_api_config()["api_key"], "sk-test")
             self.assertEqual(get_key_mock.call_count, 1)
+
+
+class MainWindowLayoutTests(unittest.TestCase):
+    def test_footer_is_reserved_before_expandable_work_area(self):
+        class PackedFrame:
+            def __init__(self):
+                self.pack_options = None
+
+            def pack(self, **kwargs):
+                self.pack_options = kwargs
+
+        main_frame = PackedFrame()
+        footer_frame = PackedFrame()
+        window = MainWindow.__new__(MainWindow)
+        window.root = object()
+        calls = []
+        window.create_menu = lambda: calls.append(("menu", None))
+        window.create_toolbar = lambda parent: calls.append(("toolbar", parent))
+        window.create_control_panel = lambda parent: calls.append(("controls", parent))
+        window.create_status_bar = lambda parent: calls.append(("status", parent))
+        window.create_onboarding_host = lambda parent: calls.append(("onboarding", parent))
+        window.create_work_area = lambda parent: calls.append(("work", parent))
+
+        with patch(
+            "src.ui.main_window.ttk.Frame",
+            side_effect=(main_frame, footer_frame),
+        ):
+            window.setup_ui()
+
+        self.assertEqual(footer_frame.pack_options, {"side": tk.BOTTOM, "fill": tk.X})
+        self.assertEqual(
+            [name for name, _parent in calls],
+            ["menu", "toolbar", "controls", "status", "onboarding", "work"],
+        )
+        self.assertIs(calls[2][1], footer_frame)
+        self.assertIs(calls[3][1], footer_frame)
 
 
 class _Root:
@@ -131,6 +169,9 @@ class ChunkedTableLoadTests(unittest.TestCase):
         window._manually_edited_items = set()
         window._hidden_items = set()
         window._all_items = []
+        # PERF §7：文档模型和表格适配器（load_data_to_table 依赖）
+        window._document = TranslationDocument()
+        window._table_adapter = TranslationTableAdapter(window.translation_table)
         statuses = []
         window.update_status = statuses.append
         window._set_save_status = lambda _status: None

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 稀疏行翻译服务单元测试（UXF-001 / UXF-002）
 
@@ -11,8 +10,6 @@
 - 取消时不覆盖已有译文
 - translate_failed 只重试失败行
 """
-
-from typing import Sequence
 
 import pytest
 
@@ -30,8 +27,9 @@ from src.domain.translation import (
 class FakeProvider:
     """测试用 TranslationProvider 替身"""
 
-    def __init__(self, results: list[TranslationResult] | None = None,
-                 fail_with: Exception | None = None):
+    def __init__(
+        self, results: list[TranslationResult] | None = None, fail_with: Exception | None = None
+    ):
         self._results = results or []
         self._fail_with = fail_with
         self._call_count = 0
@@ -52,12 +50,15 @@ class FakeProvider:
         # 模拟进度回调
         if on_progress is not None and result.lines:
             from src.domain.translation import TranslationProgress
-            on_progress(TranslationProgress(
-                completed=len(result.lines),
-                total=len(lines),
-                batch_start=0,
-                preview_lines=result.lines,
-            ))
+
+            on_progress(
+                TranslationProgress(
+                    completed=len(result.lines),
+                    total=len(lines),
+                    batch_start=0,
+                    preview_lines=result.lines,
+                )
+            )
         return result
 
     def cancel(self):
@@ -98,6 +99,7 @@ def _options(batch_size=20):
 
 
 # ── translate_pending ───────────────────────
+
 
 class TestTranslatePending:
     def test_translates_all_pending(self):
@@ -157,6 +159,7 @@ class TestTranslatePending:
 
 # ── translate_lines（稀疏行） ───────────────
 
+
 class TestTranslateLines:
     def test_translate_specific_indices(self):
         """翻译指定稀疏索引"""
@@ -182,7 +185,7 @@ class TestTranslateLines:
 
         assert project.translated_lines[0] == "甲"  # 不变
         assert project.translated_lines[1] == "OK"  # 新翻译
-        assert project.translated_lines[2] == ""    # 未触及
+        assert project.translated_lines[2] == ""  # 未触及
         assert project.translated_lines[3] == "丁"  # 不变
 
     def test_empty_indices_returns_success(self):
@@ -218,18 +221,21 @@ class TestTranslateLines:
 
 # ── 失败处理 ───────────────────────────────
 
+
 class TestFailureHandling:
     def test_partial_failure_records_failed(self):
         """部分失败记录失败行"""
         project = _make_project()
-        provider = FakeProvider(results=[
-            TranslationResult(
-                status=OperationStatus.PARTIAL,
-                lines=("OK", ""),
-                failed_indices=(1,),
-                error_message="timeout",
-            ),
-        ])
+        provider = FakeProvider(
+            results=[
+                TranslationResult(
+                    status=OperationStatus.PARTIAL,
+                    lines=("OK", ""),
+                    failed_indices=(1,),
+                    error_message="timeout",
+                ),
+            ]
+        )
         service = SparseLineTranslator(provider)
 
         result = service.translate_pending(project, _options(batch_size=2))
@@ -264,6 +270,7 @@ class TestFailureHandling:
 
 # ── translate_failed ───────────────────────
 
+
 class TestTranslateFailed:
     def test_only_retries_failed(self):
         """只重试失败行，不重复成功行"""
@@ -297,6 +304,7 @@ class TestTranslateFailed:
 
 # ── 进度回调 ───────────────────────────────
 
+
 class TestProgressCallback:
     def test_progress_callback_invoked(self):
         project = _make_project()
@@ -305,7 +313,8 @@ class TestProgressCallback:
 
         events: list[TranslationProgress] = []
         service.translate_pending(
-            project, _options(),
+            project,
+            _options(),
             on_progress=lambda e: events.append(e),
         )
 

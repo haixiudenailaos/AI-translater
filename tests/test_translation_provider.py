@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 阶段 3（API 生命周期）测试
 
@@ -11,19 +10,16 @@
 5. UiScheduler 协议可被简单实现满足
 """
 
-import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from src.application.ports import TranslationProvider, UiScheduler
 from src.application.translator_provider import TranslatorEngineAdapter
+from src.core.translation_result import BatchTranslationResult, TranslationStatus
 from src.domain.translation import (
     OperationStatus,
     TranslationOptions,
     TranslationProgress,
-    TranslationResult,
 )
-from src.core.translation_result import BatchTranslationResult, TranslationStatus
-
 
 # ── 协议符合性测试 ──────────────────────────────────────
 
@@ -51,6 +47,7 @@ class TestProtocolConformance:
 
     def test_ui_scheduler_protocol_accepts_simple_impl(self):
         """UiScheduler 协议可被简单实现满足"""
+
         class TkScheduler:
             def __init__(self, root):
                 self._root = root
@@ -72,12 +69,16 @@ class TestAdapterTranslateBatch:
     def test_successful_translation_returns_succeeded(self):
         """成功翻译返回 SUCCEEDED 状态"""
         engine = MagicMock()
+
         # 模拟 translate_fast_mode 同步调用 complete_callback
         def fake_translate(content, progress_cb, complete_cb):
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.SUCCEEDED,
-                lines=["你好", "世界"],
-            ))
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.SUCCEEDED,
+                    lines=["你好", "世界"],
+                )
+            )
+
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)
@@ -92,13 +93,17 @@ class TestAdapterTranslateBatch:
     def test_partial_translation_returns_partial(self):
         """部分翻译返回 PARTIAL 状态和失败索引"""
         engine = MagicMock()
+
         def fake_translate(content, progress_cb, complete_cb):
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.PARTIAL,
-                lines=["你好", ""],
-                failed_indices=[1],
-                error_message="1 行译文缺失",
-            ))
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.PARTIAL,
+                    lines=["你好", ""],
+                    failed_indices=[1],
+                    error_message="1 行译文缺失",
+                )
+            )
+
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)
@@ -113,11 +118,15 @@ class TestAdapterTranslateBatch:
     def test_cancelled_translation_returns_cancelled(self):
         """取消翻译返回 CANCELLED 状态"""
         engine = MagicMock()
+
         def fake_translate(content, progress_cb, complete_cb):
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.CANCELLED,
-                lines=["你好", ""],
-            ))
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.CANCELLED,
+                    lines=["你好", ""],
+                )
+            )
+
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)
@@ -130,13 +139,17 @@ class TestAdapterTranslateBatch:
     def test_failed_translation_returns_failed(self):
         """失败翻译返回 FAILED 状态"""
         engine = MagicMock()
+
         def fake_translate(content, progress_cb, complete_cb):
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.FAILED,
-                lines=["", ""],
-                failed_indices=[0, 1],
-                error_message="连接超时",
-            ))
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.FAILED,
+                    lines=["", ""],
+                    failed_indices=[0, 1],
+                    error_message="连接超时",
+                )
+            )
+
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)
@@ -166,11 +179,15 @@ class TestAdapterTranslateBatch:
     def test_empty_lines_returns_succeeded_with_empty_tuple(self):
         """空行列表返回 SUCCEEDED 和空 tuple"""
         engine = MagicMock()
+
         def fake_translate(content, progress_cb, complete_cb):
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.SUCCEEDED,
-                lines=[],
-            ))
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.SUCCEEDED,
+                    lines=[],
+                )
+            )
+
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)
@@ -194,22 +211,28 @@ class TestProgressCallback:
 
         def fake_translate(content, progress_cb, complete_cb):
             # 模拟一个批次完成
-            progress_cb(50.0, {
-                "batch_start": 0,
-                "translated_lines": ["你好"],
-                "streaming": False,
-            })
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.SUCCEEDED,
-                lines=["你好", "世界"],
-            ))
+            progress_cb(
+                50.0,
+                {
+                    "batch_start": 0,
+                    "translated_lines": ["你好"],
+                    "streaming": False,
+                },
+            )
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.SUCCEEDED,
+                    lines=["你好", "世界"],
+                )
+            )
 
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)
         options = TranslationOptions(target_language="中文", model_name="test")
-        adapter.translate_batch(["hello", "world"], options,
-                                on_progress=lambda e: progress_events.append(e))
+        adapter.translate_batch(
+            ["hello", "world"], options, on_progress=lambda e: progress_events.append(e)
+        )
 
         assert len(progress_events) == 1
         event = progress_events[0]
@@ -221,12 +244,16 @@ class TestProgressCallback:
     def test_progress_callback_none_does_not_crash(self):
         """on_progress=None 时不崩溃"""
         engine = MagicMock()
+
         def fake_translate(content, progress_cb, complete_cb):
             progress_cb(50.0, {"batch_start": 0, "translated_lines": ["你好"], "streaming": False})
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.SUCCEEDED,
-                lines=["你好"],
-            ))
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.SUCCEEDED,
+                    lines=["你好"],
+                )
+            )
+
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)
@@ -238,12 +265,16 @@ class TestProgressCallback:
     def test_progress_callback_exception_does_not_crash(self):
         """on_progress 抛异常时不影响翻译"""
         engine = MagicMock()
+
         def fake_translate(content, progress_cb, complete_cb):
             progress_cb(50.0, {"batch_start": 0, "translated_lines": ["你好"], "streaming": False})
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.SUCCEEDED,
-                lines=["你好"],
-            ))
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.SUCCEEDED,
+                    lines=["你好"],
+                )
+            )
+
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)
@@ -261,23 +292,29 @@ class TestProgressCallback:
         progress_events = []
 
         def fake_translate(content, progress_cb, complete_cb):
-            progress_cb(25.0, {
-                "batch_start": 0,
-                "streaming": True,
-                "current_text": "你好",
-                "expected_lines": 2,
-            })
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.SUCCEEDED,
-                lines=["你好", "世界"],
-            ))
+            progress_cb(
+                25.0,
+                {
+                    "batch_start": 0,
+                    "streaming": True,
+                    "current_text": "你好",
+                    "expected_lines": 2,
+                },
+            )
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.SUCCEEDED,
+                    lines=["你好", "世界"],
+                )
+            )
 
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)
         options = TranslationOptions(target_language="中文", model_name="test")
-        adapter.translate_batch(["hello", "world"], options,
-                                on_progress=lambda e: progress_events.append(e))
+        adapter.translate_batch(
+            ["hello", "world"], options, on_progress=lambda e: progress_events.append(e)
+        )
 
         assert len(progress_events) == 1
         event = progress_events[0]
@@ -325,11 +362,15 @@ class TestLifecycle:
     def test_reset_called_before_translate(self):
         """翻译前调用 engine.reset 重置状态"""
         engine = MagicMock()
+
         def fake_translate(content, progress_cb, complete_cb):
-            complete_cb(BatchTranslationResult(
-                status=TranslationStatus.SUCCEEDED,
-                lines=["你好"],
-            ))
+            complete_cb(
+                BatchTranslationResult(
+                    status=TranslationStatus.SUCCEEDED,
+                    lines=["你好"],
+                )
+            )
+
         engine.translate_fast_mode.side_effect = fake_translate
 
         adapter = TranslatorEngineAdapter(engine)

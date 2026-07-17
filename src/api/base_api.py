@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 API 抽象基类
 提取 SiliconFlowAPI 和 DeepseekAPI 的公共逻辑：
@@ -11,14 +10,16 @@ API 抽象基类
 - 缓存/批处理辅助方法
 """
 
-import httpx
 import json
-import time
 import threading
+import time
 from contextlib import contextmanager
-from typing import Dict, Any, Optional, List, Callable, Generator
-from ..core.smart_cache import SmartCache
+from typing import Any, Callable, Dict, Generator, List
+
+import httpx
+
 from ..core.batch_processor import get_batch_processor
+from ..core.smart_cache import SmartCache
 from ..domain.errors import TranslationRequestError
 from ..utils.logger import get_logger
 from ..utils.token_estimator import estimate_tokens
@@ -44,7 +45,7 @@ class BaseAPI:
         self.max_tokens = config.get("max_tokens", 2048)
         self.temperature = config.get("temperature", 0.3)
         self._cancel_event = threading.Event()
-        self._current_client: Optional[httpx.Client] = None
+        self._current_client: httpx.Client | None = None
 
         # R2-BUG-023：活动请求计数器和客户端锁
         # 心跳线程通过检查 _active_requests 判断是否有翻译请求正在进行，
@@ -70,7 +71,9 @@ class BaseAPI:
 
         # HTTP 连接池配置
         http_limits = config.get("http_limits", {})
-        self._max_keepalive = http_limits.get("max_keepalive_connections", self.DEFAULT_MAX_KEEPALIVE)
+        self._max_keepalive = http_limits.get(
+            "max_keepalive_connections", self.DEFAULT_MAX_KEEPALIVE
+        )
         self._max_connections = http_limits.get("max_connections", self.DEFAULT_MAX_CONNECTIONS)
         legacy_timeout = float(config.get("http_timeout", self.DEFAULT_TIMEOUT))
         self._connect_timeout = float(config.get("http_connect_timeout", 10.0))
@@ -104,18 +107,21 @@ class BaseAPI:
         else:
             self.cache = None
 
-        # 批处理
+        # PERF §10.3：批处理改为延迟创建。主文本翻译路径使用
+        # translate_stream_enhanced()，不会触及 batch_processor；旧式
+        # translate_batch() 首次调用时才构造，避免无用后台线程常驻。
         self.enable_batch = config.get("enable_batch", True)
         if self.enable_batch:
             bc = config.get("batch_config", {})
-            self.batch_processor = get_batch_processor(
-                max_batch_size=bc.get("max_batch_size", 10),
-                max_wait_time=bc.get("max_wait_time", 0.5),
-                max_workers=bc.get("max_workers", 4),
-            )
-            self.batch_processor.set_api_handler(self._batch_translate_handler)
+            self._batch_config = {
+                "max_batch_size": bc.get("max_batch_size", 10),
+                "max_wait_time": bc.get("max_wait_time", 0.5),
+                "max_workers": bc.get("max_workers", 4),
+            }
         else:
-            self.batch_processor = None
+            self._batch_config = None
+        self.batch_processor = None
+        self._batch_lock = threading.Lock()
 
         self.enable_stream = config.get("enable_stream", True)
         self.stream_callbacks: Dict[str, Callable] = {}
@@ -128,8 +134,8 @@ class BaseAPI:
             if self._current_client:
                 try:
                     self._current_client.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("关闭旧 HTTP 客户端失败: %s", exc)
             limits = httpx.Limits(
                 max_keepalive_connections=self._max_keepalive,
                 max_connections=self._max_connections,
@@ -193,8 +199,8 @@ class BaseAPI:
         if client is not None:
             try:
                 client.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("关闭 HTTP 客户端失败: %s", exc)
             self._current_client = None
 
     def reset_cancel(self):
@@ -211,15 +217,15 @@ class BaseAPI:
         if self._current_client:
             try:
                 self._current_client.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("关闭 HTTP 客户端失败: %s", exc)
             self._current_client = None
         # 关闭批处理线程池
         if self.batch_processor:
             try:
                 self.batch_processor.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("关闭批处理器失败: %s", exc)
             self.batch_processor = None
 
     # ── 连接测试 ────────────────────────────────────────
@@ -229,7 +235,7 @@ class BaseAPI:
             logger.warning("API密钥为空")
             return False
 
-        def _check_once(client: httpx.Client) -> Optional[bool]:
+        def _check_once(client: httpx.Client) -> bool | None:
             try:
                 resp = client.post(
                     f"{self.base_url}/chat/completions",
@@ -247,7 +253,7 @@ class BaseAPI:
                     try:
                         body = resp.json()
                         return bool(body.get("choices"))
-                    except Exception:
+                    except (KeyError, TypeError, json.JSONDecodeError):
                         return True
                 if resp.status_code in (401, 403):
                     logger.error("连接失败：鉴权错误（API Key 可能无效或权限不足）")
@@ -261,13 +267,25 @@ class BaseAPI:
                         raw = str(body.get("error") or body.get("message") or resp.text)
                     except Exception:
                         raw = resp.text
-                    kw = ["model", "not found", "unknown", "invalid", "unsupported",
-                          "模型", "不存在", "未知", "无效", "不支持", "未找到"]
+                    kw = [
+                        "model",
+                        "not found",
+                        "unknown",
+                        "invalid",
+                        "unsupported",
+                        "模型",
+                        "不存在",
+                        "未知",
+                        "无效",
+                        "不支持",
+                        "未找到",
+                    ]
                     if any(k in raw.lower() for k in kw):
                         logger.error("连接失败：模型不可用或不存在")
                         return False
                 return None
-            except Exception:
+            except Exception as exc:
+                logger.warning("连接测试异常: %s", exc)
                 return None
 
         for attempt in range(2):
@@ -286,13 +304,13 @@ class BaseAPI:
 
     # ── 翻译核心 ────────────────────────────────────────
 
-    def translate(self, text: str) -> Optional[str]:
+    def translate(self, text: str) -> str | None:
         if not self.api_key:
             logger.warning("API密钥为空")
             return None
         return self._direct_translate(text)
 
-    def _direct_translate(self, text: str, context: Dict[str, Any] = None) -> Optional[str]:
+    def _direct_translate(self, text: str, context: Dict[str, Any] = None) -> str | None:
         if not self.api_key:
             logger.warning("API密钥为空")
             return None
@@ -356,7 +374,7 @@ class BaseAPI:
                     return min(30.0, max(0.0, float(retry_after)))
                 except ValueError:
                     pass
-        return min(20.0, self._retry_base_delay * (2 ** attempt))
+        return min(20.0, self._retry_base_delay * (2**attempt))
 
     def _record_attempt(self, input_tokens: int) -> None:
         with self._metrics_lock:
@@ -402,9 +420,7 @@ class BaseAPI:
             pressure = self._rate_limit_pressure
         return max(512, int(configured * 0.75)) if pressure >= 0.5 else configured
 
-    def translate_stream(
-        self, text: str, callback=None, system_prompt: str = None
-    ) -> Optional[str]:
+    def translate_stream(self, text: str, callback=None, system_prompt: str = None) -> str | None:
         if self._cancel_event.is_set():
             return None
 
@@ -442,21 +458,38 @@ class BaseAPI:
                             response.read()
                             status_code = response.status_code
                             rate_limited = status_code == 429
-                            if self._is_retryable_status(status_code) and attempt < self._max_attempts - 1:
+                            if (
+                                self._is_retryable_status(status_code)
+                                and attempt < self._max_attempts - 1
+                            ):
                                 self._record_retry(rate_limited=rate_limited)
                                 delay = self._retry_delay(attempt, response)
                                 logger.warning(
                                     "流式请求失败 (HTTP %s)，%.1f 秒后重试 (%s/%s)",
-                                    status_code, delay, attempt + 1, self._max_attempts,
+                                    status_code,
+                                    delay,
+                                    attempt + 1,
+                                    self._max_attempts,
                                 )
                                 self._cancel_event.wait(delay)
                                 continue
                             if rate_limited:
                                 self._record_rate_limit()
                             body = response.text[:500]
+                            # 队列并发优化（§8.2）：把 Retry-After 透传给上层
+                            # 共享 ProviderLimiter，使其在 Provider 范围统一 cooldown。
+                            retry_after_seconds: float | None = None
+                            if rate_limited:
+                                raw_retry = response.headers.get("retry-after")
+                                if raw_retry:
+                                    try:
+                                        retry_after_seconds = max(0.0, min(60.0, float(raw_retry)))
+                                    except ValueError:
+                                        retry_after_seconds = None
                             raise TranslationRequestError(
                                 f"API 请求失败 (HTTP {status_code}): {body}",
                                 status_code=status_code,
+                                retry_after_seconds=retry_after_seconds,
                             )
 
                         # PERF-001：用列表累积避免字符串拼接 O(n²)
@@ -507,7 +540,10 @@ class BaseAPI:
                     delay = self._retry_delay(attempt)
                     logger.warning(
                         "网络请求失败: %s，%.1f 秒后重试 (%s/%s)",
-                        e, delay, attempt + 1, self._max_attempts,
+                        e,
+                        delay,
+                        attempt + 1,
+                        self._max_attempts,
                     )
                     self._cancel_event.wait(delay)
                     continue
@@ -520,8 +556,9 @@ class BaseAPI:
 
     # ── 视觉查询 ────────────────────────────────────────
 
-    def vision_query(self, image_base64: str, mime_type: str, prompt: str,
-                     model_override: str = None) -> Optional[str]:
+    def vision_query(
+        self, image_base64: str, mime_type: str, prompt: str, model_override: str = None
+    ) -> str | None:
         if not self.api_key:
             logger.warning("API密钥为空")
             return None
@@ -569,9 +606,11 @@ class BaseAPI:
 
     # ── 缓存 / 批处理辅助 ──────────────────────────────
 
-    def _batch_translate_handler(self, texts: List[str], contexts: List[Dict[str, Any]]) -> List[Optional[str]]:
+    def _batch_translate_handler(
+        self, texts: List[str], contexts: List[Dict[str, Any]]
+    ) -> List[str | None]:
         results = []
-        for text, context in zip(texts, contexts):
+        for text, context in zip(texts, contexts, strict=False):
             if self.cache:
                 cached = self.cache.get(text, context)
                 if cached:
@@ -583,7 +622,7 @@ class BaseAPI:
             results.append(result)
         return results
 
-    def translate_with_cache(self, text: str, context: Dict[str, Any] = None) -> Optional[str]:
+    def translate_with_cache(self, text: str, context: Dict[str, Any] = None) -> str | None:
         if self.cache:
             cached = self.cache.get(text, context)
             if cached:
@@ -593,10 +632,33 @@ class BaseAPI:
             self.cache.set(text, result, context)
         return result
 
-    def translate_batch(self, texts: List[str], contexts: List[Dict[str, Any]] = None) -> List[Optional[str]]:
+    def _ensure_batch_processor(self):
+        """PERF §10.3：线程安全地延迟创建批处理器。
+
+        首次 ``translate_batch()`` 调用时构造；若 ``enable_batch`` 为 False
+        或批处理器已存在，则直接返回。
+        """
+        if self.batch_processor is not None or self._batch_config is None:
+            return
+        with self._batch_lock:
+            if self.batch_processor is not None:
+                return
+            self.batch_processor = get_batch_processor(**self._batch_config)
+            self.batch_processor.set_api_handler(self._batch_translate_handler)
+
+    def translate_batch(
+        self, texts: List[str], contexts: List[Dict[str, Any]] = None
+    ) -> List[str | None]:
+        # PERF §10.3：首次调用时延迟创建批处理器
+        if self.batch_processor is None and self._batch_config is not None:
+            self._ensure_batch_processor()
         if not self.batch_processor:
-            return [self.translate_with_cache(t, contexts[i] if contexts and i < len(contexts) else None)
-                    for i, t in enumerate(texts)]
+            return [
+                self.translate_with_cache(
+                    t, contexts[i] if contexts and i < len(contexts) else None
+                )
+                for i, t in enumerate(texts)
+            ]
         futures = []
         for i, text in enumerate(texts):
             ctx = contexts[i] if contexts and i < len(contexts) else {}
@@ -619,7 +681,7 @@ class BaseAPI:
         context: Dict[str, Any] = None,
         stream_id: str = None,
         system_prompt: str = None,
-    ) -> Optional[str]:
+    ) -> str | None:
         if not self.enable_stream:
             direct_context = dict(context or {})
             direct_context["system_prompt"] = system_prompt
@@ -647,14 +709,16 @@ class BaseAPI:
             if stream_id:
                 self.stream_callbacks.pop(stream_id, None)
 
-    def _simulate_stream_output(self, text: str, callback: Callable[[str], None],
-                                chunk_size: int = 3, delay: float = 0.05):
+    def _simulate_stream_output(
+        self, text: str, callback: Callable[[str], None], chunk_size: int = 3, delay: float = 0.05
+    ):
         def worker():
             for i in range(0, len(text), chunk_size):
                 if self._cancel_event.is_set():
                     break
-                callback(text[i:i + chunk_size])
+                callback(text[i : i + chunk_size])
                 time.sleep(delay)
+
         threading.Thread(target=worker, daemon=True).start()
 
     def cancel_stream(self, stream_id: str):
@@ -694,15 +758,14 @@ class BaseAPI:
             pressure = self._rate_limit_pressure
         successes = metrics["successful_requests"]
         generation_seconds = metrics["generation_seconds"]
-        metrics["average_ttft_seconds"] = (
-            metrics["ttft_seconds"] / successes if successes else 0.0
-        )
+        metrics["average_ttft_seconds"] = metrics["ttft_seconds"] / successes if successes else 0.0
         metrics["average_request_seconds"] = (
             metrics["request_seconds"] / successes if successes else 0.0
         )
         metrics["output_tokens_per_second"] = (
             metrics["output_tokens_estimated"] / generation_seconds
-            if generation_seconds > 0 else 0.0
+            if generation_seconds > 0
+            else 0.0
         )
         metrics["rate_limit_pressure"] = pressure
         return metrics

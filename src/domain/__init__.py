@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 领域层（domain）
 

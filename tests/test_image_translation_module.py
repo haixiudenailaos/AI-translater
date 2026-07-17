@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 图片翻译模块集成测试
 
@@ -33,8 +32,8 @@ from src.infrastructure.image_translation.fake_provider import (
     FakeImageTranslationProvider,
 )
 from src.infrastructure.image_translation.language_codes import (
-    to_manga_lang,
     stage_label,
+    to_manga_lang,
 )
 from src.infrastructure.image_translation.manifest_repository import (
     ManifestRepository,
@@ -42,7 +41,6 @@ from src.infrastructure.image_translation.manifest_repository import (
 from src.infrastructure.image_translation.registry import (
     ImageTranslationProviderRegistry,
 )
-
 
 # ── 领域模型 ──────────────────────────────────────
 
@@ -86,18 +84,21 @@ class TestDomainModels:
 
 
 class TestLanguageMapping:
-    @pytest.mark.parametrize("project_lang,manga_code", [
-        ("中文", "CHS"),
-        ("简体中文", "CHS"),
-        ("繁體中文", "CHT"),
-        ("英文", "ENG"),
-        ("日文", "JPN"),
-        ("韩文", "KOR"),
-        ("法文", "FRA"),
-        ("德文", "DEU"),
-        ("西班牙文", "ESP"),
-        ("俄文", "RUS"),
-    ])
+    @pytest.mark.parametrize(
+        "project_lang,manga_code",
+        [
+            ("中文", "CHS"),
+            ("简体中文", "CHS"),
+            ("繁體中文", "CHT"),
+            ("英文", "ENG"),
+            ("日文", "JPN"),
+            ("韩文", "KOR"),
+            ("法文", "FRA"),
+            ("德文", "DEU"),
+            ("西班牙文", "ESP"),
+            ("俄文", "RUS"),
+        ],
+    )
     def test_known_language_mapping(self, project_lang, manga_code):
         assert to_manga_lang(project_lang) == manga_code
 
@@ -241,9 +242,7 @@ class TestManifestRepository:
         repo = ManifestRepository(tmp_path)
         result = ImageTranslationResult(
             status=OperationStatus.FAILED,
-            failed_images={
-                "a.jpg": "OCR failed with api_key=sk-secret123 and Bearer token"
-            },
+            failed_images={"a.jpg": "OCR failed with api_key=sk-secret123 and Bearer token"},
             provider_id=ImageTranslationProviderId.MANGA,
         )
         repo.save(result)
@@ -532,10 +531,7 @@ class TestConfigMigration:
         tmp_config_manager.save_app_config(app_config)
         tmp_config_manager.app_config = tmp_config_manager.load_app_config()
         # default_provider 应被强制重置为 manga
-        assert (
-            tmp_config_manager.get_image_translation_config()["default_provider"]
-            == "manga"
-        )
+        assert tmp_config_manager.get_image_translation_config()["default_provider"] == "manga"
         # 用户自定义的 manga 段字段保留
         assert (
             tmp_config_manager.get_image_translation_config()["manga"]["quality_preset"]
@@ -674,9 +670,7 @@ def _build_handler(mapping_dir, *, volc_key="", api_configured=True):
     from src.ui.image_translation_handler import ImageTranslationHandler
 
     handler = ImageTranslationHandler.__new__(ImageTranslationHandler)
-    handler.config_manager = _StubConfigManager(
-        volc_key=volc_key, api_configured=api_configured
-    )
+    handler.config_manager = _StubConfigManager(volc_key=volc_key, api_configured=api_configured)
     handler.status_updater = lambda _msg: None
     handler.image_progress_updater = lambda _msg: None
     handler.get_mapping_dir = lambda: mapping_dir
@@ -701,9 +695,7 @@ def _write_images_json(mapping_dir, *, with_images=True):
         data = {"image_mappings": {"a.jpg": {"original_path": "a.jpg"}}}
     else:
         data = {"image_mappings": {}}
-    (mapping_dir / "images.json").write_text(
-        json.dumps(data), encoding="utf-8"
-    )
+    (mapping_dir / "images.json").write_text(json.dumps(data), encoding="utf-8")
 
 
 class TestPhase4HandlerWiring:
@@ -720,9 +712,7 @@ class TestPhase4HandlerWiring:
 
         fake_module = types.ModuleType("src.infrastructure.image_asset_store")
         fake_module.migrate_legacy_images = lambda _mapping_dir: None
-        monkeypatch.setitem(
-            sys.modules, "src.infrastructure.image_asset_store", fake_module
-        )
+        monkeypatch.setitem(sys.modules, "src.infrastructure.image_asset_store", fake_module)
 
         captured = []
         handler._start_translation = lambda pid: captured.append(pid)
@@ -742,9 +732,7 @@ class TestPhase4HandlerWiring:
 
         fake_module = types.ModuleType("src.infrastructure.image_asset_store")
         fake_module.migrate_legacy_images = lambda _mapping_dir: None
-        monkeypatch.setitem(
-            sys.modules, "src.infrastructure.image_asset_store", fake_module
-        )
+        monkeypatch.setitem(sys.modules, "src.infrastructure.image_asset_store", fake_module)
 
         captured = []
         handler._start_translation = lambda pid: captured.append(pid)
@@ -778,9 +766,7 @@ class TestPhase4HandlerWiring:
         # 拦截 showwarning 弹窗，避免阻塞测试
         import src.ui.image_translation_handler as handler_mod
 
-        monkeypatch.setattr(
-            handler_mod.messagebox, "showwarning", lambda *a, **k: None
-        )
+        monkeypatch.setattr(handler_mod.messagebox, "showwarning", lambda *a, **k: None)
 
         settings_called = []
         handler.open_settings = lambda: settings_called.append(True)
@@ -795,9 +781,7 @@ class TestPhase4HandlerWiring:
         # 调用了 open_settings 引导用户配置
         assert settings_called == [True]
 
-    def test_ai_entry_aborts_when_user_declines_confirmation(
-        self, tmp_path, monkeypatch
-    ):
+    def test_ai_entry_aborts_when_user_declines_confirmation(self, tmp_path, monkeypatch):
         """用户在二次确认对话框点击「否」时不启动 AI。"""
         _write_images_json(tmp_path)
         handler = _build_handler(tmp_path, volc_key="volc-test-key")
@@ -813,9 +797,7 @@ class TestPhase4HandlerWiring:
 
         assert captured == []
 
-    def test_manga_validate_failure_in_worker_does_not_call_ai(
-        self, tmp_path, monkeypatch
-    ):
+    def test_manga_validate_failure_in_worker_does_not_call_ai(self, tmp_path, monkeypatch):
         """Manga 校验失败时 worker 不调用 AI Provider（不自动切换）。
 
         通过替换 _get_service 返回一个 Manga 校验失败 + AI 跟踪调用的 Service，
@@ -827,15 +809,9 @@ class TestPhase4HandlerWiring:
         # 拦截 messagebox 弹窗，避免阻塞测试
         import src.ui.image_translation_handler as handler_mod
 
-        monkeypatch.setattr(
-            handler_mod.messagebox, "showerror", lambda *a, **k: None
-        )
-        monkeypatch.setattr(
-            handler_mod.messagebox, "showinfo", lambda *a, **k: None
-        )
-        monkeypatch.setattr(
-            handler_mod.messagebox, "showwarning", lambda *a, **k: None
-        )
+        monkeypatch.setattr(handler_mod.messagebox, "showerror", lambda *a, **k: None)
+        monkeypatch.setattr(handler_mod.messagebox, "showinfo", lambda *a, **k: None)
+        monkeypatch.setattr(handler_mod.messagebox, "showwarning", lambda *a, **k: None)
 
         # 构造一个 Service：Manga validate 失败，AI 可被调用以便跟踪
         registry = ImageTranslationProviderRegistry()
@@ -862,17 +838,13 @@ class TestPhase4HandlerWiring:
 class TestConcurrentWindowQueueWiring:
     """阶段 4 验收：队列图片翻译默认走 Manga，移除火山 Key 硬编码。"""
 
-    def test_translate_all_images_requires_api_config_not_volc_key(
-        self, tmp_path, monkeypatch
-    ):
+    def test_translate_all_images_requires_api_config_not_volc_key(self, tmp_path, monkeypatch):
         """队列图片翻译入口只检查 API 配置（Manga external_llm 用），不检查火山 Key。"""
         from src.ui.concurrent_window import ConcurrentWindow
 
         # 绕过 __init__
         win = ConcurrentWindow.__new__(ConcurrentWindow)
-        win.config_manager = _StubConfigManager(
-            volc_key="", api_configured=True
-        )
+        win.config_manager = _StubConfigManager(volc_key="", api_configured=True)
         win.app_paths = None
 
         # manager.get_all_tasks() 返回空列表 → 进入「没有已完成的EPUB任务」分支
@@ -894,12 +866,8 @@ class TestConcurrentWindowQueueWiring:
         shown = []
         import src.ui.concurrent_window as cw_mod
 
-        monkeypatch.setattr(
-            cw_mod.messagebox, "showinfo", lambda *a, **k: shown.append(a)
-        )
-        monkeypatch.setattr(
-            cw_mod.messagebox, "showwarning", lambda *a, **k: shown.append(a)
-        )
+        monkeypatch.setattr(cw_mod.messagebox, "showinfo", lambda *a, **k: shown.append(a))
+        monkeypatch.setattr(cw_mod.messagebox, "showwarning", lambda *a, **k: shown.append(a))
 
         win._translate_all_images()
 

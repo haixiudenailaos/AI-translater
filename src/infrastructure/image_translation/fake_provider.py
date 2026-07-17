@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 内存 Fake Provider（测试安全网）
 
@@ -7,7 +6,7 @@
 """
 
 import threading
-from typing import Callable, Optional
+from typing import Callable
 
 from ...domain.errors import ImageTranslationCancelled
 from ...domain.image_translation import (
@@ -25,18 +24,16 @@ class FakeImageTranslationProvider:
     通过配置控制返回结果，便于覆盖各种状态语义。
     """
 
-    provider_id: str = ImageTranslationProviderId.MANGA.value
-
     def __init__(
         self,
         provider_id: str = ImageTranslationProviderId.MANGA.value,
         *,
-        validation_errors: Optional[list[str]] = None,
-        result_map: Optional[dict] = None,
-        skipped_images: Optional[list] = None,
-        failed_images: Optional[dict] = None,
+        validation_errors: list[str] | None = None,
+        result_map: dict | None = None,
+        skipped_images: list | None = None,
+        failed_images: dict | None = None,
         status: OperationStatus = OperationStatus.SUCCEEDED,
-        raise_on_translate: Optional[Exception] = None,
+        raise_on_translate: Exception | None = None,
         cancel_raises: bool = False,
     ) -> None:
         self._provider_id = provider_id
@@ -52,11 +49,11 @@ class FakeImageTranslationProvider:
         self.close_called = False
         self.translate_called = False
         self.translate_call_count = 0
-        self.last_request: Optional[ImageTranslationRequest] = None
+        self.last_request: ImageTranslationRequest | None = None
         self._cancel_event = threading.Event()
 
     @property
-    def provider_id(self) -> str:  # type: ignore[override]
+    def provider_id(self) -> str:
         return self._provider_id
 
     def validate(self, request: ImageTranslationRequest) -> list[str]:
@@ -65,7 +62,7 @@ class FakeImageTranslationProvider:
     def translate(
         self,
         request: ImageTranslationRequest,
-        on_progress: Optional[Callable[[ImageTranslationProgress], None]] = None,
+        on_progress: Callable[[ImageTranslationProgress], None] | None = None,
     ) -> ImageTranslationResult:
         self.translate_called = True
         self.translate_call_count += 1
@@ -78,18 +75,12 @@ class FakeImageTranslationProvider:
             raise self._raise_on_translate
 
         if on_progress is not None:
-            total = len(self._result_map) + len(self._skipped_images) + len(
-                self._failed_images
-            )
+            total = len(self._result_map) + len(self._skipped_images) + len(self._failed_images)
             for i in range(total):
                 if self._cancel_event.is_set():
                     raise ImageTranslationCancelled()
                 try:
-                    on_progress(
-                        ImageTranslationProgress(
-                            stage="test", current=i, total=total
-                        )
-                    )
+                    on_progress(ImageTranslationProgress(stage="test", current=i, total=total))
                 except Exception:
                     pass
 

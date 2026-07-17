@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 图片格式转换工具模块
 将非标准格式图片（SVG、GIF、WebP、BMP、TIFF等）转换为PNG，
@@ -36,12 +35,7 @@ def convert_to_png(b64_data: str, mime_type: str) -> tuple:
         logger.warning("base64解码失败: %s", e)
         return None, None
 
-    png_data = None
-
-    if mime_type == "image/svg+xml":
-        png_data = _convert_svg(raw)
-    else:
-        png_data = _convert_with_pillow(raw)
+    png_data = _convert_svg(raw) if mime_type == "image/svg+xml" else _convert_with_pillow(raw)
 
     if png_data is None:
         return None, None
@@ -54,6 +48,7 @@ def _convert_svg(raw: bytes) -> bytes | None:
     """SVG转PNG，需要cairosvg库。"""
     try:
         import cairosvg
+
         return cairosvg.svg2png(bytestring=raw)
     except ImportError:
         logger.warning("cairosvg未安装，无法转换SVG图片。可通过 pip install cairosvg 安装。")
@@ -75,10 +70,7 @@ def _convert_with_pillow(raw: bytes) -> bytes | None:
             img.seek(0)
 
         # 处理透明通道
-        if img.mode in ("RGBA", "LA", "P", "PA"):
-            img = img.convert("RGBA")
-        else:
-            img = img.convert("RGB")
+        img = img.convert("RGBA") if img.mode in ("RGBA", "LA", "P", "PA") else img.convert("RGB")
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")

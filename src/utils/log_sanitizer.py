@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 日志与诊断信息脱敏工具（UXF-006）
 
@@ -22,14 +21,26 @@
 """
 
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 # 敏感字段名（不区分大小写）
 _SENSITIVE_KEYS = {
-    "api_key", "apikey", "api-key", "key", "secret", "token",
-    "authorization", "auth", "password", "passwd", "pwd",
-    "access_token", "refresh_token", "bearer",
-    "ark_api_key", "volc_key",
+    "api_key",
+    "apikey",
+    "api-key",
+    "key",
+    "secret",
+    "token",
+    "authorization",
+    "auth",
+    "password",
+    "passwd",
+    "pwd",
+    "access_token",
+    "refresh_token",
+    "bearer",
+    "ark_api_key",
+    "volc_key",
 }
 
 # 常见密钥前缀正则（sk-、Bearer 等）
@@ -43,9 +54,7 @@ _BEARER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 # 通用长 token（>=20 位的字母数字序列，可能是密钥）
-_LONG_TOKEN_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9])"
-)
+_LONG_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9])")
 
 # 脱敏后保留的前缀和后缀长度
 _MASK_KEEP_PREFIX = 4
@@ -61,7 +70,11 @@ def mask_value(value: str) -> str:
         return ""
     if len(value) <= 8:
         return "*" * len(value)
-    return value[:_MASK_KEEP_PREFIX] + "*" * (len(value) - _MASK_KEEP_PREFIX - _MASK_KEEP_SUFFIX) + value[-_MASK_KEEP_SUFFIX:]
+    return (
+        value[:_MASK_KEEP_PREFIX]
+        + "*" * (len(value) - _MASK_KEEP_PREFIX - _MASK_KEEP_SUFFIX)
+        + value[-_MASK_KEEP_SUFFIX:]
+    )
 
 
 def sanitize_for_log(value: Any) -> Any:

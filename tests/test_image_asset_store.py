@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """PERF-004 图片二进制资源存储与旧格式迁移测试。"""
 
 import base64
@@ -16,9 +15,7 @@ from src.infrastructure.image_asset_store import (
 def test_save_image_binary_keeps_base64_out_of_metadata(tmp_path):
     """新图片映射只保存元数据，按需读取时仍可得到原始内容。"""
     image_data = b"\x89PNG\r\n\x1a\nimage-content"
-    info = save_image_binary(
-        tmp_path, 0, "Images/cover.png", image_data, "image/png"
-    )
+    info = save_image_binary(tmp_path, 0, "Images/cover.png", image_data, "image/png")
 
     assert "base64_data" not in info
     assert (tmp_path / info["local_path"]).read_bytes() == image_data

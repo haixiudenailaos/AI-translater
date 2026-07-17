@@ -16,7 +16,42 @@ env:
   PYTHON_VERSION: "3.11"
 
 jobs:
+  # P1-6：质量门禁——PR 必须先通过 lint、format check 和测试
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install -r requirements.txt
+
+      - name: Ruff lint
+        run: python -m ruff check main.py build.py src tests tools
+
+      - name: Ruff format check
+        run: python -m ruff format --check main.py build.py src tests tools
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  # P0-1：Text Edition 和 Full Edition 使用独立 matrix
   build-windows:
+    needs: quality
+    strategy:
+      matrix:
+        edition:
+          - { spec: translator_text.spec, name: Text, binary: LightNovelTranslatorV1.6-Text }
+          - { spec: translator.spec, name: Full, binary: LightNovelTranslatorV1.6 }
     runs-on: windows-latest
     steps:
       - name: Check out source
@@ -35,26 +70,40 @@ jobs:
           pip install pyinstaller
           pip install -r requirements.txt
 
-      - name: Build Windows executable
+      - name: Build Windows executable (onedir)
         shell: pwsh
-        run: pyinstaller translator.spec --clean --noconfirm
+        run: pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm
 
-      - name: Rename and validate executable
+      - name: Validate and package onedir output
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path dist -Filter *.exe | Select-Object -First 1
-          if (-not $exe) { throw "PyInstaller did not produce a Windows executable" }
-          $target = "${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64.exe"
-          Move-Item -LiteralPath $exe.FullName -Destination (Join-Path dist $target)
+          # P0-1：onedir 产物位于 dist/<binary_name>/<binary_name>.exe
+          $onedir = "dist/${{ matrix.edition.binary }}"
+          $exe = Join-Path $onedir "${{ matrix.edition.binary }}.exe"
+          if (-not (Test-Path $exe)) {
+            throw "PyInstaller onedir executable not found at: $exe"
+          }
+          Write-Host "Found executable: $exe ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
 
-      - name: Upload Windows executable
+          # 打包整个 onedir 目录为 zip
+          $zipName = "${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64-${{ matrix.edition.name }}.zip"
+          Compress-Archive -Path "$onedir/*" -DestinationPath "dist/$zipName" -Force
+          Write-Host "Created zip: dist/$zipName"
+
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64
-          path: dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64.exe
+          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64-${{ matrix.edition.name }}
+          path: dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64-${{ matrix.edition.name }}.zip
           retention-days: 30
 
   build-macos:
+    needs: quality
+    strategy:
+      matrix:
+        edition:
+          - { spec: translator_text.spec, name: Text, binary: LightNovelTranslatorV1.6-Text }
+          - { spec: translator.spec, name: Full, binary: LightNovelTranslatorV1.6 }
     runs-on: macos-latest
     steps:
       - name: Check out source
@@ -72,17 +121,31 @@ jobs:
           pip install pyinstaller
           pip install -r requirements.txt
 
-      - name: Build macOS executable
-        run: pyinstaller translator.spec --clean --noconfirm
+      - name: Build macOS executable (onedir)
+        run: pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm
 
       - name: Assemble macOS application bundle
         shell: bash
         run: |
-          APP_DIR="dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-Universal.app"
+          # P0-1：onedir 产物位于 dist/<binary_name>/<binary_name>
+          ONEDIR="dist/${{ matrix.edition.binary }}"
+          BINARY="$ONEDIR/${{ matrix.edition.binary }}"
+          if [ ! -f "$BINARY" ]; then
+            echo "ERROR: PyInstaller onedir binary not found at: $BINARY"
+            ls -la dist/ || true
+            ls -la "$ONEDIR" 2>/dev/null || true
+            exit 1
+          fi
+
+          APP_DIR="dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-${{ matrix.edition.name }}.app"
           APP_BINARY="$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
           mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-          mv "dist/LightNovelTranslatorV1.6" "$APP_BINARY"
-          chmod +x "$APP_BINARY"
+
+          # P0-1：复制整个 onedir 目录内容（主二进制 + _internal 依赖）
+          cp -R "$ONEDIR/"* "$APP_DIR/Contents/MacOS/"
+          chmod +x "$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
+          chmod +x "$APP_BINARY" 2>/dev/null || true
+
           cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -112,11 +175,11 @@ jobs:
           plutil -lint "$APP_DIR/Contents/Info.plist"
           ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "${APP_DIR}.zip"
 
-      - name: Upload macOS application
+      - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-Universal
-          path: dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-Universal.app.zip
+          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-${{ matrix.edition.name }}
+          path: dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-${{ matrix.edition.name }}.app.zip
           retention-days: 30
 
   release:

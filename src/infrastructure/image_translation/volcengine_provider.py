@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 火山引擎 AI 图片翻译 Provider
 
@@ -14,9 +13,8 @@ VolcengineImageTranslationProvider 的内部实现保留。
 """
 
 import uuid
-from typing import Optional
 
-from ...domain.errors import ImageTranslationConfigError
+from ...domain.errors import ImageTranslationCancelled, ImageTranslationConfigError
 from ...domain.image_translation import (
     ImageTranslationProgress,
     ImageTranslationProviderId,
@@ -39,6 +37,7 @@ class VolcengineImageTranslationProvider:
         self._translator = None  # 惰性创建
         self._cancel_event = None
         import threading
+
         self._cancel_event = threading.Event()
         self._closed = False
 
@@ -85,7 +84,7 @@ class VolcengineImageTranslationProvider:
         if not volc_key:
             raise ImageTranslationConfigError("未配置火山引擎 API Key")
 
-        from ..core.image_translator import ImageTranslator
+        from ...core.image_translator import ImageTranslator
 
         translator = ImageTranslator(self._config_manager)
         self._translator = translator
@@ -99,16 +98,13 @@ class VolcengineImageTranslationProvider:
             image_mappings_override = None
             if request.selected_images:
                 import json
+
                 images_data = json.loads(
-                    (Path(request.mapping_dir) / "images.json").read_text(
-                        encoding="utf-8"
-                    )
+                    (Path(request.mapping_dir) / "images.json").read_text(encoding="utf-8")
                 )
                 all_mappings = images_data.get("image_mappings", {})
                 selected = set(request.selected_images)
-                image_mappings_override = {
-                    k: v for k, v in all_mappings.items() if k in selected
-                }
+                image_mappings_override = {k: v for k, v in all_mappings.items() if k in selected}
 
             def progress_cb(success, total, current):
                 if on_progress is not None:
@@ -131,6 +127,16 @@ class VolcengineImageTranslationProvider:
                 request.target_language,
                 progress_cb,
                 image_mappings_override=image_mappings_override,
+                cancel_event=self._cancel_event,
+            )
+            failure_message = getattr(translator, "last_error", "")
+        except ImageTranslationCancelled:
+            # P1-8：取消时返回 CANCELLED 结果，不再继续处理
+            logger.info("AI 图片翻译已被用户取消")
+            return ImageTranslationResult(
+                status=OperationStatus.CANCELLED,
+                provider_id=ImageTranslationProviderId.AI_VOLCENGINE,
+                run_id=run_id,
             )
         except Exception as exc:
             logger.error("AI 图片翻译失败: %s", exc, exc_info=True)
@@ -147,14 +153,15 @@ class VolcengineImageTranslationProvider:
                 pass
             self._translator = None
 
-        status = (
-            OperationStatus.SUCCEEDED
-            if result_map
-            else OperationStatus.FAILED
-        )
+        status = OperationStatus.SUCCEEDED if result_map else OperationStatus.FAILED
         return ImageTranslationResult(
             status=status,
             result_map=result_map,
+            failed_images=(
+                {"_global": failure_message or "AI 图片翻译未产生结果"}
+                if not result_map
+                else {}
+            ),
             provider_id=ImageTranslationProviderId.AI_VOLCENGINE,
             run_id=run_id,
         )

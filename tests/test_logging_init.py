@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 R2-BUG-021：日志初始化不由模块导入抢先触发
 
@@ -11,9 +10,7 @@ R2-BUG-021：日志初始化不由模块导入抢先触发
 
 import importlib
 import logging
-import os
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -56,9 +53,7 @@ class TestLoggingInitOrder:
             importlib.import_module("src.app_paths")
 
         # _initialized 应仍为 False
-        assert reset_logger_state._initialized is False, (
-            "导入 app_paths 不应触发日志初始化"
-        )
+        assert reset_logger_state._initialized is False, "导入 app_paths 不应触发日志初始化"
 
     def test_import_app_paths_does_not_create_logs_dir(self, reset_logger_state, tmp_path):
         """导入 src.app_paths 不在 CWD 下创建 ./logs 目录。"""
@@ -68,9 +63,7 @@ class TestLoggingInitOrder:
         importlib.import_module("src.app_paths")
 
         # 导入后仍不应创建 ./logs
-        assert not (tmp_path / "logs").exists(), (
-            "导入 app_paths 不应在 CWD 下创建 logs 目录"
-        )
+        assert not (tmp_path / "logs").exists(), "导入 app_paths 不应在 CWD 下创建 logs 目录"
 
     def test_get_logger_does_not_auto_init(self, reset_logger_state):
         """get_logger 不再隐式调用 setup_logging。"""
@@ -84,7 +77,7 @@ class TestLoggingInitOrder:
 
     def test_setup_logging_uses_explicit_log_dir(self, reset_logger_state, tmp_path):
         """显式 setup_logging(log_dir=...) 后日志写入指定目录。"""
-        from src.utils.logger import setup_logging, is_initialized, get_logger
+        from src.utils.logger import get_logger, is_initialized, setup_logging
 
         custom_log_dir = tmp_path / "custom_logs"
         setup_logging(log_dir=custom_log_dir)

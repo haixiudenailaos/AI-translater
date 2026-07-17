@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Application 层端口（协议）定义
 
@@ -17,18 +16,18 @@ UXF-002（稀疏行翻译）：TranslationProvider.translate_batch 已接受任�
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
+from ..domain.image_translation import (
+    ImageTranslationProgress,
+    ImageTranslationRequest,
+    ImageTranslationResult,
+)
 from ..domain.project import TranslationProject
 from ..domain.translation import (
     TranslationOptions,
     TranslationProgress,
     TranslationResult,
-)
-from ..domain.image_translation import (
-    ImageTranslationProgress,
-    ImageTranslationRequest,
-    ImageTranslationResult,
 )
 
 
@@ -155,7 +154,7 @@ class ProjectRepository(Protocol):
         file_type: str,
         mapping_dir: str,
         original_lines: Sequence[str],
-        model_snapshot: Optional[dict] = None,
+        model_snapshot: dict | None = None,
     ) -> TranslationProject:
         """创建新翻译项目（同 ID 已存在则返回已有项目）
 
@@ -172,7 +171,7 @@ class ProjectRepository(Protocol):
         """
         ...
 
-    def load(self, project_id: str) -> Optional[TranslationProject]:
+    def load(self, project_id: str) -> TranslationProject | None:
         """按项目 ID 加载项目，不存在返回 None"""
         ...
 
@@ -183,8 +182,7 @@ class ProjectRepository(Protocol):
         """
         ...
 
-    def create_checkpoint(self, project: TranslationProject,
-                          label: str = "") -> str:
+    def create_checkpoint(self, project: TranslationProject, label: str = "") -> str:
         """创建检查点（UXF-001：覆盖前创建，允许撤销）
 
         Returns:
@@ -250,4 +248,96 @@ class ImageTranslationProvider(Protocol):
 
     def close(self) -> None:
         """释放资源（模型、event loop、HTTP 客户端），幂等"""
+        ...
+
+
+@runtime_checkable
+class ImageManifestRepository(Protocol):
+    """图片翻译 manifest 仓储协议（P1-1 / P2-2）
+
+    Application 层只依赖此协议，不依赖具体的 ManifestRepository 实现。
+    bootstrap.py 注入工厂，每次请求按 mapping_dir 创建实例。
+
+    约束：
+    - save / save_empty 失败时抛出异常，不静默吞掉（P1-1）。
+    - 原子写入保证旧文件在写入失败时保持完整。
+    - load 兼容 v1/v2 格式。
+    """
+
+    def save(
+        self,
+        result: ImageTranslationResult,
+        *,
+        source_fingerprint: str = "",
+        config_fingerprint: str = "",
+        run_at: str = "",
+    ) -> None:
+        """以 v2 格式原子写入 manifest，失败时抛出异常"""
+        ...
+
+    def save_empty(self, *, run_at: str = "") -> None:
+        """写入空结果 manifest（取消或全部失败前的清理）"""
+        ...
+
+    def load(self) -> object | None:
+        """读取 manifest，不存在返回 None"""
+        ...
+
+
+@runtime_checkable
+class ImageProviderRegistry(Protocol):
+    """图片翻译 Provider 注册表协议（P2-2）
+
+    Application 层只依赖此协议，不依赖全局 get_registry() 单例。
+    bootstrap.py 注入具体注册表，多个窗口或任务之间不共享状态。
+
+    约束：
+    - 按 provider_id 取得 Provider，不实现自动 fallback。
+    - Manga Provider 在禁用开关关闭时返回 None，调用方展示错误。
+    """
+
+    def register(self, provider: object) -> None:
+        """注册一个 Provider"""
+        ...
+
+    def get(self, provider_id: object) -> object | None:
+        """按 provider_id 取得 Provider，不存在返回 None"""
+        ...
+
+    def is_registered(self, provider_id: object) -> bool:
+        """判断 provider_id 是否已注册且可用"""
+        ...
+
+
+@runtime_checkable
+class SecretStore(Protocol):
+    """密钥存储协议（P1-2）
+
+    Application 层只依赖此协议，不依赖 keyring 或环境变量具体实现。
+    bootstrap.py 注入具体实现（KeyringSecretStore 或测试替身）。
+
+    约束：
+    - store 返回 StorageStatus，区分 PERSISTED / SESSION_ONLY / FAILED。
+    - 不在日志或异常中写入密钥明文。
+    - 空密钥视为删除。
+    """
+
+    def store(self, identifier: str, key: str) -> object:
+        """存储密钥，返回 StorageStatus
+
+        Args:
+            identifier: 密钥标识符，如 "provider:siliconflow"
+            key: 密钥明文；空字符串视为删除
+
+        Returns:
+            StorageStatus.PERSISTED / SESSION_ONLY / FAILED
+        """
+        ...
+
+    def retrieve(self, identifier: str) -> str:
+        """读取密钥，不存在返回空字符串"""
+        ...
+
+    def delete(self, identifier: str) -> bool:
+        """删除密钥，幂等"""
         ...

@@ -1,0 +1,161 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-translater"
+version = "1.6.0"
+description = "轻小说翻译器：EPUB/TXT 文学翻译与图片翻译工具"
+requires-python = ">=3.11"
+dependencies = [
+    # PERF §10.2：声明 h2 依赖以匹配 SiliconFlowAPI 的 http2=True 配置，
+    # 避免运行时缺少 h2 后静默回退到 HTTP/1.1。
+    "httpx[http2]>=0.27.0",
+    # P1-5：约束 ebooklib 上限，0.20 存在破坏性变更导致 EPUB 测试失败
+    "ebooklib>=0.18,<0.20",
+    "beautifulsoup4>=4.11.0",
+    "lxml>=4.9.0",
+    "Pillow>=9.0.0",
+    "chardet>=5.0.0",
+    "requests>=2.28.0",
+    "aiohttp>=3.9.0",
+    "openai>=1.0.0",
+    "keyring>=24.0.0",
+]
+
+[project.optional-dependencies]
+# 开发依赖：lint、format、测试
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.6.0",
+]
+# 可选图片翻译依赖：manga-image-translator 深度学习栈
+image-manga = [
+    "torch>=2.1.0,<2.6",
+    "torchvision>=0.16.0,<0.21",
+    "onnxruntime>=1.16.0,<1.20",
+    "opencv-python>=4.8.0,<4.10",
+    "numpy==1.26.4",
+    "Pillow>=9.0.0",
+    "huggingface-hub>=0.20.0,<0.25",
+    "safetensors>=0.4.0",
+    "tokenizers>=0.15.0,<0.20",
+    "transformers>=4.38.0,<4.46",
+    "sentencepiece>=0.1.99",
+    "ctranslate2>=4.0.0",
+    "accelerate>=0.27.0",
+    "open-clip-torch>=2.24.0",
+    "timm>=0.9.16",
+    "einops>=0.7.0",
+    "scikit-image>=0.22.0",
+    "pyclipper>=1.3.0",
+    "shapely>=2.0.0",
+    "freetype-py>=2.4.0",
+    "kornia>=0.7.0",
+    "ImageHash>=4.3.0",
+    "manga-ocr>=0.1.11",
+    "omegaconf>=2.3.0",
+    "python-bidi>=0.4.2",
+    "arabic-reshaper>=3.0.0",
+    "pyhyphen>=4.0.3",
+    "openai==1.63.0",
+    "httpx[http2]==0.27.2",
+    "pydantic==2.5.0",
+    "aiofiles>=23.2.1",
+    "aioshutil>=1.5",
+    "rich>=13.7.0",
+    "regex>=2023.12.25",
+    "cryptography>=41.0.0",
+    "tqdm>=4.66.0",
+    "networkx>=3.2.0",
+    "py3langid==0.2.2",
+    "langdetect>=1.0.9",
+    "langcodes[data]>=3.3.0",
+    "editdistance>=0.8.1",
+    "tensorboardX>=2.6.0",
+    "websockets>=12.0",
+    "tiktoken>=0.6.0",
+    "colorama>=0.4.6",
+    "python-dotenv>=1.0.0",
+    "nest-asyncio>=1.6.0",
+    "marshmallow>=3.20.0",
+    "backports.cached-property>=1.0.2",
+    "groq>=0.9.0",
+    "deepl>=1.18.0",
+    "google-genai>=1.0.0",
+    "protobuf>=3.20.2,<6.0.0",
+    "pandas>=2.1.0",
+    "torch-summary>=1.4.5",
+    "rusty-manga-image-translator",
+]
+
+[tool.setuptools.packages.find]
+# P1-4：修复 wheel 包发现，包含 src 及其所有子包
+where = ["."]
+include = ["src*"]
+
+# ── Ruff：lint + format ──────────────────────────────────────────────
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "third_party",
+    "build",
+    "dist",
+    ".venv",
+]
+
+[tool.ruff.lint]
+# 初始门禁：启用基础规则集，避免一次性修复全部历史代码。
+# E/F: pyflakes + pycodestyle 基础
+# I: isort（import 顺序）
+# UP: pyupgrade（现代化语法）
+# B: bugbear（常见 bug 模式）
+# SIM: simplify（简化代码）
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    # E501: 行过长（由 formatter 处理，且项目中有大量长字符串）
+    "E501",
+    # B008: 函数调用作为默认参数（Tkinter 常见模式）
+    "B008",
+    # SIM117: 嵌套 with 合并（有时影响可读性）
+    "SIM117",
+    # UP035: typing.List 等已弃用（项目仍在过渡期）
+    "UP035",
+    # UP006: 使用 list/dict 替代 typing.List/Dict（过渡期保留）
+    "UP006",
+    # B904: raise from（项目中大量未链式异常，逐步修复）
+    "B904",
+    # UP042: str, Enum → StrEnum（unsafe fix，运行时行为不同，项目依赖字符串枚举）
+    "UP042",
+    # SIM105: try-except-pass → contextlib.suppress
+    # P3-3 将统一收敛异常处理：要求窄化异常类型或记日志，而非机械替换为 suppress
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试文件允许使用 assert、宽捕获和未使用导入
+"tests/**" = ["S101", "B017", "F841"]
+# third_party 不检查
+"third_party/**" = ["E", "F", "I", "UP", "B", "SIM"]
+# translator.py：B023 误报——stream_callback 在单次迭代的循环内同步调用，
+# 列表变量（stream_buffer/pending_parts/preview_lines）为闭包内 mutate，不存在延迟绑定问题
+"src/core/translator.py" = ["B023"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ── pytest ──────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+filterwarnings = [
+    "ignore::DeprecationWarning:ebooklib.*",
+    "ignore::PendingDeprecationWarning",
+]

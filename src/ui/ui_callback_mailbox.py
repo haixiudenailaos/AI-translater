@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""P1-1：通用 UI 回调邮箱与 Tk 主线程事件泵。
+
+解决 ``PYTHON_UIUX_BEST_PRACTICES_AUDIT.md`` P1-1 问题：
+工作线程直接调用 ``root.after()`` / ``winfo_exists()`` 是跨线程 Tk 调用，
+依赖 Tcl 构建和 mainloop 时序，窗口销毁或高并发时可能静默丢事件、卡住
+或抛 ``TclError``。
+
+方案：复用已有的 mailbox/event-pump 模式（参考 ``translation_event_mailbox.py``
+和 ``tk_event_pump.py``），提供通用的 UI 回调邮箱：
+
+- 工作线程只调用 ``UICallbackMailbox.submit(callback)``（基于 ``queue.Queue``，
+  线程安全）。
+- ``TkUICallbackPump`` 由 Tk 主线程创建，按固定间隔排空邮箱并执行回调。
+- 关闭时先标记 ``closed``，再取消 ``after`` 调度，最后关闭邮箱拒绝后续 submit。
+- 窗口销毁后的迟到事件被安全丢弃，``discarded_count`` 提供可观测计数。
+
+约束：
+- ``start`` / ``_poll`` / ``close`` 只由 Tk 主线程调用。
+- 工作线程只能调用 ``mailbox.submit()``。
+- 回调执行期间的异常被 pump 捕获并记录，不会中断后续回调。
+"""
+
+from __future__ import annotations
+
+import queue
+from threading import Lock
+from typing import Callable, List
+
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class UICallbackMailbox:
+    """P1-1：通用 UI 回调邮箱（线程安全）。
+
+    工作线程 ``submit`` 回调，Tk 主线程通过 pump ``drain`` 排空并执行。
+
+    - ``submit`` 可由多个工作线程并发调用（基于 ``queue.Queue``）。
+    - ``drain`` 只由 Tk 主线程调用（与 pump 轮询同步）。
+    - ``close`` 后迟到的 ``submit`` 被安全丢弃，``discarded_count`` 提供可观测计数。
+    """
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self._closed = False
+        self._lock = Lock()
+        self._discarded_count = 0
+        self._total_submitted = 0
+        self._total_drained = 0
+
+    def submit(self, callback: Callable[[], None]) -> None:
+        """工作线程提交回调（线程安全）。
+
+        关闭后的迟到回调被安全丢弃，并增加 ``discarded_count``。
+        """
+        with self._lock:
+            if self._closed:
+                self._discarded_count += 1
+                return
+            self._total_submitted += 1
+        self._queue.put(callback)
+
+    def drain(self) -> List[Callable[[], None]]:
+        """主线程排空邮箱，返回待执行回调列表（保持提交顺序）。
+
+        只由 Tk 主线程调用（与 pump 轮询同步）。排空后邮箱为空。
+        """
+        callbacks: List[Callable[[], None]] = []
+        while True:
+            try:
+                callbacks.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        with self._lock:
+            self._total_drained += len(callbacks)
+        return callbacks
+
+    def close(self) -> None:
+        """关闭邮箱，拒绝后续 ``submit``。幂等。"""
+        with self._lock:
+            self._closed = True
+
+    @property
+    def is_closed(self) -> bool:
+        """邮箱是否已关闭。"""
+        return self._closed
+
+    @property
+    def discarded_count(self) -> int:
+        """关闭后被丢弃的迟到回调数（可观测计数，满足 P1-1 验收标准）。"""
+        return self._discarded_count
+
+    @property
+    def pending_count(self) -> int:
+        """当前待处理的回调数。"""
+        return self._queue.qsize()
+
+    @property
+    def total_submitted(self) -> int:
+        """累计提交数（不含被丢弃的迟到回调）。"""
+        return self._total_submitted
+
+    @property
+    def total_drained(self) -> int:
+        """累计排空数。"""
+        return self._total_drained
+
+
+class TkUICallbackPump:
+    """P1-1：Tk 主线程 UI 回调事件泵。
+
+    按固定间隔（默认 50ms，对应 20 次/秒）在 Tk 主线程排空
+    ``UICallbackMailbox`` 并执行回调。
+
+    约束：
+    - ``start`` / ``_poll`` / ``close`` 只由 Tk 主线程调用。
+    - 工作线程只能调用 ``mailbox.submit()``。
+    - 关闭时先标记 ``_closed``，再取消 ``after`` 调度，最后关闭邮箱。
+    - 回调执行期间的异常被捕获并记录（通过 ``on_error``），不中断后续回调。
+    """
+
+    def __init__(
+        self,
+        root,
+        mailbox: UICallbackMailbox,
+        interval_ms: int = 50,
+        on_error: Callable[[Exception], None] | None = None,
+    ) -> None:
+        self._root = root
+        self._mailbox = mailbox
+        # 默认 50ms 对应 20 次/秒，满足 UI 响应需求且不过度消耗 CPU。
+        self._interval_ms = interval_ms
+        self._after_id: str | None = None
+        self._closed = False
+        self._on_error = on_error
+        self._executed_count = 0
+        self._error_count = 0
+
+    def start(self) -> None:
+        """启动事件泵。幂等：已启动或已关闭时不再调度。"""
+        if self._closed or self._after_id is not None:
+            return
+        self._after_id = self._root.after(self._interval_ms, self._poll)
+
+    def _poll(self) -> None:
+        """排空邮箱并执行回调。只在 Tk 主线程执行。"""
+        self._after_id = None
+        if self._closed:
+            return
+        callbacks = self._mailbox.drain()
+        for callback in callbacks:
+            try:
+                callback()
+                self._executed_count += 1
+            except Exception as exc:
+                self._error_count += 1
+                # 记录异常但不中断后续回调
+                logger.debug("UI 回调执行异常: %s", exc, exc_info=True)
+                if self._on_error is not None:
+                    try:
+                        self._on_error(exc)
+                    except Exception:
+                        pass
+        # 继续下一轮调度
+        self.start()
+
+    def close(self) -> None:
+        """关闭事件泵，取消待执行的 after 回调。幂等。
+
+        同时关闭邮箱以拒绝后续 submit（迟到事件被丢弃并计数）。
+        """
+        self._closed = True
+        self._mailbox.close()
+        if self._after_id is not None:
+            try:
+                self._root.after_cancel(self._after_id)
+            except Exception:
+                # Tk 可能已被销毁，忽略取消失败
+                pass
+            self._after_id = None
+
+    @property
+    def is_closed(self) -> bool:
+        """事件泵是否已关闭。"""
+        return self._closed
+
+    @property
+    def executed_count(self) -> int:
+        """累计成功执行的回调数。"""
+        return self._executed_count
+
+    @property
+    def error_count(self) -> int:
+        """累计执行失败的回调数。"""
+        return self._error_count

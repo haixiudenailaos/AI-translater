@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 轻量批处理封装（线程池版）
 提供最小可用接口：set_api_handler、submit_request、get_stats、configure
 """
 
-from concurrent.futures import ThreadPoolExecutor, Future
-from typing import Any, Callable, Dict, List, Optional
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Callable, Dict, List
 
 
 class BatchProcessor:
-    def __init__(self, max_batch_size: int = 10, max_wait_time: float = 0.5,
-                 max_workers: int = 4):
+    def __init__(self, max_batch_size: int = 10, max_wait_time: float = 0.5, max_workers: int = 4):
         self.max_batch_size = max_batch_size
         self.max_wait_time = max_wait_time
         self.max_workers = max_workers
 
-        self._handler: Optional[Callable[[List[str], List[Dict[str, Any]]], List[Optional[str]]]] = None
+        self._handler: Callable[[List[str], List[Dict[str, Any]]], List[str | None]] | None = None
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._submitted = 0
         self._batches = 0
@@ -42,14 +40,16 @@ class BatchProcessor:
         try:
             # cancel_futures=True 取消尚未开始的待办任务
             self._executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
+        except TypeError:
             # 某些旧版本 Python 不支持 cancel_futures 参数
             try:
                 self._executor.shutdown(wait=False)
-            except Exception:
-                pass
+            except TypeError:
+                pass  # 最佳努力：旧版 Python 不支持无参数 shutdown
 
-    def set_api_handler(self, handler: Callable[[List[str], List[Dict[str, Any]]], List[Optional[str]]]) -> None:
+    def set_api_handler(
+        self, handler: Callable[[List[str], List[Dict[str, Any]]], List[str | None]]
+    ) -> None:
         self._handler = handler
 
     def _run_batch(self, requests) -> None:
@@ -69,8 +69,8 @@ class BatchProcessor:
 
     def _flush_pending(self):
         with self._lock:
-            requests = self._pending[:self.max_batch_size]
-            self._pending = self._pending[len(requests):]
+            requests = self._pending[: self.max_batch_size]
+            self._pending = self._pending[len(requests) :]
             self._flush_timer = None
             if self._pending:
                 self._flush_timer = threading.Timer(self.max_wait_time, self._flush_pending)
@@ -93,8 +93,8 @@ class BatchProcessor:
                     self._flush_timer = None
                 if not self._pending:
                     return
-                requests = self._pending[:self.max_batch_size]
-                self._pending = self._pending[len(requests):]
+                requests = self._pending[: self.max_batch_size]
+                self._pending = self._pending[len(requests) :]
             if requests and not self._closed:
                 self._batches += 1
                 self._executor.submit(self._run_batch, requests)
@@ -132,8 +132,9 @@ class BatchProcessor:
                 setattr(self, k, v)
 
 
-def get_batch_processor(max_batch_size: int = 10, max_wait_time: float = 0.5,
-                        max_workers: int = 4, **_kwargs) -> BatchProcessor:
+def get_batch_processor(
+    max_batch_size: int = 10, max_wait_time: float = 0.5, max_workers: int = 4, **_kwargs
+) -> BatchProcessor:
     return BatchProcessor(
         max_batch_size=max_batch_size,
         max_wait_time=max_wait_time,

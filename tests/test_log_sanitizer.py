@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 日志脱敏工具单元测试（UXF-006）
 
@@ -12,8 +11,6 @@
 - 幂等性
 """
 
-import pytest
-
 from src.utils.log_sanitizer import (
     is_safe_to_log,
     mask_value,
@@ -22,8 +19,8 @@ from src.utils.log_sanitizer import (
     sanitize_for_log,
 )
 
-
 # ── mask_value ─────────────────────────────
+
 
 class TestMaskValue:
     def test_empty(self):
@@ -47,6 +44,7 @@ class TestMaskValue:
 
 
 # ── sanitize_for_log 字符串 ────────────────
+
 
 class TestSanitizeString:
     def test_plain_text_unchanged(self):
@@ -77,6 +75,7 @@ class TestSanitizeString:
 
 
 # ── sanitize_for_log 字典 ──────────────────
+
 
 class TestSanitizeDict:
     def test_sensitive_field_masked(self):
@@ -135,6 +134,7 @@ class TestSanitizeDict:
 
 
 # ── is_safe_to_log ─────────────────────────
+
 
 class TestIsSafeToLog:
     def test_safe_text(self):

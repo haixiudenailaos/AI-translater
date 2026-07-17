@@ -1,5 +1,7 @@
-httpx>=0.24.0
-ebooklib>=0.18
+# P1-5：运行时依赖，与 pyproject.toml [project.dependencies] 保持一致
+# 测试依赖（pytest/pytest-cov）请使用：pip install -e ".[dev]"
+httpx[http2]>=0.27.0
+ebooklib>=0.18,<0.20
 beautifulsoup4>=4.11.0
 lxml>=4.9.0
 Pillow>=9.0.0
@@ -8,7 +10,3 @@ requests>=2.28.0
 aiohttp>=3.9.0
 openai>=1.0.0
 keyring>=24.0.0
-
-# 测试依赖
-pytest>=7.0.0
-pytest-cov>=4.0.0

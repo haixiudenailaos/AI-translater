@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 pytest 全局配置与共享 fixtures
 
@@ -7,12 +6,10 @@ pytest 全局配置与共享 fixtures
 所有 fixture 均不依赖 Tkinter，可纯命令行运行。
 """
 
-import json
 import os
-import shutil
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import pytest
 
@@ -23,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # ── 临时目录 fixtures ────────────────────────────────
+
 
 @pytest.fixture()
 def tmp_app_paths(tmp_path):
@@ -45,11 +43,33 @@ def tmp_config_manager(tmp_app_paths, reset_secure_storage_state):
     在每个测试前都被重置，避免跨测试污染（R2-BUG-002 测试稳定性）。
     """
     from src.config.config_manager import ConfigManager
+    from src.domain.secret import StorageStatus
 
-    return ConfigManager(app_paths=tmp_app_paths)
+    class InMemorySecretStore:
+        """Prevent tests from reading or overwriting the user's OS keyring."""
+
+        def __init__(self):
+            self.values = {}
+
+        def store(self, identifier, key):
+            self.values[identifier] = key
+            return StorageStatus.PERSISTED
+
+        def retrieve(self, identifier):
+            return self.values.get(identifier, "")
+
+        def delete(self, identifier):
+            self.values.pop(identifier, None)
+            return True
+
+    return ConfigManager(
+        app_paths=tmp_app_paths,
+        secret_store=InMemorySecretStore(),
+    )
 
 
 # ── 密钥环隔离 fixtures ──────────────────────────────
+
 
 @pytest.fixture()
 def reset_secure_storage_state():
@@ -76,6 +96,7 @@ def reset_secure_storage_state():
 
 # ── EPUB fixture 构造 ────────────────────────────────
 
+
 def _build_epub_chapter(title: str, paragraphs: List[str], lang: str = "ja") -> bytes:
     """构造一个最小化的 EPUB 章节 HTML。"""
     paras = "\n".join(f"<p>{p}</p>" for p in paragraphs)
@@ -87,7 +108,7 @@ def _build_epub_chapter(title: str, paragraphs: List[str], lang: str = "ja") -> 
 <h1>{title}</h1>
 {paras}
 </body>
-</html>""".encode("utf-8")
+</html>""".encode()
 
 
 def _make_minimal_epub(
@@ -215,5 +236,5 @@ def image_epub(make_epub) -> Path:
     png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfe\xa3\x1f\x16\xb7\x00\x00\x00\x00IEND\xaeB`\x82"
     return make_epub(
         chapters=[("第一章", ["画像テスト。"])],
-        images=[("Images/cover.png", png_bytes),("Images/inner.png", png_bytes)],
+        images=[("Images/cover.png", png_bytes), ("Images/inner.png", png_bytes)],
     )

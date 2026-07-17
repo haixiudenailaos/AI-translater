@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 领域层（domain）单元测试
 
@@ -14,21 +13,21 @@
 
 import pytest
 
+from src.domain.errors import (
+    EpubFingerprintMismatchError,
+    SegmentMappingError,
+    TranslationCancelled,
+    TranslationRequestError,
+)
 from src.domain.translation import (
     OperationStatus,
     TranslationOptions,
     TranslationProgress,
     TranslationResult,
 )
-from src.domain.errors import (
-    TranslationRequestError,
-    TranslationCancelled,
-    EpubFingerprintMismatchError,
-    SegmentMappingError,
-)
-
 
 # ── OperationStatus ──────────────────────────────────
+
 
 class TestOperationStatus:
     def test_status_values_are_strings(self):
@@ -55,6 +54,7 @@ class TestOperationStatus:
 
 
 # ── TranslationOptions ───────────────────────────────
+
 
 class TestTranslationOptions:
     def test_defaults(self):
@@ -91,6 +91,7 @@ class TestTranslationOptions:
 
 # ── TranslationProgress ──────────────────────────────
 
+
 class TestTranslationProgress:
     def test_defaults(self):
         """preview_lines 默认为空 tuple"""
@@ -117,13 +118,16 @@ class TestTranslationProgress:
     def test_preview_is_tuple_not_list(self):
         """preview_lines 必须是 tuple 而非 list（不可变）"""
         prog = TranslationProgress(
-            completed=1, total=2, batch_start=0,
+            completed=1,
+            total=2,
+            batch_start=0,
             preview_lines=("a",),
         )
         assert isinstance(prog.preview_lines, tuple)
 
 
 # ── TranslationResult ────────────────────────────────
+
 
 class TestTranslationResult:
     def test_succeeded_result(self):
@@ -195,11 +199,14 @@ class TestTranslationResult:
 
 # ── 领域异常 ─────────────────────────────────────────
 
+
 class TestDomainErrors:
     def test_translation_request_error_carries_failed_indices(self):
         """TranslationRequestError 携带 failed_indices"""
         exc = TranslationRequestError(
-            "翻译失败", failed_indices=[0, 2], status_code=500,
+            "翻译失败",
+            failed_indices=[0, 2],
+            status_code=500,
         )
         assert exc.failed_indices == [0, 2]
         assert exc.status_code == 500
@@ -225,7 +232,8 @@ class TestDomainErrors:
     def test_epub_fingerprint_mismatch_carries_fingerprints(self):
         """EpubFingerprintMismatchError 携带期望和实际指纹"""
         exc = EpubFingerprintMismatchError(
-            expected="abc123", actual="def456",
+            expected="abc123",
+            actual="def456",
         )
         assert exc.expected == "abc123"
         assert exc.actual == "def456"
@@ -233,7 +241,9 @@ class TestDomainErrors:
     def test_segment_mapping_error_carries_reason(self):
         """SegmentMappingError 携带 segment_id 和 reason"""
         exc = SegmentMappingError(
-            "原文已变化", segment_id="ch1_p2", reason="source_changed",
+            "原文已变化",
+            segment_id="ch1_p2",
+            reason="source_changed",
         )
         assert exc.segment_id == "ch1_p2"
         assert exc.reason == "source_changed"
@@ -241,21 +251,26 @@ class TestDomainErrors:
 
 # ── 兼容层 re-export ─────────────────────────────────
 
+
 class TestCompatibilityShim:
     """验证 core/translation_result.py 兼容层正确 re-export 领域类型"""
 
     def test_translation_status_is_operation_status(self):
         """TranslationStatus 是 OperationStatus 的别名"""
         from src.core.translation_result import (
-            TranslationStatus,
             OperationStatus as DomainOperationStatus,
         )
+        from src.core.translation_result import (
+            TranslationStatus,
+        )
+
         assert TranslationStatus is DomainOperationStatus
         assert TranslationStatus.SUCCEEDED is OperationStatus.SUCCEEDED
 
     def test_batch_translation_result_uses_list(self):
         """BatchTranslationResult 使用 list（兼容 translator.py）"""
         from src.core.translation_result import BatchTranslationResult
+
         result = BatchTranslationResult(
             status=OperationStatus.SUCCEEDED,
             lines=["a", "b"],
@@ -267,9 +282,12 @@ class TestCompatibilityShim:
     def test_errors_reexported(self):
         """异常类从兼容层正确 re-export"""
         from src.core.translation_result import (
-            TranslationRequestError as CompatRequestError,
             TranslationCancelled as CompatCancelled,
         )
+        from src.core.translation_result import (
+            TranslationRequestError as CompatRequestError,
+        )
+
         assert CompatRequestError is TranslationRequestError
         assert CompatCancelled is TranslationCancelled
 
@@ -279,6 +297,7 @@ class TestCompatibilityShim:
             BatchTranslationResult,
             TranslationStatus,
         )
+
         result = BatchTranslationResult(
             status=TranslationStatus.SUCCEEDED,
             lines=[],

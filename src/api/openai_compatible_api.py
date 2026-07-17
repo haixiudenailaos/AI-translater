@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Client for user-defined OpenAI-compatible chat completion services."""
 
 from .base_api import BaseAPI

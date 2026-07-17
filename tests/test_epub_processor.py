@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 EPUB 处理器测试
 
@@ -15,7 +14,6 @@ nested_dirs_epub），不依赖 Tkinter。
 """
 
 import json
-import shutil
 from pathlib import Path
 
 import pytest
@@ -23,8 +21,8 @@ import pytest
 from src.core.epub_processor import EPUBProcessor
 from src.domain.errors import EpubFingerprintMismatchError
 
-
 # ── 辅助函数 ──────────────────────────────────────────
+
 
 def _make_processor(tmp_app_paths) -> EPUBProcessor:
     """构造使用临时工作区的 EPUBProcessor"""
@@ -33,12 +31,11 @@ def _make_processor(tmp_app_paths) -> EPUBProcessor:
 
 def _load_content_mapping(mapping_dir: Path) -> dict:
     """读取 content_mapping.json"""
-    return json.loads(
-        (Path(mapping_dir) / "content_mapping.json").read_text(encoding="utf-8")
-    )
+    return json.loads((Path(mapping_dir) / "content_mapping.json").read_text(encoding="utf-8"))
 
 
 # ── R2-BUG-001：字符串 spine ID 解析 ─────────────────
+
 
 class TestStringSpineParsing:
     """R2-BUG-001：ebooklib 字符串 spine ID 无法解析"""
@@ -64,17 +61,13 @@ class TestStringSpineParsing:
 
         result_obj = proc.import_epub(str(simple_epub), extract_images=False)
         data_obj = _load_content_mapping(result_obj["mapping_dir"])
-        chapters_obj = {
-            m["chapter_id"] for m in data_obj["content_mappings"].values()
-        }
+        chapters_obj = {m["chapter_id"] for m in data_obj["content_mappings"].values()}
 
         # 用新的工作区子目录避免冲突
         proc2 = EPUBProcessor(app_paths=tmp_app_paths)
         result_str = proc2.import_epub(str(string_spine_epub), extract_images=False)
         data_str = _load_content_mapping(result_str["mapping_dir"])
-        chapters_str = {
-            m["chapter_id"] for m in data_str["content_mappings"].values()
-        }
+        chapters_str = {m["chapter_id"] for m in data_str["content_mappings"].values()}
 
         # 去重后的章节 ID 集合应一致（两个 fixture 的章节文件名相同，
         # 但段数不同：simple_epub 每章 2 段，string_spine_epub 每章 1 段）
@@ -84,6 +77,7 @@ class TestStringSpineParsing:
         """spine 非空但无法解析出任何正文时抛异常"""
         # 构造一个 spine 指向不存在 id 的 EPUB
         from ebooklib import epub
+
         book = epub.EpubBook()
         book.set_identifier("bad-spine-id")
         book.set_title("空 spine")
@@ -103,6 +97,7 @@ class TestStringSpineParsing:
 
 
 # ── R2-BUG-005：章节 ID 保留唯一路径 ─────────────────
+
 
 class TestChapterIdUniqueness:
     """R2-BUG-005：章节 ID 归一化丢失目录层级"""
@@ -135,6 +130,7 @@ class TestChapterIdUniqueness:
     def test_conflicting_chapter_ids_rejected(self, tmp_app_paths, make_epub):
         """检测到规范化 ID 冲突时拒绝生成映射"""
         from ebooklib import epub
+
         book = epub.EpubBook()
         book.set_identifier("conflict-id")
         book.set_title("冲突测试")
@@ -164,6 +160,7 @@ class TestChapterIdUniqueness:
 
 # ── R2-BUG-004：禁止按位置复用已变化原文的译文 ────────
 
+
 class TestPositionalMatchValidation:
     """R2-BUG-004：位置降级匹配不校验原文"""
 
@@ -188,6 +185,7 @@ class TestPositionalMatchValidation:
         # 第二次导入：修改第一个段落的原文内容
         # 构造一个修改了原文的 EPUB
         from ebooklib import epub
+
         book = epub.read_epub(str(simple_epub))
         for item in book.items:
             if hasattr(item, "get_type") and item.get_type() == 9:  # ITEM_DOCUMENT
@@ -212,8 +210,7 @@ class TestPositionalMatchValidation:
         for m in mappings2.values():
             if "変更された原文" in m.get("original_text", ""):
                 # 原文变化后不应复用旧译文
-                assert m["translated_text"] == "", \
-                    f"原文变化后仍复用旧译文: {m['translated_text']}"
+                assert m["translated_text"] == "", f"原文变化后仍复用旧译文: {m['translated_text']}"
                 changed_found = True
                 break
         assert changed_found, "未找到修改后的段落"
@@ -247,6 +244,7 @@ class TestPositionalMatchValidation:
 
 
 # ── R2-BUG-006：导出前验证源 EPUB 指纹 ────────────────
+
 
 class TestExportFingerprint:
     """R2-BUG-006：导出未验证 EPUB 源文件是否变化"""
@@ -296,12 +294,16 @@ class TestExportFingerprint:
 
 # ── R2-BUG-007：保留 EPUB 内联格式 ───────────────────
 
+
 class TestInlineFormatPreservation:
     """R2-BUG-007：导出删除全部内联文本节点"""
 
     def test_em_tag_preserved(self, tmp_app_paths, tmp_path):
         """含 em 强调标签的段落导出后标签保留"""
+        import re
+
         from ebooklib import epub
+
         book = epub.EpubBook()
         book.set_identifier("inline-test")
         book.set_title("内联格式测试")
@@ -313,7 +315,7 @@ class TestInlineFormatPreservation:
 <body>
 <p>这是<em>强调</em>内容</p>
 </body>
-</html>""".encode("utf-8")
+</html>""".encode()
         chapter = epub.EpubHtml(title="ch1", file_name="Text/ch1.xhtml", lang="ja")
         chapter.content = html_content
         book.add_item(chapter)
@@ -330,7 +332,7 @@ class TestInlineFormatPreservation:
 
         # 写入译文
         data = _load_content_mapping(result["mapping_dir"])
-        for key, m in data["content_mappings"].items():
+        for _key, m in data["content_mappings"].items():
             m["translated_text"] = "translated text"
             m["translated_at"] = "2026-01-01"
         (Path(result["mapping_dir"]) / "content_mapping.json").write_text(
@@ -342,19 +344,27 @@ class TestInlineFormatPreservation:
         proc.export_epub(result["mapping_dir"], str(output_path))
 
         # 读取导出后的 EPUB，检查 em 标签保留
+        # EPUB 导出修复（根因一）：清除所有后代原文文本节点，保留内联标签
         exported_book = epub.read_epub(str(output_path))
         for item in exported_book.items:
             if hasattr(item, "get_type") and item.get_type() == 9:  # ITEM_DOCUMENT
                 content = item.get_content().decode("utf-8")
-                if "<em>" in content or "<em " in content:
-                    # em 标签保留
+                # 匹配 <em> / <em/> / <em ...> 等多种序列化格式
+                if re.search(r"<em[\s/>]", content):
+                    # em 标签保留（可能为空 <em/> 或 <em></em>）
                     assert "<em" in content
+                    # 修复关键断言：原文"强调"必须被清除，不能残留在 em 标签内
+                    # 这是 EPUB_EXPORT_MIXED_TEXT_AND_BLANK_PAGE_REPAIR.md 根因一的核心要求
+                    assert "强调" not in content, "em 标签内的原文未清除，译文混入原文"
+                    # 译文应存在于输出中
+                    assert "translated text" in content
                     return
         pytest.fail("导出后未找到 em 标签")
 
     def test_link_target_preserved(self, tmp_app_paths, tmp_path):
         """含超链接的段落导出后 href 保留"""
         from ebooklib import epub
+
         book = epub.EpubBook()
         book.set_identifier("link-test")
         book.set_title("链接测试")
@@ -366,7 +376,7 @@ class TestInlineFormatPreservation:
 <body>
 <p>请访问<a href="https://example.com">链接</a>查看详情</p>
 </body>
-</html>""".encode("utf-8")
+</html>""".encode()
         chapter = epub.EpubHtml(title="ch1", file_name="Text/ch1.xhtml", lang="ja")
         chapter.content = html_content
         book.add_item(chapter)
@@ -383,7 +393,7 @@ class TestInlineFormatPreservation:
 
         # 写入译文
         data = _load_content_mapping(result["mapping_dir"])
-        for key, m in data["content_mappings"].items():
+        for _key, m in data["content_mappings"].items():
             m["translated_text"] = "translated content"
             m["translated_at"] = "2026-01-01"
         (Path(result["mapping_dir"]) / "content_mapping.json").write_text(
@@ -407,6 +417,7 @@ class TestInlineFormatPreservation:
     def test_untranslated_paragraph_unchanged(self, tmp_app_paths, tmp_path):
         """未翻译段落的 HTML 不发生无关变化"""
         from ebooklib import epub
+
         book = epub.EpubBook()
         book.set_identifier("untranslated-test")
         book.set_title("未翻译测试")
@@ -418,7 +429,7 @@ class TestInlineFormatPreservation:
 <body>
 <p>这段没有译文</p>
 </body>
-</html>""".encode("utf-8")
+</html>""".encode()
         chapter = epub.EpubHtml(title="ch1", file_name="Text/ch1.xhtml", lang="ja")
         chapter.content = original_html
         book.add_item(chapter)

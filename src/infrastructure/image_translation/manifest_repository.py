@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 图片翻译结果 manifest 仓库
 
@@ -15,7 +14,6 @@
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from ...domain.image_translation import ImageTranslationResult
 from ...domain.translation import OperationStatus
@@ -71,7 +69,7 @@ class ManifestRepository:
         self.mapping_dir = Path(mapping_dir)
         self.path = self.mapping_dir / MANIFEST_FILENAME
 
-    def load(self) -> Optional[ManifestData]:
+    def load(self) -> ManifestData | None:
         """读取 manifest，兼容 v1 裸字典、v1 result_map 格式和 v2。
 
         不存在返回 None。
@@ -110,10 +108,7 @@ class ManifestRepository:
 
         # v1 裸字典：整个字典视为 result_map
         # 过滤明显非映射的字段
-        result_map = {
-            k: v for k, v in raw.items()
-            if isinstance(k, str) and isinstance(v, str)
-        }
+        result_map = {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
         return ManifestData(schema_version=1, result_map=result_map)
 
     def load_result_map(self) -> dict:
@@ -139,10 +134,7 @@ class ManifestRepository:
         即使 result_map 为空也覆盖旧文件，避免导出过期图片。
         """
         # 脱敏失败原因
-        failed = {
-            path: _sanitize_error(msg)
-            for path, msg in result.failed_images.items()
-        }
+        failed = {path: _sanitize_error(msg) for path, msg in result.failed_images.items()}
 
         payload = {
             "schema_version": SCHEMA_VERSION,

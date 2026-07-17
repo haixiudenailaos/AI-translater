@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 EPUB解析与映射生成模块
 负责：
@@ -8,50 +7,52 @@ EPUB解析与映射生成模块
 - 提供译文更新与装载辅助函数
 """
 
-from pathlib import Path
-from typing import Dict, List, Tuple, Iterator, Optional
-import json
 import base64
 import datetime
 import hashlib
+import json
 import logging
-from ..utils.logger import get_logger
-from ..utils.file_handler import write_json_atomic
-from ..domain.errors import EpubFingerprintMismatchError
+from pathlib import Path
+from typing import Dict, Iterator, List, Tuple
+
+from ..infrastructure.document_order import (
+    get_item_media_type as _get_item_media_type_impl,
+)
+from ..infrastructure.document_order import (
+    get_item_name as _get_item_name_impl,
+)
+
 # 阶段 4：委托到 infrastructure 层
 from ..infrastructure.document_order import (
     iter_spine_documents as _iter_spine_documents_impl,
-    normalize_chapter_id as _normalize_chapter_id_impl,
-    get_item_name as _get_item_name_impl,
-    get_item_media_type as _get_item_media_type_impl,
 )
-from ..infrastructure.segment_extractor import (
-    BLOCK_TAGS as _BLOCK_TAGS,
-    compute_source_checksum as _compute_source_checksum_impl,
-    extract_segments_from_document as _extract_segments_impl,
-    match_existing_translation as _match_existing_impl,
-    is_leaf_block as _is_leaf_block_impl,
+from ..infrastructure.document_order import (
+    normalize_chapter_id as _normalize_chapter_id_impl,
+)
+from ..infrastructure.exporter import (
+    compute_file_hash as _compute_file_hash_impl,
+)
+from ..infrastructure.exporter import (
+    export_epub as _export_epub_impl,
+)
+from ..infrastructure.image_asset_store import save_image_binary
+from ..infrastructure.image_rewriter import (
+    match_and_get_new_path as _match_and_get_new_path_impl,
 )
 from ..infrastructure.mapping_repository import (
     load_content_mapping as _load_content_mapping_impl,
+)
+from ..infrastructure.mapping_repository import (
     save_translations as _save_translations_impl,
-    load_old_translations as _load_old_translations_impl,
-    save_content_mapping as _save_content_mapping_impl,
-    save_images_mapping as _save_images_mapping_impl,
-    save_format_info as _save_format_info_impl,
 )
-from ..infrastructure.image_rewriter import (
-    match_and_get_new_path as _match_and_get_new_path_impl,
-    add_translated_images as _add_translated_images_impl,
-    rewrite_image_references as _rewrite_image_references_impl,
-    inject_figcaption as _inject_figcaption_impl,
+from ..infrastructure.segment_extractor import (
+    BLOCK_TAGS as _BLOCK_TAGS,
 )
-from ..infrastructure.image_asset_store import save_image_binary
-from ..infrastructure.exporter import (
-    export_epub as _export_epub_impl,
-    compute_file_hash as _compute_file_hash_impl,
+from ..infrastructure.segment_extractor import (
+    compute_source_checksum as _compute_source_checksum_impl,
 )
-
+from ..utils.file_handler import write_json_atomic
+from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -79,7 +80,7 @@ class EPUBProcessor:
         safe_stem = "".join(c for c in epub_path.stem if c.isalnum() or c in ("-", "_")) or "epub"
         try:
             abs_path_str = str(epub_path.resolve())
-        except Exception:
+        except OSError:
             abs_path_str = str(epub_path.absolute())
         path_hash = hashlib.sha256(abs_path_str.encode("utf-8")).hexdigest()[:12]
         return f"{safe_stem}-{path_hash}"
@@ -131,9 +132,9 @@ class EPUBProcessor:
         返回：{"mapping_dir": str, "content_file": str, "images_file": str, "format_file": str}
         """
         try:
-            from ebooklib import epub
             import ebooklib
             from bs4 import BeautifulSoup
+            from ebooklib import epub
         except ImportError:
             raise Exception("需要安装ebooklib和beautifulsoup4库来支持EPUB文件解析")
 
@@ -160,21 +161,29 @@ class EPUBProcessor:
             "css_styles": {},
             "spine_order": [],
             "toc_structure": [],
-            "manifest_items": {}
+            "manifest_items": {},
         }
 
         # 元数据
         try:
             # 常见DC元数据
             md = {}
-            for tag in ["title", "creator", "language", "identifier", "publisher", "date", "description"]:
+            for tag in [
+                "title",
+                "creator",
+                "language",
+                "identifier",
+                "publisher",
+                "date",
+                "description",
+            ]:
                 vals = book.get_metadata("DC", tag)
                 if vals:
                     # 取第一个值
                     md[tag] = vals[0][0]
             format_info["metadata"] = md
-        except Exception:
-            pass
+        except (KeyError, AttributeError):
+            pass  # 最佳努力：提取 EPUB 元数据，不同版本 ebooklib 字段差异
 
         # 清点manifest与spine
         try:
@@ -185,14 +194,14 @@ class EPUBProcessor:
                     if name:
                         format_info["manifest_items"][name] = {
                             "media_type": self._get_item_media_type(item),
-                            "properties": getattr(item, "properties", None)
+                            "properties": getattr(item, "properties", None),
                         }
                 except Exception as e:
                     print(f"⚠ 警告：解析manifest条目失败: {e}")
                     continue
         except Exception as e:
             print(f"⚠ 警告：提取manifest时发生错误: {e}")
-        
+
         # spine（顺序）- 健壮的多版本兼容处理（单独try以确保即使manifest失败也能提取spine）
         try:
             spine_order = []
@@ -205,31 +214,31 @@ class EPUBProcessor:
                     else:
                         # 旧版本：直接是itemref
                         itemref = item
-                    
+
                     if not itemref:
                         continue
-                    
+
                     # 获取文件名（尝试多种属性）
                     name = self._get_item_name(itemref)
                     if not name and isinstance(itemref, str):
                         name = itemref
-                    
+
                     # 如果是对象，尝试从book.items中查找
-                    if not name and hasattr(itemref, 'idref'):
+                    if not name and hasattr(itemref, "idref"):
                         try:
                             item_obj = book.get_item_with_id(itemref.idref)
                             if item_obj:
                                 name = self._get_item_name(item_obj)
-                        except:
+                        except (KeyError, AttributeError):
                             pass
-                    
+
                     if name:
                         normalized_name = self._normalize_chapter_id(name)
                         spine_order.append(normalized_name)
-                except Exception:
+                except (KeyError, AttributeError, TypeError):
                     # 单个spine条目失败不影响其他条目的提取
                     continue
-            
+
             # 【关键修复】只有在spine_order非空时才赋值，否则发出警告
             if spine_order:
                 format_info["spine_order"] = spine_order
@@ -244,16 +253,20 @@ class EPUBProcessor:
 
         # TOC结构（简化保存：标题、href、层级）
         try:
+
             def _flatten_toc(toc, level=1):
                 for entry in toc:
                     try:
                         title = entry.title if hasattr(entry, "title") else str(entry)
                         href = entry.href if hasattr(entry, "href") else None
-                        format_info["toc_structure"].append({"title": title, "href": href, "level": level})
+                        format_info["toc_structure"].append(
+                            {"title": title, "href": href, "level": level}
+                        )
                         if hasattr(entry, "children") and entry.children:
                             _flatten_toc(entry.children, level + 1)
                     except Exception:
                         continue
+
             _flatten_toc(book.toc, 1)
         except Exception:
             pass
@@ -261,28 +274,33 @@ class EPUBProcessor:
         # 提取CSS样式
         try:
             import ebooklib
+
             for item in book.get_items():
                 if item.get_type() == ebooklib.ITEM_STYLE:
                     name = self._get_item_name(item)
                     if name:
                         try:
-                            format_info["css_styles"][name] = item.get_content().decode("utf-8", errors="ignore")
+                            format_info["css_styles"][name] = item.get_content().decode(
+                                "utf-8", errors="ignore"
+                            )
                         except Exception:
-                            format_info["css_styles"][name] = base64.b64encode(item.get_content()).decode("ascii")
+                            format_info["css_styles"][name] = base64.b64encode(
+                                item.get_content()
+                            ).decode("ascii")
         except Exception:
             pass
 
         # 【关键修复】检查是否已存在旧的翻译数据，以便保留翻译进度
         # BUG-003：使用稳定定位符优先匹配，降级到原文匹配
         existing_translations = {}  # 按原文文本匹配（降级用）
-        existing_by_locator = {}   # 按稳定定位符匹配（优先用）
+        existing_by_locator = {}  # 按稳定定位符匹配（优先用）
         existing_by_chapter_seq = {}  # 按 chapter_id+block_index 匹配（次优先）
         content_file = mapping_dir / "content_mapping.json"
         if content_file.exists():
             try:
                 old_data = json.loads(content_file.read_text(encoding="utf-8"))
                 old_mappings = old_data.get("content_mappings", {})
-                for key, item in old_mappings.items():
+                for _key, item in old_mappings.items():
                     original = item.get("original_text", "")
                     translated = item.get("translated_text", "")
                     translated_at = item.get("translated_at", "")
@@ -347,7 +365,10 @@ class EPUBProcessor:
                     try:
                         if node.name in self.BLOCK_TAGS:
                             # 检查是否为叶子块节点（避免重复提取嵌套内容）
-                            has_block_children = any(child.name in self.BLOCK_TAGS for child in node.find_all(True, recursive=False))
+                            has_block_children = any(
+                                child.name in self.BLOCK_TAGS
+                                for child in node.find_all(True, recursive=False)
+                            )
                             if has_block_children:
                                 continue
 
@@ -369,21 +390,33 @@ class EPUBProcessor:
                                 if locator in existing_by_locator:
                                     matched_record = existing_by_locator[locator]
                                 # 2. chapter_id + block_index（R2-BUG-004：位置降级必须校验原文）
-                                elif f"{base_name}|{block_index_in_chapter}" in existing_by_chapter_seq:
-                                    candidate = existing_by_chapter_seq[f"{base_name}|{block_index_in_chapter}"]
+                                elif (
+                                    f"{base_name}|{block_index_in_chapter}"
+                                    in existing_by_chapter_seq
+                                ):
+                                    candidate = existing_by_chapter_seq[
+                                        f"{base_name}|{block_index_in_chapter}"
+                                    ]
                                     # 校验 checksum 或规范化原文一致，防止原文变化后复用旧译文
-                                    if (candidate.get("source_checksum") == checksum
-                                            or candidate.get("original_text", "").strip() == text.strip()):
+                                    if (
+                                        candidate.get("source_checksum") == checksum
+                                        or candidate.get("original_text", "").strip()
+                                        == text.strip()
+                                    ):
                                         matched_record = candidate
                                     else:
                                         logger.warning(
                                             "位置降级匹配失败（原文已变化）: %s|%s, 旧 checksum=%s, 新 checksum=%s",
-                                            base_name, block_index_in_chapter,
-                                            candidate.get("source_checksum"), checksum,
+                                            base_name,
+                                            block_index_in_chapter,
+                                            candidate.get("source_checksum"),
+                                            checksum,
                                         )
                                 # 3. 原文匹配（降级，需后续验证唯一性）
                                 elif text in existing_translations:
-                                    text_occurrence_count[text] = text_occurrence_count.get(text, 0) + 1
+                                    text_occurrence_count[text] = (
+                                        text_occurrence_count.get(text, 0) + 1
+                                    )
                                     matched_record = existing_translations[text]
 
                                 if matched_record:
@@ -397,7 +430,7 @@ class EPUBProcessor:
                                     "chapter_id": base_name,
                                     "block_index": block_index_in_chapter,  # BUG-003：章节内块索引
                                     "source_checksum": checksum,  # BUG-003：原文校验和
-                                    "translated_at": translated_at  # 保留翻译时间戳
+                                    "translated_at": translated_at,  # 保留翻译时间戳
                                 }
                                 global_line_number += 1
                                 block_index_in_chapter += 1
@@ -419,27 +452,34 @@ class EPUBProcessor:
             non_unique_texts = {t for t, c in text_occurrence_count.items() if c > 1}
             if non_unique_texts:
                 cleared = 0
-                for cid, item in content_mappings.items():
+                for _cid, item in content_mappings.items():
                     original = item.get("original_text", "")
                     if original in non_unique_texts:
                         # 仅清空通过降级匹配（无定位符命中）的译文
                         # 定位符命中的译文不受影响（已通过 locator/seq 验证）
-                        locator = f"{item.get('chapter_id','')}|{item.get('block_index')}|{item.get('source_checksum','')}"
-                        seq_key = f"{item.get('chapter_id','')}|{item.get('block_index')}"
-                        if locator not in existing_by_locator and seq_key not in existing_by_chapter_seq:
-                            if item.get("translated_text"):
-                                item["translated_text"] = ""
-                                cleared += 1
+                        locator = f"{item.get('chapter_id', '')}|{item.get('block_index')}|{item.get('source_checksum', '')}"
+                        seq_key = f"{item.get('chapter_id', '')}|{item.get('block_index')}"
+                        if (
+                            locator not in existing_by_locator
+                            and seq_key not in existing_by_chapter_seq
+                            and item.get("translated_text")
+                        ):
+                            item["translated_text"] = ""
+                            cleared += 1
                 if cleared:
-                    logger.warning("发现 %d 条非唯一原文，已清空 %d 条降级匹配译文以防串书",
-                                   len(non_unique_texts), cleared)
+                    logger.warning(
+                        "发现 %d 条非唯一原文，已清空 %d 条降级匹配译文以防串书",
+                        len(non_unique_texts),
+                        cleared,
+                    )
 
         # 图片Base64映射
         if extract_images:
             try:
                 import ebooklib
+
                 logger.debug("[import_epub] ====== 开始提取EPUB图片 ======")
-                print(f"📷 开始提取EPUB图片...")
+                print("📷 开始提取EPUB图片...")
                 image_count = 0
 
                 # PERF-007：单次遍历，合并计数和提取
@@ -452,18 +492,29 @@ class EPUBProcessor:
                         item_type = item.get_type()
                         media_type = self._get_item_media_type(item)
                         item_name = self._get_item_name(item)
-                        
-                        logger.debug("[import_epub] 检查item %d/%d: name=%s, type=%s, media_type=%s", idx + 1, total_items, item_name, item_type, media_type)
-                        
+
+                        logger.debug(
+                            "[import_epub] 检查item %d/%d: name=%s, type=%s, media_type=%s",
+                            idx + 1,
+                            total_items,
+                            item_name,
+                            item_type,
+                            media_type,
+                        )
+
                         # 检查是否是图片
                         is_image = False
                         if item_type == ebooklib.ITEM_IMAGE:
-                            logger.debug("[import_epub] item_type == ebooklib.ITEM_IMAGE，判定为图片")
+                            logger.debug(
+                                "[import_epub] item_type == ebooklib.ITEM_IMAGE，判定为图片"
+                            )
                             is_image = True
-                        elif media_type and media_type.startswith('image/'):
-                            logger.debug("[import_epub] media_type.startswith('image/')，判定为图片")
+                        elif media_type and media_type.startswith("image/"):
+                            logger.debug(
+                                "[import_epub] media_type.startswith('image/')，判定为图片"
+                            )
                             is_image = True
-                        
+
                         if is_image:
                             name = self._get_item_name(item)
                             if not name:
@@ -478,23 +529,32 @@ class EPUBProcessor:
                             )
                             logger.debug(
                                 "[import_epub] 图片信息: name=%s, size=%d bytes, mime=%s",
-                                name, len(data), mime,
+                                name,
+                                len(data),
+                                mime,
                             )
                             image_count += 1
                             print(f"  ✓ 提取图片: {name} ({len(data)} bytes)")
                         else:
                             logger.debug("[import_epub] 非图片item，跳过: name=%s", item_name)
                     except Exception as e:
-                        logger.error("[import_epub] 提取单个图片失败: %s: %s", type(e).__name__, e, exc_info=True)
+                        logger.error(
+                            "[import_epub] 提取单个图片失败: %s: %s",
+                            type(e).__name__,
+                            e,
+                            exc_info=True,
+                        )
                         print(f"⚠ 警告：提取单个图片失败: {e}")
                         continue
-                
+
                 logger.debug("[import_epub] ====== 图片提取完成 ======")
                 logger.debug("[import_epub] 成功提取 %d 张图片", image_count)
                 logger.debug("[import_epub] images_mapping包含 %d 个条目", len(images_mapping))
                 print(f"✅ 图片提取完成，共 {image_count} 张图片")
             except Exception as e:
-                logger.error("[import_epub] 提取图片时发生错误: %s: %s", type(e).__name__, e, exc_info=True)
+                logger.error(
+                    "[import_epub] 提取图片时发生错误: %s: %s", type(e).__name__, e, exc_info=True
+                )
                 print(f"⚠ 警告：提取图片时发生错误: {e}")
 
         # 写入文件
@@ -515,20 +575,15 @@ class EPUBProcessor:
             # R2-BUG-006：保存内容哈希，导出前验证源文件未变化
             "source_content_hash": self._compute_file_hash(epub_path) if epub_path.exists() else "",
             "created_at": datetime.datetime.now().isoformat(),
-            "updated_at": datetime.datetime.now().isoformat()
+            "updated_at": datetime.datetime.now().isoformat(),
         }
 
-        content_payload = {
-            "project_info": project_info,
-            "content_mappings": content_mappings
-        }
+        content_payload = {"project_info": project_info, "content_mappings": content_mappings}
         logger.debug("[import_epub] content_payload: %d 个content_mappings", len(content_mappings))
 
-        images_payload = {
-            "image_mappings": images_mapping
-        }
+        images_payload = {"image_mappings": images_mapping}
         logger.debug("[import_epub] images_payload: %d 个image_mappings", len(images_mapping))
-        
+
         # 【关键修复】如果spine_order为空，从content_mappings推断章节顺序
         if not format_info.get("spine_order"):
             logger.warning("[import_epub] spine_order为空，正在从content_mappings推断章节顺序...")
@@ -539,12 +594,14 @@ class EPUBProcessor:
                 chapter = item.get("chapter_id", "")
                 if chapter:
                     chapters.add(chapter)
-            
+
             # 按文件名自然顺序排序（通常与p-0001, p-0002...的命名规则匹配）
             inferred_spine = sorted(chapters)
             format_info["spine_order"] = inferred_spine
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[import_epub] 已推断 %d 个章节: %s", len(inferred_spine), inferred_spine)
+                logger.debug(
+                    "[import_epub] 已推断 %d 个章节: %s", len(inferred_spine), inferred_spine
+                )
             print(f"✓ 已推断 {len(inferred_spine)} 个章节（按文件名排序）")
             print("⚠ 建议：使用 tools/fix_spine_order.py 从原EPUB提取精确的spine顺序")
 
@@ -562,7 +619,7 @@ class EPUBProcessor:
             "mapping_dir": str(mapping_dir),
             "content_file": str(content_file),
             "images_file": str(images_file),
-            "format_file": str(format_file)
+            "format_file": str(format_file),
         }
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[import_epub] 返回结果: %s", result)
@@ -579,7 +636,6 @@ class EPUBProcessor:
         """
         return _load_content_mapping_impl(mapping_dir)
 
-
     def save_translations(self, mapping_dir: str, translated_lines: List[str]) -> None:
         """将译文列表按行号严格对齐保存到content_mapping.json（委托到 infrastructure.mapping_repository）。
 
@@ -590,7 +646,9 @@ class EPUBProcessor:
         """
         _save_translations_impl(mapping_dir, translated_lines)
 
-    def _match_and_get_new_path(self, src: str, path_mapping: Dict[str, str], doc_dir: Path) -> tuple:
+    def _match_and_get_new_path(
+        self, src: str, path_mapping: Dict[str, str], doc_dir: Path
+    ) -> tuple:
         """匹配图片路径并返回新的相对路径（委托到 infrastructure.image_rewriter）。
 
         Returns:
@@ -598,8 +656,13 @@ class EPUBProcessor:
         """
         return _match_and_get_new_path_impl(src, path_mapping, doc_dir)
 
-    def export_epub(self, mapping_dir: str, output_path: str, image_map: Dict[str, str] = None,
-                    image_text_map: Dict[str, Dict] = None) -> str:
+    def export_epub(
+        self,
+        mapping_dir: str,
+        output_path: str,
+        image_map: Dict[str, str] = None,
+        image_text_map: Dict[str, Dict] = None,
+    ) -> str:
         """根据mapping重建并导出EPUB（委托到 infrastructure.exporter）。
 
         改进说明：

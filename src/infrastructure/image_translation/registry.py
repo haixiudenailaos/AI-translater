@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 图片翻译 Provider 注册表
 
@@ -9,8 +8,6 @@
 回滚：保留功能开关 manga_provider_available，用于出现打包级故障时
 禁用 Manga 入口并展示错误；该开关不得自动改选 AI。
 """
-
-from typing import Optional
 
 from ...domain.image_translation import ImageTranslationProviderId
 from ...utils.logger import get_logger
@@ -33,7 +30,7 @@ class ImageTranslationProviderRegistry:
         self._providers[str(pid)] = provider
         logger.info("已注册图片翻译 Provider: %s", pid)
 
-    def get(self, provider_id: str | ImageTranslationProviderId) -> Optional[object]:
+    def get(self, provider_id: str | ImageTranslationProviderId) -> object | None:
         """按 provider_id 取得 Provider。
 
         Manga Provider 在禁用开关关闭时返回 None，调用方应展示错误，
@@ -44,10 +41,9 @@ class ImageTranslationProviderRegistry:
             if isinstance(provider_id, ImageTranslationProviderId)
             else str(provider_id)
         )
-        if pid == ImageTranslationProviderId.MANGA.value:
-            if not self._manga_provider_available:
-                logger.warning("Manga Provider 已被功能开关禁用")
-                return None
+        if pid == ImageTranslationProviderId.MANGA.value and not self._manga_provider_available:
+            logger.warning("Manga Provider 已被功能开关禁用")
+            return None
         return self._providers.get(pid)
 
     def list_available(self) -> list[str]:
@@ -78,7 +74,7 @@ class ImageTranslationProviderRegistry:
 
 
 # 进程级单例注册表
-_registry: Optional[ImageTranslationProviderRegistry] = None
+_registry: ImageTranslationProviderRegistry | None = None
 
 
 def get_registry() -> ImageTranslationProviderRegistry:

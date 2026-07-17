@@ -1,13 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-轻小说翻译器V1.6 - PyInstaller 规格文件
+轻小说翻译器V1.6 - Full Manga Edition PyInstaller 规格文件
 
-集成 manga-image-translator 后的打包配置：
-- 默认包含 Manga Provider 所需的隐藏导入和资源。
+PERF §11.2/§11.3：onedir 发布结构，包含本地 Manga 推理依赖。
+- Text Edition（默认下载）见 translator_text.spec，仅包含 TXT/EPUB 文本翻译。
+- 本 Full Edition 在 Text Edition 基础上加入 manga-image-translator 全部依赖。
+- onedir 避免单文件解包开销，启动时不再解压到临时目录。
 - torch/onnxruntime/cv2 等重依赖由官方 PyInstaller hooks 自动收集。
 - 字体资源单独声明，便于审计和分发。
-- 未安装重依赖时 spec 仍可加载（Manga Provider 内部惰性导入，
-  validate() 会给出明确的引擎缺失提示）。
+- manga_translator 源码模块由 hook-manga_translator.py 的 hiddenimports 收集，
+  不再把整个源码目录作为 data 复制（避免与 PYZ 模块重复）。
 """
 
 import sys
@@ -27,14 +29,9 @@ if _fonts_dir.exists():
             (str(_font_file.relative_to(project_root)), 'assets/fonts')
         )
 
-# ── manga_translator 源码（如已 vendor 到 third_party）──
-# third_party/manga-image-translator/manga_translator/ 存在时打包
-_manga_datas = []
-_manga_vendor = project_root / 'third_party' / 'manga-image-translator' / 'manga_translator'
-if _manga_vendor.exists():
-    _manga_datas.append(
-        (str(_manga_vendor.relative_to(project_root)), 'manga_translator')
-    )
+# PERF §11.3：不再将 manga_translator 源码目录作为 data 复制。
+# 模块由 hook-manga_translator.py 的 hiddenimports 声明，资源文件
+#（YAML/tokenizer）由 hook 的 datas 收集，避免与 PYZ 重复打包。
 
 # 分析主要脚本
 a = Analysis(
@@ -46,24 +43,27 @@ a = Analysis(
     ],
     binaries=[],
     datas=[
+        # PERF §11.3：仅保留真正的非 Python 资源；src 模块由 Analysis/PYZ 收集。
         # 配置文件目录（仅包含示例文件和基础配置）
         ('config/api_config_sample.json', 'config'),
         ('config/glossary_sample.json', 'config'),
         ('config/app_config.json', 'config'),
         ('config/glossary.json', 'config'),
-        # 源代码目录
-        ('src', 'src'),
     ]
-    + _font_datas
-    + _manga_datas,
+    + _font_datas,
     hiddenimports=[
         # 确保这些模块被打包
+        'src.bootstrap',
+        'src.app_paths',
         'src.ui.main_window',
         'src.ui.settings_window',
         'src.ui.glossary_window',
         'src.ui.concurrent_window',
         'src.ui.image_translation_handler',
         'src.ui.file_importer',
+        'src.ui.translation_table_adapter',
+        'src.ui.translation_event_mailbox',
+        'src.ui.tk_event_pump',
         'src.config.config_manager',
         'src.core.translator',
         'src.core.batch_processor',
@@ -77,6 +77,10 @@ a = Analysis(
         'src.api.openai_compatible_api',
         'src.utils.file_handler',
         'src.utils.secure_storage',
+        # PERF §8/§7：文本翻译性能修复新增模块
+        'src.application.autosave',
+        'src.application.translation_document',
+        'src.application.translation_events',
         # 图片翻译新模块
         'src.application.image_translation_service',
         'src.application.ports',
@@ -130,19 +134,17 @@ a = Analysis(
 # 去除重复项
 pyz = PYZ(a.pure, a.zipped_data)
 
-# 创建可执行文件
+# PERF §11.3：onedir 结构。EXE 只包含脚本和 PYZ，二进制由 COLLECT 收集到目录。
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='LightNovelTranslatorV1.6',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,  # PERF §11.3：先关闭 UPX，实测后决定是否启用
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,  # 不显示控制台窗口
@@ -153,4 +155,16 @@ exe = EXE(
     entitlements_file=None,
     # 如果有图标文件，取消下面这行的注释
     # icon='assets/icon.ico',
+)
+
+# PERF §11.3：COLLECT 将 EXE 和所有二进制/数据收集到 onedir 目录，
+# 避免单文件启动时解包到临时目录的开销。
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name='LightNovelTranslatorV1.6',
 )

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 心跳线程安全测试
 
@@ -11,12 +10,11 @@
 
 import threading
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import httpx
 import pytest
 
-from src.api.base_api import BaseAPI
 from src.api.siliconflow_api import SiliconFlowAPI
 
 
@@ -36,6 +34,7 @@ def _make_siliconflow(config=None) -> SiliconFlowAPI:
 
 
 # ── 活动请求计数 ──────────────────────────────────────
+
 
 class TestActiveRequestTracking:
     """R2-BUG-023：活动请求计数器"""
@@ -74,6 +73,7 @@ class TestActiveRequestTracking:
 
 
 # ── 心跳安全重建 ──────────────────────────────────────
+
 
 class TestHeartbeatSafeRecreate:
     """R2-BUG-023：心跳不得关闭活动客户端"""
@@ -118,6 +118,7 @@ class TestHeartbeatSafeRecreate:
 
 
 # ── 心跳与翻译并发 ────────────────────────────────────
+
 
 class TestHeartbeatDuringTranslation:
     """R2-BUG-023：翻译期间心跳不会中断"""
@@ -194,11 +195,119 @@ class TestHeartbeatDuringTranslation:
                 # 等待多个心跳周期
                 time.sleep(0.5)
                 # 活动客户端应该未被关闭
-                assert not active_client.is_closed, \
-                    "活动客户端在多个心跳周期后被关闭"
+                assert not active_client.is_closed, "活动客户端在多个心跳周期后被关闭"
 
             # 心跳应该已触发多次
-            assert call_count["n"] >= 2, \
-                f"心跳只触发了 {call_count['n']} 次，预期至少 2 次"
+            assert call_count["n"] >= 2, f"心跳只触发了 {call_count['n']} 次，预期至少 2 次"
+        finally:
+            api.close()
+
+
+# ── PERF §10.3：延迟创建批处理器 ──────────────────────
+
+
+class TestLazyBatchProcessor:
+    """PERF §10.3：批处理器延迟创建测试。
+
+    验收要求：
+    - 创建 API Client 不创建无用后台 timer 或 executor。
+    - ``translate_batch()`` 首次调用线程安全地初始化处理器。
+    - ``close()`` 不初始化尚未使用的资源。
+    - 测试连接不额外常驻一个 Client（不创建批处理器）。
+    """
+
+    def test_init_does_not_create_batch_processor(self):
+        """PERF §10.3：构造 API 实例不创建批处理器（避免无用后台线程常驻）"""
+        # enable_batch=True 时也应延迟创建，不在构造期创建
+        api = _make_siliconflow(config={"enable_batch": True})
+        try:
+            # 批处理器尚未创建
+            assert api.batch_processor is None, (
+                "构造 API 实例时不应立即创建 BatchProcessor，"
+                "主文本翻译路径使用 translate_stream_enhanced()，"
+                "提前创建会带来无用 ThreadPoolExecutor 后台线程。"
+            )
+            # 配置已保存为延迟创建所需的 dict
+            assert api._batch_config is not None
+            assert api._batch_config["max_batch_size"] == 10
+        finally:
+            api.close()
+
+    def test_close_without_batch_use_does_not_initialize(self):
+        """PERF §10.3：close() 不初始化尚未使用的资源"""
+        api = _make_siliconflow(config={"enable_batch": True})
+        # 从未调用 translate_batch()
+        assert api.batch_processor is None
+        # close() 不应触发批处理器创建
+        api.close()
+        assert api.batch_processor is None, (
+            "close() 不应初始化尚未使用的批处理器，避免在关闭路径创建后台线程。"
+        )
+
+    def test_test_connection_does_not_create_batch_processor(self):
+        """PERF §10.3：test_connection() 不创建批处理器"""
+        api = _make_siliconflow(config={"enable_batch": True})
+        try:
+            # test_connection 会失败（无真实 API），但不应创建批处理器
+            api.test_connection()
+            assert api.batch_processor is None, "test_connection() 不应触发批处理器创建。"
+        finally:
+            api.close()
+
+    def test_translate_batch_creates_processor_lazily(self):
+        """PERF §10.3：首次 translate_batch() 调用线程安全地初始化处理器"""
+        api = _make_siliconflow(config={"enable_batch": True})
+        try:
+            assert api.batch_processor is None
+            # 模拟 _direct_translate 避免真实网络调用
+            with patch.object(api, "_direct_translate", return_value="译文"):
+                results = api.translate_batch(["hello"], [{}])
+            # 批处理器已创建
+            assert api.batch_processor is not None, (
+                "首次 translate_batch() 调用应线程安全地创建批处理器。"
+            )
+            # 翻译结果正确
+            assert results == ["译文"]
+        finally:
+            api.close()
+
+    def test_concurrent_translate_batch_creates_single_processor(self):
+        """PERF §10.3：并发 translate_batch() 调用只创建一个批处理器（双重检查锁）"""
+        api = _make_siliconflow(config={"enable_batch": True})
+        try:
+            barrier = threading.Barrier(8)
+
+            def call_translate():
+                barrier.wait()
+                with patch.object(api, "_direct_translate", return_value="译文"):
+                    api.translate_batch(["text"], [{}])
+
+            threads = [threading.Thread(target=call_translate) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5.0)
+
+            # 并发调用后只创建了一个批处理器
+            assert api.batch_processor is not None
+            # 验证未重复创建：记录当前实例后再次调用，应保持同一实例
+            first = api.batch_processor
+            with patch.object(api, "_direct_translate", return_value="译文"):
+                api.translate_batch(["text"], [{}])
+            assert api.batch_processor is first, "双重检查锁应确保并发调用只创建一个批处理器实例。"
+        finally:
+            api.close()
+
+    def test_disabled_batch_never_creates_processor(self):
+        """PERF §10.3：enable_batch=False 时 translate_batch() 不创建处理器"""
+        api = _make_siliconflow(config={"enable_batch": False})
+        try:
+            assert api._batch_config is None
+            # 模拟 _direct_translate 避免真实网络调用
+            with patch.object(api, "_direct_translate", return_value="译文"):
+                results = api.translate_batch(["hello"], [{}])
+            # 批处理器仍未创建（走 translate_with_cache 回退路径）
+            assert api.batch_processor is None
+            assert results == ["译文"]
         finally:
             api.close()

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 BUG-009 / R2-BUG-002：安全密钥存储工具
 
@@ -15,9 +14,8 @@ R2-BUG-002 修复要点：
 """
 
 import os
-from enum import Enum
-from typing import Optional
 
+from ..domain.secret import StorageStatus
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,15 +24,17 @@ logger = get_logger(__name__)
 _KEYRING_SERVICE = "AI-Translator"
 
 # 是否可用 keyring（延迟探测，避免每次调用都尝试导入）
-_keyring_available: Optional[bool] = None
+_keyring_available: bool | None = None
 
 
-class StorageStatus(str, Enum):
-    """密钥存储结果状态（R2-BUG-002）"""
-
-    PERSISTED = "persisted"        # 已持久化到密钥环，重启后仍可读取
-    SESSION_ONLY = "session_only"  # 仅写入环境变量，重启后失效
-    FAILED = "failed"              # 写入失败
+__all__ = [
+    "StorageStatus",
+    "store_key",
+    "store_key_bool",
+    "get_key",
+    "delete_key",
+    "mask_key",
+]
 
 
 # 视为不可用的 keyring 后端名称集合
@@ -134,6 +134,8 @@ def store_key(identifier: str, key: str) -> StorageStatus:
             # R2-BUG-002：回读验证一致才视为持久化成功
             read_back = _kr.get_password(_KEYRING_SERVICE, identifier)
             if read_back and read_back.strip() == key:
+                # 持久化成功后清理可能残留的旧会话覆盖。
+                os.environ.pop(_env_var_name(identifier), None)
                 logger.debug("密钥已存入密钥环: %s", identifier)
                 return StorageStatus.PERSISTED
             logger.warning(
@@ -168,7 +170,7 @@ def store_key_bool(identifier: str, key: str) -> bool:
 
 
 def get_key(identifier: str) -> str:
-    """从密钥环读取密钥；不可用时从环境变量读取。
+    """读取密钥；会话覆盖优先于密钥环中的持久化值。
 
     Args:
         identifier: 密钥标识符
@@ -176,6 +178,12 @@ def get_key(identifier: str) -> str:
     Returns:
         密钥明文，不存在时返回空字符串
     """
+    # keyring 写入失败时 store_key() 会把新值保存为会话覆盖。
+    # 必须优先读取它，否则同一进程会继续使用 keyring 中的旧值。
+    session_value = os.environ.get(_env_var_name(identifier), "").strip()
+    if session_value:
+        return session_value
+
     if _detect_keyring():
         try:
             import keyring as _kr
@@ -190,7 +198,7 @@ def get_key(identifier: str) -> str:
                 e,
             )
 
-    return os.environ.get(_env_var_name(identifier), "").strip()
+    return ""
 
 
 def delete_key(identifier: str) -> bool:

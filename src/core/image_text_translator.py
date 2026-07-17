@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 图片文字检测与插图翻译模块
 
@@ -9,29 +8,27 @@
 3. 导出EPUB时优先使用翻译后的新图片，没有则保留原图
 """
 
-import json
-import re
 import datetime
-from pathlib import Path
-from typing import Dict, Any, Optional, Callable
+import json
 import logging
+import re
+from pathlib import Path
+from typing import Any, Callable, Dict
 
-from ..utils.file_handler import write_json_atomic
 from ..infrastructure.image_asset_store import load_image_base64
+from ..utils.file_handler import write_json_atomic
 
 logger = logging.getLogger(__name__)
 
 # 匹配非中文字符的正则：英文字母、日文假名、韩文等
 # 排除常见标点和数字，只关注真正的外语文字
-_NON_CHINESE_TEXT_RE = re.compile(
-    r'[A-Za-z\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]{2,}'
-)
+_NON_CHINESE_TEXT_RE = re.compile(r"[A-Za-z\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]{2,}")
 
 
 # R2-BUG-017：图片文字检测状态
-DETECTION_NO_TEXT = "no_text"        # 图片中确实没有外文文字
+DETECTION_NO_TEXT = "no_text"  # 图片中确实没有外文文字
 DETECTION_FOREIGN_TEXT = "foreign_text"  # 检测到非中文文字
-DETECTION_FAILED = "failed"          # 检测请求失败（鉴权、超时、服务端错误等）
+DETECTION_FAILED = "failed"  # 检测请求失败（鉴权、超时、服务端错误等）
 
 
 def _contains_non_chinese_text(text: str) -> bool:
@@ -51,9 +48,11 @@ class ImageTextTranslator:
             provider = api_config.get("provider", "siliconflow")
             if provider == "deepseek":
                 from ..api.deepseek_api import DeepseekAPI
+
                 self._api_client = DeepseekAPI(api_config)
             else:
                 from ..api.siliconflow_api import SiliconFlowAPI
+
                 self._api_client = SiliconFlowAPI(api_config)
         return self._api_client
 
@@ -65,8 +64,8 @@ class ImageTextTranslator:
         if self._api_client is not None:
             try:
                 self._api_client.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("关闭 API 客户端失败: %s", exc)
             self._api_client = None
 
     def close(self):
@@ -131,8 +130,9 @@ class ImageTextTranslator:
             "text_content": text,
         }
 
-    def process_all_images(self, mapping_dir: str, target_lang: str,
-                           progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
+    def process_all_images(
+        self, mapping_dir: str, target_lang: str, progress_callback: Callable | None = None
+    ) -> Dict[str, Any]:
         """处理mapping目录中所有图片：视觉检测 + 插图翻译
 
         流程：
@@ -177,6 +177,7 @@ class ImageTextTranslator:
                 continue
 
             from .image_utils import convert_to_png
+
             converted_b64, converted_mime = convert_to_png(b64_data, mime_type)
             if converted_b64 is None:
                 print(f"[图片检测] 跳过不支持的格式: {image_path} ({mime_type})")
@@ -203,14 +204,17 @@ class ImageTextTranslator:
                 continue
 
         detected_count = len(foreign_text_images)
-        print(f"\n📊 检测完成: 总计 {total} 张图片，"
-              f"含非中文文字 {detected_count} 张，"
-              f"跳过 {skipped_count} 张"
-              + (f"，失败 {error_count} 张" if error_count else ""))
+        print(
+            f"\n📊 检测完成: 总计 {total} 张图片，"
+            f"含非中文文字 {detected_count} 张，"
+            f"跳过 {skipped_count} 张" + (f"，失败 {error_count} 张" if error_count else "")
+        )
 
         # R2-BUG-017：全部检测失败时不显示"无需翻译"的成功提示
         if not foreign_text_images:
-            if error_count > 0 and error_count + skipped_count == total - (total - error_count - skipped_count):
+            if error_count > 0 and error_count + skipped_count == total - (
+                total - error_count - skipped_count
+            ):
                 # 有失败项，不显示普通完成
                 msg = f"完成（{error_count} 张检测失败）" if error_count else "完成（无需翻译）"
             else:
@@ -233,6 +237,7 @@ class ImageTextTranslator:
             return {}
 
         from .image_translator import ImageTranslator
+
         img_translator = ImageTranslator(self.config_manager)
 
         # 直接传入筛选后的图片映射，无需操作文件
@@ -244,13 +249,14 @@ class ImageTextTranslator:
             def img2img_progress_cb(success, img_total, current):
                 if progress_callback:
                     progress_callback(
-                        img2img_progress_base + success, total,
-                        f"[插图翻译] {current}"
+                        img2img_progress_base + success, total, f"[插图翻译] {current}"
                     )
 
             result_map = img_translator.translate_images(
-                mapping_dir, target_lang, img2img_progress_cb,
-                image_mappings_override=filtered_mappings
+                mapping_dir,
+                target_lang,
+                img2img_progress_cb,
+                image_mappings_override=filtered_mappings,
             )
 
         except Exception as e:

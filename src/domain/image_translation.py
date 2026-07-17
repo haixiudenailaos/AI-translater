@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 图片翻译领域模型
 
@@ -18,7 +17,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 from .translation import OperationStatus
 
@@ -52,7 +51,7 @@ class ImageTranslationRequest:
     mapping_dir: Path
     target_language: str
     provider_id: ImageTranslationProviderId
-    selected_images: Optional[Tuple[str, ...]] = None
+    selected_images: Tuple[str, ...] | None = None
     source_fingerprint: str = ""
     config_fingerprint: str = ""
 

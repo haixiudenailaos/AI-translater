@@ -1,9 +1,9 @@
 """UXF-008: deterministic post-translation quality inspection."""
 
+import re
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from enum import Enum
-import re
 from typing import Iterable
 
 from ..domain.project import TranslationProject
@@ -75,7 +75,9 @@ def inspect_quality(
     issues: list[QualityIssue] = []
     targets_seen: dict[str, int] = {}
 
-    def add(issue_type: QualityIssueType, severity: QualitySeverity, index: int, message: str) -> None:
+    def add(
+        issue_type: QualityIssueType, severity: QualitySeverity, index: int, message: str
+    ) -> None:
         issue_id = f"{issue_type.value}:{index}"
         if issue_id not in ignored:
             issues.append(QualityIssue(issue_id, issue_type, severity, index, message))
@@ -85,27 +87,67 @@ def inspect_quality(
             continue
         target = project.translated_lines[index] if index < len(project.translated_lines) else ""
         if not target or not target.strip():
-            add(QualityIssueType.MISSING_TRANSLATION, QualitySeverity.ERROR, index, "原文非空但译文为空。")
+            add(
+                QualityIssueType.MISSING_TRANSLATION,
+                QualitySeverity.ERROR,
+                index,
+                "原文非空但译文为空。",
+            )
             continue
 
         normalized_source = "".join(source.split()).casefold()
         normalized_target = "".join(target.split()).casefold()
-        if len(normalized_source) >= 4 and SequenceMatcher(None, normalized_source, normalized_target).ratio() >= 0.92:
-            add(QualityIssueType.UNCHANGED_TRANSLATION, QualitySeverity.WARNING, index, "译文与原文高度相似，可能未翻译。")
+        if (
+            len(normalized_source) >= 4
+            and SequenceMatcher(None, normalized_source, normalized_target).ratio() >= 0.92
+        ):
+            add(
+                QualityIssueType.UNCHANGED_TRANSLATION,
+                QualitySeverity.WARNING,
+                index,
+                "译文与原文高度相似，可能未翻译。",
+            )
         if _LINE_MARKER_RE.search(target):
-            add(QualityIssueType.INTERNAL_MARKER, QualitySeverity.ERROR, index, "译文残留内部行号标记。")
+            add(
+                QualityIssueType.INTERNAL_MARKER,
+                QualitySeverity.ERROR,
+                index,
+                "译文残留内部行号标记。",
+            )
         if sorted(_NUMBER_RE.findall(source)) != sorted(_NUMBER_RE.findall(target)):
-            add(QualityIssueType.NUMBER_MISMATCH, QualitySeverity.WARNING, index, "原文和译文中的数字不一致。")
-        if len(source) >= 20 and (len(target) < len(source) * 0.15 or len(target) > len(source) * 6):
-            add(QualityIssueType.LENGTH_ANOMALY, QualitySeverity.WARNING, index, "译文长度与原文差异异常。")
+            add(
+                QualityIssueType.NUMBER_MISMATCH,
+                QualitySeverity.WARNING,
+                index,
+                "原文和译文中的数字不一致。",
+            )
+        if len(source) >= 20 and (
+            len(target) < len(source) * 0.15 or len(target) > len(source) * 6
+        ):
+            add(
+                QualityIssueType.LENGTH_ANOMALY,
+                QualitySeverity.WARNING,
+                index,
+                "译文长度与原文差异异常。",
+            )
         previous_index = targets_seen.get(normalized_target)
         if previous_index is not None and len(normalized_target) >= 8:
-            add(QualityIssueType.REPEATED_TRANSLATION, QualitySeverity.WARNING, index, f"译文与第 {previous_index + 1} 行重复。")
+            add(
+                QualityIssueType.REPEATED_TRANSLATION,
+                QualitySeverity.WARNING,
+                index,
+                f"译文与第 {previous_index + 1} 行重复。",
+            )
         else:
             targets_seen[normalized_target] = index
         for source_term, target_term in glossary:
             if source_term in source and target_term not in target:
-                add(QualityIssueType.GLOSSARY_MISS, QualitySeverity.WARNING, index, f"术语“{source_term}”未使用指定译法“{target_term}”。")
+                add(
+                    QualityIssueType.GLOSSARY_MISS,
+                    QualitySeverity.WARNING,
+                    index,
+                    f"术语“{source_term}”未使用指定译法“{target_term}”。",
+                )
 
     return QualityReport(
         total_lines=len(project.original_lines),

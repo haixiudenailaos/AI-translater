@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 翻译项目持久化仓库（UXF-004）
 
@@ -21,9 +20,8 @@
 import datetime
 import hashlib
 import json
-import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from ..domain.project import SaveStatus, TaskStatus, TranslationProject
 from ..utils.file_handler import write_json_atomic
@@ -97,7 +95,7 @@ class ProjectRepository:
         file_type: str,
         mapping_dir: str,
         original_lines: List[str],
-        model_snapshot: Optional[Dict[str, object]] = None,
+        model_snapshot: Dict[str, object] | None = None,
     ) -> TranslationProject:
         """创建新翻译项目。
 
@@ -131,7 +129,7 @@ class ProjectRepository:
         )
         return project
 
-    def load(self, project_id: str) -> Optional[TranslationProject]:
+    def load(self, project_id: str) -> TranslationProject | None:
         """按项目 ID 加载项目，不存在返回 None。"""
         path = self._project_file(project_id)
         if not path.exists():
@@ -167,8 +165,7 @@ class ProjectRepository:
 
     # ── 检查点（UXF-001：覆盖前创建检查点，允许撤销） ──
 
-    def create_checkpoint(self, project: TranslationProject,
-                          label: str = "") -> str:
+    def create_checkpoint(self, project: TranslationProject, label: str = "") -> str:
         """创建检查点，返回检查点文件名。
 
         在"重新翻译全部"等覆盖性操作前调用，允许撤销到翻译前版本。
@@ -210,13 +207,12 @@ class ProjectRepository:
         results.sort(key=lambda x: x[1], reverse=True)
         return results
 
-    def restore_checkpoint(self, project_id: str,
-                           checkpoint_name: str) -> Optional[TranslationProject]:
+    def restore_checkpoint(
+        self, project_id: str, checkpoint_name: str
+    ) -> TranslationProject | None:
         """从检查点恢复项目状态。"""
         path = self.projects_dir / checkpoint_name
-        if not path.exists() or not checkpoint_name.startswith(
-            f"{project_id}.ckpt_"
-        ):
+        if not path.exists() or not checkpoint_name.startswith(f"{project_id}.ckpt_"):
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -275,17 +271,19 @@ class ProjectRepository:
         # 移除同 ID 旧条目
         entries = [e for e in entries if e.get("project_id") != project.project_id]
 
-        entries.append({
-            "project_id": project.project_id,
-            "source_path": project.source_path,
-            "file_type": project.file_type,
-            "status": project.status.value,
-            "total_lines": project.total_lines,
-            "translated_count": project.translated_count,
-            "failed_count": project.failed_count,
-            "last_opened_at": project.last_opened_at,
-            "last_saved_at": project.last_saved_at,
-        })
+        entries.append(
+            {
+                "project_id": project.project_id,
+                "source_path": project.source_path,
+                "file_type": project.file_type,
+                "status": project.status.value,
+                "total_lines": project.total_lines,
+                "translated_count": project.translated_count,
+                "failed_count": project.failed_count,
+                "last_opened_at": project.last_opened_at,
+                "last_saved_at": project.last_saved_at,
+            }
+        )
 
         # 只保留最近 50 条
         entries.sort(key=lambda x: str(x.get("last_opened_at", "")), reverse=True)
@@ -321,10 +319,7 @@ class ProjectRepository:
         if recent_file.exists():
             try:
                 data = json.loads(recent_file.read_text(encoding="utf-8"))
-                entries = [
-                    e for e in data.get("projects", [])
-                    if e.get("project_id") != project_id
-                ]
+                entries = [e for e in data.get("projects", []) if e.get("project_id") != project_id]
                 write_json_atomic(recent_file, {"projects": entries})
             except Exception:
                 pass

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 EPUB 映射仓库模块
 
@@ -47,12 +46,14 @@ def load_content_mapping(mapping_dir: str) -> Tuple[List[str], List[str]]:
         line_num = v.get("line_number")
         if line_num is None:
             raise Exception(f"条目 {k} 缺少 line_number 字段，数据损坏")
-        entries.append({
-            "key": k,
-            "line_number": int(line_num),
-            "original_text": v.get("original_text", ""),
-            "translated_text": v.get("translated_text", ""),
-        })
+        entries.append(
+            {
+                "key": k,
+                "line_number": int(line_num),
+                "original_text": v.get("original_text", ""),
+                "translated_text": v.get("translated_text", ""),
+            }
+        )
 
     # 严格按 line_number 排序
     entries.sort(key=lambda x: x["line_number"])
@@ -116,7 +117,7 @@ def load_old_translations(mapping_dir: Path) -> Tuple[Dict, Dict, Dict]:
     try:
         old_data = json.loads(content_file.read_text(encoding="utf-8"))
         old_mappings = old_data.get("content_mappings", {})
-        for key, item in old_mappings.items():
+        for _key, item in old_mappings.items():
             original = item.get("original_text", "")
             translated = item.get("translated_text", "")
             translated_at = item.get("translated_at", "")
@@ -145,7 +146,7 @@ def load_old_translations(mapping_dir: Path) -> Tuple[Dict, Dict, Dict]:
             existing_translations[original] = record
 
         print(f"✓ 检测到已有翻译数据，已保留 {len(existing_translations)} 条翻译记录")
-    except Exception as e:
+    except (OSError, json.JSONDecodeError, KeyError, AttributeError) as e:
         print(f"⚠ 警告：读取旧翻译数据失败: {e}")
 
     return existing_translations, existing_by_locator, existing_by_chapter_seq

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 统一应用路径解析模块（BUG-001）
 
@@ -15,14 +14,12 @@
 - 测试环境允许显式注入临时目录
 """
 
-import os
-import sys
-import json
 import logging
+import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 # R2-BUG-021：不再在模块级导入 get_logger / file_handler。
 # - get_logger 会在导入阶段触发日志初始化，导致日志目录被固定为 ./logs。
@@ -69,6 +66,7 @@ class AppPaths:
         workspace_dir: EPUB 工作区目录
         log_dir: 日志目录
     """
+
     resource_dir: Path
     data_dir: Path
     config_dir: Path
@@ -79,10 +77,10 @@ class AppPaths:
     def create(
         cls,
         *,
-        data_dir: Optional[Path] = None,
-        config_dir: Optional[Path] = None,
-        workspace_dir: Optional[Path] = None,
-        log_dir: Optional[Path] = None,
+        data_dir: Path | None = None,
+        config_dir: Path | None = None,
+        workspace_dir: Path | None = None,
+        log_dir: Path | None = None,
     ) -> "AppPaths":
         """创建 AppPaths，允许测试环境注入临时目录。
 
@@ -133,31 +131,35 @@ class AppPaths:
         if migration_marker.exists():
             try:
                 import json as _json
+
                 state = _json.loads(migration_marker.read_text(encoding="utf-8"))
                 if state.get("status") in ("completed", "no_source"):
                     return
                 # partial 状态：允许重试，继续执行迁移
-            except Exception:
+            except (OSError, ValueError) as exc:
                 # marker 损坏，继续尝试迁移
-                pass
+                logger.warning("迁移标记读取失败，将重试迁移: %s", exc)
 
         # R2-BUG-020：显式历史迁移源，不扫描任意 CWD
         legacy_sources = self._legacy_config_sources()
 
         # 选择第一个存在的迁移源
-        legacy_config: Optional[Path] = None
+        legacy_config: Path | None = None
         for src in legacy_sources:
             try:
                 if src.exists() and src.is_dir():
                     legacy_config = src
                     break
-            except Exception:
+            except OSError:
                 continue
 
         if legacy_config is None:
             self._write_migration_marker(
-                migration_marker, status="no_source", source=None,
-                migrated=[], failed=[],
+                migration_marker,
+                status="no_source",
+                source=None,
+                migrated=[],
+                failed=[],
             )
             return
 
@@ -185,8 +187,11 @@ class AppPaths:
         # R2-BUG-020：只有无失败才标记 completed，否则标记 partial 允许重试
         status = "completed" if not failed else "partial"
         self._write_migration_marker(
-            migration_marker, status=status, source=str(legacy_config),
-            migrated=migrated, failed=failed,
+            migration_marker,
+            status=status,
+            source=str(legacy_config),
+            migrated=migrated,
+            failed=failed,
         )
 
     def _legacy_config_sources(self) -> list[Path]:
@@ -212,12 +217,13 @@ class AppPaths:
         marker: Path,
         *,
         status: str = "completed",
-        source: Optional[str] = None,
-        migrated: Optional[list[str]] = None,
-        failed: Optional[list[str]] = None,
+        source: str | None = None,
+        migrated: list[str] | None = None,
+        failed: list[str] | None = None,
     ) -> None:
         try:
             import datetime
+
             payload = {
                 "schema_version": 1,
                 "status": status,
@@ -228,6 +234,7 @@ class AppPaths:
             }
             # R2-BUG-021：延迟导入，避免模块导入阶段拉起 file_handler / chardet
             from .utils.file_handler import write_json_atomic
+
             # BUG-006：使用原子写入
             write_json_atomic(marker, payload)
         except Exception as exc:

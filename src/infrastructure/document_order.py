@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 EPUB spine 文档顺序模块
 
@@ -36,7 +35,8 @@ def get_item_name(item) -> str:
     if hasattr(item, "get_name"):
         try:
             return item.get_name()
-        except Exception:
+        except (AttributeError, KeyError):
+            # ebooklib 不同版本 API 差异，最佳努力获取名称
             pass
     return ""
 
@@ -49,7 +49,8 @@ def get_item_media_type(item) -> str:
     if hasattr(item, "get_media_type"):
         try:
             return item.get_media_type()
-        except Exception:
+        except (AttributeError, KeyError):
+            # ebooklib 不同版本 API 差异，最佳努力获取媒体类型
             pass
     if hasattr(item, "media_type"):
         return item.media_type
@@ -91,7 +92,7 @@ def normalize_chapter_id(name: str) -> str:
     low = n.lower()
     for prefix in _CONTAINER_PREFIXES:
         if low.startswith(prefix):
-            n = n[len(prefix):]
+            n = n[len(prefix) :]
             break
     # 移除开头的 /
     n = n.lstrip("/")
@@ -112,6 +113,7 @@ def iter_spine_documents(book) -> Iterator:
     3. 跳过非线性（linear="no"）或不存在的项目
     """
     import ebooklib
+
     seen_ids = set()
     for item in book.spine:
         try:
@@ -136,12 +138,12 @@ def iter_spine_documents(book) -> Iterator:
             if isinstance(itemref, str):
                 try:
                     doc_item = book.get_item_with_id(itemref)
-                except Exception:
+                except (KeyError, AttributeError):
                     doc_item = None
             elif hasattr(itemref, "idref"):
                 try:
                     doc_item = book.get_item_with_id(itemref.idref)
-                except Exception:
+                except (KeyError, AttributeError):
                     doc_item = None
             elif hasattr(itemref, "get_type"):
                 doc_item = itemref
@@ -161,6 +163,6 @@ def iter_spine_documents(book) -> Iterator:
             seen_ids.add(item_name)
 
             yield doc_item
-        except Exception as exc:
+        except (KeyError, AttributeError, TypeError) as exc:
             logger.warning("遍历 spine 时出错，已跳过: %s", exc)
             continue

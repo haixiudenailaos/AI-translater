@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 项目持久化仓库单元测试（UXF-004）
 
@@ -13,12 +12,11 @@
 - 保存失败不静默吞掉（UXF-003）
 """
 
-import json
 from pathlib import Path
 
 import pytest
 
-from src.domain.project import SaveStatus, TaskStatus, TranslationProject
+from src.domain.project import SaveStatus, TaskStatus
 from src.infrastructure.project_repository import (
     ProjectRepository,
     compute_file_fingerprint,
@@ -40,6 +38,7 @@ def _make_source_file(tmp_path: Path, content: str = "Hello\nWorld\n") -> Path:
 
 
 # ── 项目 ID 与指纹 ─────────────────────────────
+
 
 class TestProjectIdAndFingerprint:
     def test_project_id_stable(self):
@@ -80,6 +79,7 @@ class TestProjectIdAndFingerprint:
 
 
 # ── 创建与加载 ──────────────────────────────
+
 
 class TestCreateAndLoad:
     def test_create_new_project(self, repo):
@@ -140,6 +140,7 @@ class TestCreateAndLoad:
 
 # ── 保存 ──────────────────────────────────
 
+
 class TestSave:
     def test_save_creates_file(self, repo, tmp_path):
         project = repo.create(
@@ -190,6 +191,7 @@ class TestSave:
 
 
 # ── 检查点 ──────────────────────────────────
+
 
 class TestCheckpoints:
     def test_create_checkpoint(self, repo):
@@ -251,6 +253,7 @@ class TestCheckpoints:
     def test_prune_old_checkpoints(self, repo):
         """超出 MAX_CHECKPOINTS 的旧检查点被删除"""
         import time
+
         from src.infrastructure.project_repository import MAX_CHECKPOINTS
 
         project = repo.create(
@@ -270,6 +273,7 @@ class TestCheckpoints:
 
 
 # ── 最近项目 ──────────────────────────────
+
 
 class TestRecentProjects:
     def test_list_recent_empty(self, repo):
@@ -307,6 +311,7 @@ class TestRecentProjects:
     def test_list_recent_ordered(self, repo):
         """最近项目按最后打开时间倒序"""
         import time
+
         for i in range(3):
             project = repo.create(
                 source_path=f"/tmp/test{i}.txt",
@@ -323,6 +328,7 @@ class TestRecentProjects:
 
 
 # ── 删除 ──────────────────────────────────
+
 
 class TestDelete:
     def test_delete_project(self, repo):

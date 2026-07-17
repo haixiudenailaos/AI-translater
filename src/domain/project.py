@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 翻译项目领域模型（UXF-001 / UXF-003 / UXF-004 / UXF-005）
 
@@ -16,7 +15,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 from .translation import OperationStatus
 
@@ -36,13 +35,13 @@ class TaskStatus(str, Enum):
     - completed / cancelled / error 为终态（cancelled/error 可重新发起）
     """
 
-    PENDING = "pending"        # 等待开始
-    RUNNING = "running"        # 正在执行
-    PAUSED = "paused"          # 用户暂停，可恢复
-    PARTIAL = "partial"        # 有成功结果，也有失败或缺失行
-    COMPLETED = "completed"    # 全部必需内容成功且质检通过
-    CANCELLED = "cancelled"    # 用户取消
-    ERROR = "error"            # 任务无法继续，需要用户处理
+    PENDING = "pending"  # 等待开始
+    RUNNING = "running"  # 正在执行
+    PAUSED = "paused"  # 用户暂停，可恢复
+    PARTIAL = "partial"  # 有成功结果，也有失败或缺失行
+    COMPLETED = "completed"  # 全部必需内容成功且质检通过
+    CANCELLED = "cancelled"  # 用户取消
+    ERROR = "error"  # 任务无法继续，需要用户处理
 
     @property
     def is_terminal(self) -> bool:
@@ -67,9 +66,9 @@ class SaveStatus(str, Enum):
     保存失败不得吞掉异常，应保留未保存状态并提供"重试保存"。
     """
 
-    SAVED = "saved"              # 已保存，磁盘与内存一致
-    UNSAVED = "unsaved"          # 有未保存更改
-    SAVING = "saving"            # 正在保存
+    SAVED = "saved"  # 已保存，磁盘与内存一致
+    UNSAVED = "unsaved"  # 有未保存更改
+    SAVING = "saving"  # 正在保存
     SAVE_FAILED = "save_failed"  # 保存失败，需用户处理
 
 
@@ -112,7 +111,7 @@ class ModelSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: Optional[Dict[str, object]] = None) -> "ModelSnapshot":
+    def from_dict(cls, data: Dict[str, object] | None = None) -> "ModelSnapshot":
         if not data:
             return cls()
         return cls(
@@ -152,7 +151,7 @@ class TranslationProject:
     # 任务状态
     status: TaskStatus = TaskStatus.PENDING
     last_operation_status: OperationStatus = OperationStatus.SUCCEEDED
-    last_error: Optional[str] = None
+    last_error: str | None = None
     retry_counts: Dict[int, int] = field(default_factory=dict)
 
     # 配置快照
@@ -181,9 +180,7 @@ class TranslationProject:
     def translated_count(self) -> int:
         """已成功翻译的行数（译文非空且非失败行）"""
         return sum(
-            1
-            for i, t in enumerate(self.translated_lines)
-            if t and i not in self.failed_indices
+            1 for i, t in enumerate(self.translated_lines) if t and i not in self.failed_indices
         )
 
     @property
@@ -202,9 +199,7 @@ class TranslationProject:
     @property
     def completion_ratio(self) -> float:
         """完成比例 [0.0, 1.0]，基于非空原文行数计算"""
-        translatable = sum(
-            1 for line in self.original_lines if line and line.strip()
-        )
+        translatable = sum(1 for line in self.original_lines if line and line.strip())
         if translatable == 0:
             return 1.0
         return self.translated_count / translatable
@@ -223,11 +218,15 @@ class TranslationProject:
         """计算待翻译行索引：原文非空 + 译文为空 + 非手工编辑"""
         pending = []
         for i, (orig, trans) in enumerate(
-            zip(self.original_lines, self.translated_lines)
+            zip(self.original_lines, self.translated_lines, strict=False)
         ):
-            if orig and orig.strip() and not (trans and trans.strip()):
-                if i not in self.manually_edited_indices:
-                    pending.append(i)
+            if (
+                orig
+                and orig.strip()
+                and not (trans and trans.strip())
+                and i not in self.manually_edited_indices
+            ):
+                pending.append(i)
         return tuple(pending)
 
     # ── 变更方法 ──────────────────────────────────
@@ -236,9 +235,7 @@ class TranslationProject:
         """确保译文列表与原文等长，不足部分补空字符串"""
         expected = len(self.original_lines)
         if len(self.translated_lines) < expected:
-            self.translated_lines.extend(
-                [""] * (expected - len(self.translated_lines))
-            )
+            self.translated_lines.extend([""] * (expected - len(self.translated_lines)))
         elif len(self.translated_lines) > expected:
             del self.translated_lines[expected:]
 
@@ -285,9 +282,7 @@ class TranslationProject:
         for offset, idx in enumerate(indices):
             if idx in self.manually_edited_indices:
                 continue  # 跳过手工编辑行
-            translated = (
-                translated_lines[offset] if offset < len(translated_lines) else ""
-            )
+            translated = translated_lines[offset] if offset < len(translated_lines) else ""
             if offset in failed_set or not (translated and translated.strip()):
                 # 失败行保持原值，记录失败
                 self.failed_indices.add(idx)
@@ -301,7 +296,7 @@ class TranslationProject:
         """标记某行为手工编辑并写入译文"""
         self.apply_translation(index, translated, manually_edited=True)
 
-    def mark_failed(self, index: int, error: Optional[str] = None) -> None:
+    def mark_failed(self, index: int, error: str | None = None) -> None:
         """标记某行翻译失败"""
         self.failed_indices.add(index)
         self.retry_counts[index] = self.retry_counts.get(index, 0) + 1
@@ -328,8 +323,7 @@ class TranslationProject:
             return
         self.status = new_status
 
-    def update_from_operation(self, op_status: OperationStatus,
-                              error: Optional[str] = None) -> None:
+    def update_from_operation(self, op_status: OperationStatus, error: str | None = None) -> None:
         """根据单次操作结果更新任务状态（UXF-005）"""
         self.last_operation_status = op_status
         if error:

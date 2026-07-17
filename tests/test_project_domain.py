@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 翻译项目领域模型单元测试（UXF-001 / UXF-003 / UXF-004 / UXF-005）
 
@@ -13,10 +12,7 @@
 领域层不依赖任何项目外模块，可独立运行。
 """
 
-import pytest
-
 from src.domain.project import (
-    LineEditState,
     ModelSnapshot,
     SaveStatus,
     TaskStatus,
@@ -24,8 +20,8 @@ from src.domain.project import (
 )
 from src.domain.translation import OperationStatus
 
-
 # ── TaskStatus ──────────────────────────────────
+
 
 class TestTaskStatus:
     def test_status_values_are_strings(self):
@@ -64,6 +60,7 @@ class TestTaskStatus:
 
 # ── SaveStatus ──────────────────────────────────
 
+
 class TestSaveStatus:
     def test_status_values(self):
         assert SaveStatus.SAVED == "saved"
@@ -73,6 +70,7 @@ class TestSaveStatus:
 
 
 # ── ModelSnapshot ──────────────────────────────
+
 
 class TestModelSnapshot:
     def test_defaults(self):
@@ -99,6 +97,7 @@ class TestModelSnapshot:
 
 
 # ── TranslationProject 基础 ─────────────────────
+
 
 def _make_project(lines=None, translations=None):
     """创建测试用项目"""
@@ -133,21 +132,23 @@ class TestTranslationProjectBasics:
         assert project.completion_ratio == 0.0
 
     def test_completion_ratio_full(self):
-        project = _make_project(
-            translations=["你好", "世界", "", "富"]
-        )
+        project = _make_project(translations=["你好", "世界", "", "富"])
         # 3 个非空原文行中 3 个已翻译
         assert project.completion_ratio == 1.0
 
     def test_completion_ratio_zero_lines(self):
         project = TranslationProject(
-            project_id="empty", source_path="", source_fingerprint="",
-            file_type="txt", mapping_dir="",
+            project_id="empty",
+            source_path="",
+            source_fingerprint="",
+            file_type="txt",
+            mapping_dir="",
         )
         assert project.completion_ratio == 1.0
 
 
 # ── UXF-002：稀疏行计算 ─────────────────────────
+
 
 class TestPendingIndices:
     def test_all_empty_translations(self):
@@ -194,6 +195,7 @@ class TestPendingIndices:
 
 # ── UXF-001：手工编辑保护 ───────────────────────
 
+
 class TestManualEditProtection:
     def test_auto_translation_skips_manual(self):
         """自动翻译不覆盖手工编辑行"""
@@ -237,6 +239,7 @@ class TestManualEditProtection:
 
 
 # ── UXF-005：状态流转 ───────────────────────────
+
 
 class TestStatusTransition:
     def test_completed_requires_no_failed(self):
@@ -297,6 +300,7 @@ class TestStatusTransition:
 
 # ── 序列化 ──────────────────────────────────
 
+
 class TestSerialization:
     def test_round_trip(self):
         project = _make_project(translations=["你好", "", "", ""])
@@ -305,7 +309,8 @@ class TestSerialization:
         project.status = TaskStatus.PARTIAL
         project.last_error = "timeout"
         project.model_snapshot = ModelSnapshot(
-            provider="deepseek", model_name="deepseek-v3",
+            provider="deepseek",
+            model_name="deepseek-v3",
         )
         project.created_at = "2026-07-15T10:00:00"
 
@@ -339,6 +344,7 @@ class TestSerialization:
 
 # ── ensure_translated_capacity ─────────────────
 
+
 class TestEnsureCapacity:
     def test_extend_short(self):
         project = _make_project()
@@ -354,6 +360,7 @@ class TestEnsureCapacity:
 
 
 # ── failed 行管理 ──────────────────────────────
+
 
 class TestFailedLineManagement:
     def test_mark_failed(self):

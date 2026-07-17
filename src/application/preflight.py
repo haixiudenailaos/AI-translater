@@ -68,34 +68,38 @@ def build_preflight_report(
     estimated_cost = None
     if input_price_per_million is not None and output_price_per_million is not None:
         estimated_cost = (
-            input_tokens * input_price_per_million
-            + output_tokens * output_price_per_million
+            input_tokens * input_price_per_million + output_tokens * output_price_per_million
         ) / 1_000_000
 
     issues: list[PreflightIssue] = []
     long_lines = tuple(
-        index for index in pending
-        if len(project.original_lines[index]) > long_line_threshold
+        index for index in pending if len(project.original_lines[index]) > long_line_threshold
     )
     if long_lines:
-        issues.append(PreflightIssue(
-            "long_source_lines", PreflightSeverity.WARNING,
-            f"{len(long_lines)} 行超过 {long_line_threshold} 字符，可能需要拆分。",
-            long_lines,
-        ))
+        issues.append(
+            PreflightIssue(
+                "long_source_lines",
+                PreflightSeverity.WARNING,
+                f"{len(long_lines)} 行超过 {long_line_threshold} 字符，可能需要拆分。",
+                long_lines,
+            )
+        )
     if not pending:
-        issues.append(PreflightIssue(
-            "nothing_to_translate", PreflightSeverity.INFO,
-            "没有待翻译内容。",
-        ))
+        issues.append(
+            PreflightIssue(
+                "nothing_to_translate",
+                PreflightSeverity.INFO,
+                "没有待翻译内容。",
+            )
+        )
     if not options.model_name.strip():
-        issues.append(PreflightIssue(
-            "missing_model", PreflightSeverity.ERROR, "尚未选择翻译模型。"
-        ))
+        issues.append(
+            PreflightIssue("missing_model", PreflightSeverity.ERROR, "尚未选择翻译模型。")
+        )
     if not options.target_language.strip():
-        issues.append(PreflightIssue(
-            "missing_target_language", PreflightSeverity.ERROR, "尚未选择目标语言。"
-        ))
+        issues.append(
+            PreflightIssue("missing_target_language", PreflightSeverity.ERROR, "尚未选择目标语言。")
+        )
 
     return PreflightReport(
         action=action,

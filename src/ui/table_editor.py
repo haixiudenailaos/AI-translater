@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 通用 Treeview 单元格编辑组件
 可复用于 MainWindow 和 TaskDetailWindow。
@@ -7,7 +6,7 @@
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Optional, Callable
+from typing import Callable
 
 
 class TableCellEditor:
@@ -20,18 +19,22 @@ class TableCellEditor:
     on_save(item_id, col_index, old_value, new_value) 在值变更时被调用。
     """
 
-    def __init__(self, tree: ttk.Treeview, *,
-                 editable_columns: Optional[set] = None,
-                 on_save: Optional[Callable] = None,
-                 font: tuple = ("微软雅黑", 10)):
+    def __init__(
+        self,
+        tree: ttk.Treeview,
+        *,
+        editable_columns: set | None = None,
+        on_save: Callable | None = None,
+        font: tuple = ("微软雅黑", 10),
+    ):
         self.tree = tree
         self.editable_columns = editable_columns or {1, 2}
         self.on_save = on_save
         self.font = font
 
-        self.edit_entry: Optional[tk.Entry] = None
-        self.editing_item: Optional[str] = None
-        self.editing_column: Optional[int] = None
+        self.edit_entry: tk.Entry | None = None
+        self.editing_item: str | None = None
+        self.editing_column: int | None = None
 
     def on_double_click(self, event):
         """双击单元格进入编辑"""
@@ -43,7 +46,7 @@ class TableCellEditor:
             return
 
         column = self.tree.identify_column(event.x)
-        col_idx = int(column.replace('#', '')) - 1
+        col_idx = int(column.replace("#", "")) - 1
         if col_idx not in self.editable_columns:
             return
 
@@ -51,7 +54,7 @@ class TableCellEditor:
         if not item:
             return
 
-        values = self.tree.item(item)['values']
+        values = self.tree.item(item)["values"]
         if not values or col_idx >= len(values):
             return
 
@@ -62,28 +65,29 @@ class TableCellEditor:
         self.editing_item = item
         self.editing_column = col_idx
 
-        self.edit_entry = tk.Entry(self.tree, font=self.font,
-                                   relief=tk.SOLID, borderwidth=1)
+        self.edit_entry = tk.Entry(self.tree, font=self.font, relief=tk.SOLID, borderwidth=1)
         self.edit_entry.insert(0, values[col_idx])
         self.edit_entry.select_range(0, tk.END)
         self.edit_entry.focus_set()
-        self.edit_entry.place(x=bbox[0], y=bbox[1],
-                              width=bbox[2], height=bbox[3])
+        self.edit_entry.place(x=bbox[0], y=bbox[1], width=bbox[2], height=bbox[3])
 
-        self.edit_entry.bind('<Return>', lambda e: self.save())
-        self.edit_entry.bind('<Escape>', lambda e: self.cancel())
-        self.edit_entry.bind('<FocusOut>', lambda e: self.save())
+        self.edit_entry.bind("<Return>", lambda e: self.save())
+        self.edit_entry.bind("<Escape>", lambda e: self.cancel())
+        self.edit_entry.bind("<FocusOut>", lambda e: self.save())
 
     def save(self):
-        """保存编辑并销毁 Entry"""
+        """保存编辑并销毁 Entry
+
+        P0-2：不再直接修改 Treeview，只提交 edit command。
+        由调用方（MainWindow._on_cell_edited）负责更新 Treeview 和 TranslationDocument，
+        确保模型与视图保持一致。
+        """
         if not self.edit_entry or not self.editing_item:
             return
 
         new_value = self.edit_entry.get()
-        values = list(self.tree.item(self.editing_item)['values'])
+        values = list(self.tree.item(self.editing_item)["values"])
         old_value = values[self.editing_column]
-        values[self.editing_column] = new_value
-        self.tree.item(self.editing_item, values=values)
 
         item_id = self.editing_item
         col_idx = self.editing_column

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 稀疏行翻译应用服务（UXF-001 / UXF-002）
 
@@ -20,7 +19,7 @@
 """
 
 from collections.abc import Callable, Sequence
-from typing import Optional, Tuple
+from typing import Tuple
 
 from ..domain.errors import TranslationCancelled
 from ..domain.project import TranslationProject
@@ -57,7 +56,7 @@ class SparseLineTranslator:
         self,
         project: TranslationProject,
         options: TranslationOptions,
-        on_progress: Optional[Callable[[TranslationProgress], None]] = None,
+        on_progress: Callable[[TranslationProgress], None] | None = None,
     ) -> TranslationResult:
         """翻译项目中的所有待翻译行（UXF-002）
 
@@ -90,7 +89,7 @@ class SparseLineTranslator:
         project: TranslationProject,
         indices: Sequence[int],
         options: TranslationOptions,
-        on_progress: Optional[Callable[[TranslationProgress], None]] = None,
+        on_progress: Callable[[TranslationProgress], None] | None = None,
     ) -> TranslationResult:
         """翻译指定的稀疏行索引（UXF-002）
 
@@ -141,7 +140,7 @@ class SparseLineTranslator:
 
         total = len(valid_indices)
         all_failed_global: list[int] = []
-        last_error: Optional[str] = None
+        last_error: str | None = None
         any_success = False
         batch_size = max(1, options.batch_size)
 
@@ -153,9 +152,13 @@ class SparseLineTranslator:
 
             try:
                 batch_result = self._provider.translate_batch(
-                    batch_lines, options,
+                    batch_lines,
+                    options,
                     self._make_progress_wrapper(
-                        on_progress, batch_start, total, batch_indices,
+                        on_progress,
+                        batch_start,
+                        total,
+                        batch_indices,
                         project,
                     ),
                 )
@@ -172,15 +175,15 @@ class SparseLineTranslator:
                     project.mark_failed(gi, str(exc))
                 logger.error(
                     "批次 %d-%d 翻译失败: %s",
-                    batch_start, batch_end - 1, exc,
+                    batch_start,
+                    batch_end - 1,
+                    exc,
                 )
                 continue
 
             # 映射批次失败索引到全局索引
             batch_failed_global = [
-                batch_indices[fi]
-                for fi in batch_result.failed_indices
-                if fi < len(batch_indices)
+                batch_indices[fi] for fi in batch_result.failed_indices if fi < len(batch_indices)
             ]
 
             # 写回成功行（UXF-002：只在非空且索引匹配时写回）
@@ -223,7 +226,7 @@ class SparseLineTranslator:
         self,
         project: TranslationProject,
         options: TranslationOptions,
-        on_progress: Optional[Callable[[TranslationProgress], None]] = None,
+        on_progress: Callable[[TranslationProgress], None] | None = None,
     ) -> TranslationResult:
         """重试失败行（UXF-009）
 
@@ -240,12 +243,12 @@ class SparseLineTranslator:
 
     def _make_progress_wrapper(
         self,
-        on_progress: Optional[Callable[[TranslationProgress], None]],
+        on_progress: Callable[[TranslationProgress], None] | None,
         batch_start: int,
         total: int,
         batch_indices: Tuple[int, ...],
         project: TranslationProject,
-    ) -> Optional[Callable[[TranslationProgress], None]]:
+    ) -> Callable[[TranslationProgress], None] | None:
         """包装进度回调，将批次内偏移映射到全局已完成数。"""
         if on_progress is None:
             return None
@@ -254,12 +257,14 @@ class SparseLineTranslator:
             # 将批次内完成数映射到全局待翻译行完成数
             global_completed = batch_start + event.completed
             try:
-                on_progress(TranslationProgress(
-                    completed=global_completed,
-                    total=total,
-                    batch_start=batch_indices[0] if batch_indices else 0,
-                    preview_lines=event.preview_lines,
-                ))
+                on_progress(
+                    TranslationProgress(
+                        completed=global_completed,
+                        total=total,
+                        batch_start=batch_indices[0] if batch_indices else 0,
+                        preview_lines=event.preview_lines,
+                    )
+                )
             except Exception as e:
                 logger.warning("进度回调异常: %s", e)
 

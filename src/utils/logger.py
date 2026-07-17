@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 统一日志模块
 提供全局日志配置，替代散落各处的 print() 和 logging.basicConfig()。
@@ -9,14 +8,14 @@ import logging
 import sys
 from pathlib import Path
 
-
 # 是否已显式初始化。R2-BUG-021：get_logger 不再隐式调用 setup_logging，
 # 避免在 AppPaths 生效前把日志目录固定为 ./logs。
 _initialized = False
 
 
-def setup_logging(level=logging.INFO, log_file: str = "translator.log",
-                  log_dir: "Path | str | None" = None):
+def setup_logging(
+    level=logging.INFO, log_file: str = "translator.log", log_dir: "Path | str | None" = None
+):
     """初始化全局日志配置（仅执行一次）。
 
     - 控制台输出 INFO 及以上
@@ -51,10 +50,7 @@ def setup_logging(level=logging.INFO, log_file: str = "translator.log",
 
     # 文件
     try:
-        if log_dir is not None:
-            resolved_log_dir = Path(log_dir)
-        else:
-            resolved_log_dir = Path("logs")
+        resolved_log_dir = Path(log_dir) if log_dir is not None else Path("logs")
         resolved_log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(
             resolved_log_dir / log_file, encoding="utf-8", delay=True

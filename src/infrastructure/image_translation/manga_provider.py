@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Manga 图片翻译 Provider
 
@@ -23,7 +22,6 @@ import io
 import threading
 import uuid
 from pathlib import Path
-from typing import Optional
 
 from ...domain.errors import ImageTranslationCancelled, ImageTranslationConfigError
 from ...domain.image_translation import (
@@ -35,6 +33,7 @@ from ...domain.image_translation import (
 from ...domain.translation import OperationStatus
 from ...utils.logger import get_logger
 from ..image_asset_store import load_image_bytes
+from .engine_loader import configure_engine_import_path, diagnose_manga_engine
 from .language_codes import stage_label, to_manga_lang
 from .runtime import MangaRuntime
 
@@ -56,8 +55,8 @@ _STAGE_MAP = {
 }
 
 
-class MangaImageTranslationProvider:
-    """Manga 默认图片翻译 Provider"""
+class _LocalMangaImageTranslationProvider:
+    """运行在 Python 3.11 worker 内的 Manga 实现。"""
 
     provider_id: str = ImageTranslationProviderId.MANGA.value
 
@@ -65,8 +64,9 @@ class MangaImageTranslationProvider:
         self,
         config_manager,
         *,
-        model_dir: Optional[Path] = None,
-        font_path: Optional[Path] = None,
+        model_dir: Path | None = None,
+        resource_dir: Path | None = None,
+        font_path: Path | None = None,
         quality_preset: str = "standard",
         device: str = "auto",
     ) -> None:
@@ -81,6 +81,7 @@ class MangaImageTranslationProvider:
         """
         self._config_manager = config_manager
         self._model_dir = Path(model_dir) if model_dir else None
+        self._resource_dir = Path(resource_dir) if resource_dir else None
         self._font_path = str(font_path) if font_path else None
         self._quality_preset = quality_preset
         self._device = device
@@ -101,8 +102,7 @@ class MangaImageTranslationProvider:
         manga_lang = to_manga_lang(request.target_language)
         if manga_lang is None:
             errors.append(
-                f"不支持的目标语言: {request.target_language}，"
-                "请在设置中选择已支持的语言"
+                f"不支持的目标语言: {request.target_language}，请在设置中选择已支持的语言"
             )
 
         # images.json 校验
@@ -120,12 +120,8 @@ class MangaImageTranslationProvider:
             except Exception as exc:
                 errors.append(f"images.json 解析失败: {exc}")
 
-        # 引擎可用性校验（惰性探测，不强制安装）
-        if not self._is_engine_available():
-            errors.append(
-                "Manga 翻译引擎未安装或依赖缺失，"
-                "请确认 third_party/manga-image-translator 已正确纳入"
-            )
+        # 引擎与全局 Python 环境校验（不加载模型权重）
+        errors.extend(diagnose_manga_engine(self._resource_dir))
 
         # 文本翻译 API 配置校验（external_llm 需要 base_url 和 model）
         api_config = self._config_manager.get_api_config()
@@ -154,15 +150,11 @@ class MangaImageTranslationProvider:
         try:
             from PIL import Image, ImageOps  # noqa: F401
         except ImportError as exc:
-            raise ImageTranslationConfigError(
-                "Pillow 未安装，无法处理图片: " + str(exc)
-            )
+            raise ImageTranslationConfigError("Pillow 未安装，无法处理图片: " + str(exc))
 
         manga_lang = to_manga_lang(request.target_language)
         if manga_lang is None:
-            raise ImageTranslationConfigError(
-                f"不支持的目标语言: {request.target_language}"
-            )
+            raise ImageTranslationConfigError(f"不支持的目标语言: {request.target_language}")
 
         # 读取 images.json
         import json
@@ -185,9 +177,7 @@ class MangaImageTranslationProvider:
         # 过滤选定图片
         if request.selected_images:
             selected = set(request.selected_images)
-            image_mappings = {
-                k: v for k, v in image_mappings.items() if k in selected
-            }
+            image_mappings = {k: v for k, v in image_mappings.items() if k in selected}
 
         total = len(image_mappings)
         result_map: dict[str, str] = {}
@@ -260,9 +250,7 @@ class MangaImageTranslationProvider:
                     continue
 
                 # 保存结果
-                rel_path = self._save_result(
-                    result_image, output_dir, image_path, image_info
-                )
+                rel_path = self._save_result(result_image, output_dir, image_path, image_info)
                 if rel_path:
                     result_map[image_path] = rel_path
                 else:
@@ -274,16 +262,12 @@ class MangaImageTranslationProvider:
                 # 单图失败不破坏整个任务
                 err = self._sanitize_error(str(exc))
                 failed_images[image_path] = err
-                logger.error(
-                    "翻译图片失败: %s: %s", image_path, exc, exc_info=True
-                )
+                logger.error("翻译图片失败: %s: %s", image_path, exc, exc_info=True)
 
         # 确定最终状态
         if self._cancel_event.is_set():
             status = OperationStatus.CANCELLED
-        elif failed_images and not result_map and not skipped_images:
-            status = OperationStatus.FAILED
-        elif failed_images or (not result_map and not skipped_images):
+        elif not result_map and (failed_images or not skipped_images):
             status = OperationStatus.FAILED
         elif result_map and (failed_images or skipped_images):
             status = OperationStatus.PARTIAL
@@ -320,19 +304,13 @@ class MangaImageTranslationProvider:
 
     # ── 引擎构造 ──────────────────────────────────
 
-    def _is_engine_available(self) -> bool:
-        """惰性探测 Manga 引擎是否可导入。"""
-        try:
-            import manga_translator  # noqa: F401
-            return True
-        except Exception:
-            return False
-
     def _get_or_create_engine(self):
         """惰性创建 MangaTranslator 实例。"""
         with self._engine_lock:
             if self._engine is not None:
                 return self._engine
+            if configure_engine_import_path(self._resource_dir) is None:
+                raise ImageTranslationConfigError("未找到 manga_translator 源码")
             from manga_translator.manga_translator import MangaTranslator
 
             params = self._build_engine_params()
@@ -362,6 +340,7 @@ class MangaImageTranslationProvider:
         if device == "auto":
             try:
                 import torch  # noqa: F401
+
                 if hasattr(torch, "cuda") and torch.cuda.is_available():
                     return "cuda"
                 if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -432,9 +411,7 @@ class MangaImageTranslationProvider:
             img = ImageOps.exif_transpose(img)
             # 防解压炸弹
             if img.width * img.height > _MAX_PIXELS:
-                logger.warning(
-                    "图片像素过大，拒绝处理: %dx%d", img.width, img.height
-                )
+                logger.warning("图片像素过大，拒绝处理: %dx%d", img.width, img.height)
                 return None
             # 统一为 RGB（Manga 引擎要求）
             if img.mode not in ("RGB", "L"):
@@ -450,7 +427,7 @@ class MangaImageTranslationProvider:
         output_dir: Path,
         image_path: str,
         image_info: dict,
-    ) -> Optional[str]:
+    ) -> str | None:
         """保存结果图片到 translated_images/manga/<source_hash>.png。
 
         文件名基于原始 EPUB 路径和内容摘要，避免同名图片互相覆盖。
@@ -543,4 +520,46 @@ class MangaImageTranslationProvider:
 
 class _TranslationInterruptProxy(Exception):
     """取消代理异常，用于在进度 hook 中中断翻译。"""
+
     pass
+
+
+class MangaImageTranslationProvider:
+    """Python 3.13-side Provider proxy backed by a Python 3.11 worker."""
+
+    provider_id: str = ImageTranslationProviderId.MANGA.value
+
+    def __init__(
+        self,
+        config_manager,
+        *,
+        model_dir: Path | None = None,
+        resource_dir: Path | None = None,
+        font_path: Path | None = None,
+        quality_preset: str = "standard",
+        device: str = "auto",
+        python_executable: str | None = None,
+    ) -> None:
+        from .manga_worker_client import MangaWorkerClient
+
+        self._client = MangaWorkerClient(
+            config_manager,
+            model_dir=model_dir,
+            resource_dir=resource_dir,
+            font_path=font_path,
+            quality_preset=quality_preset,
+            device=device,
+            python_executable=python_executable,
+        )
+
+    def validate(self, request: ImageTranslationRequest) -> list[str]:
+        return self._client.validate(request)
+
+    def translate(self, request: ImageTranslationRequest, on_progress=None):
+        return self._client.translate(request, on_progress)
+
+    def cancel(self) -> None:
+        self._client.cancel()
+
+    def close(self) -> None:
+        self._client.close()

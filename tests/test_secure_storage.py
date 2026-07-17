@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 R2-BUG-002 / R2-BUG-003：密钥迁移安全性测试
 
@@ -13,22 +12,17 @@ R2-BUG-002 / R2-BUG-003：密钥迁移安全性测试
 
 import json
 import os
-from pathlib import Path
-from unittest.mock import patch, MagicMock
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from src.utils.secure_storage import (
     StorageStatus,
-    store_key,
     get_key,
-    delete_key,
     mask_key,
-    _detect_keyring,
+    store_key,
 )
 
-
 # ── StorageStatus 基础测试 ───────────────────────────
+
 
 class TestStorageStatus:
     """R2-BUG-002：StorageStatus 枚举与 store_key 返回值。"""
@@ -48,9 +42,7 @@ class TestStorageStatus:
     ):
         """密钥环不可用时，写入环境变量返回 SESSION_ONLY。"""
         # 强制 keyring 不可用
-        monkeypatch.setattr(
-            "src.utils.secure_storage._detect_keyring", lambda: False
-        )
+        monkeypatch.setattr("src.utils.secure_storage._detect_keyring", lambda: False)
         reset_secure_storage_state._keyring_available = False
 
         status = store_key("provider:test", "sk-test-key-12345")
@@ -58,6 +50,33 @@ class TestStorageStatus:
 
         # 验证环境变量被设置
         assert os.environ.get("AI_TRANSLATOR_KEY_PROVIDER_TEST") == "sk-test-key-12345"
+
+    def test_session_override_wins_over_stale_keyring_value(
+        self, reset_secure_storage_state, monkeypatch
+    ):
+        """会话降级的新 Key 不得被 keyring 中的旧 Key 覆盖。"""
+        fake_module = MagicMock()
+        fake_module.get_password.return_value = "stale-key"
+        monkeypatch.setattr("src.utils.secure_storage._detect_keyring", lambda: True)
+        monkeypatch.setenv("AI_TRANSLATOR_KEY_PROVIDER_TEST", "session-key")
+
+        with patch.dict("sys.modules", {"keyring": fake_module}):
+            assert get_key("provider:test") == "session-key"
+
+    def test_persisted_write_clears_old_session_override(
+        self, reset_secure_storage_state, monkeypatch
+    ):
+        """keyring 成功写入后应清除旧的会话覆盖。"""
+        fake_module = MagicMock()
+        fake_module.get_password.return_value = "persisted-key"
+        monkeypatch.setattr("src.utils.secure_storage._detect_keyring", lambda: True)
+        monkeypatch.setenv("AI_TRANSLATOR_KEY_PROVIDER_TEST", "old-session-key")
+
+        with patch.dict("sys.modules", {"keyring": fake_module}):
+            status = store_key("provider:test", "persisted-key")
+
+        assert status == StorageStatus.PERSISTED
+        assert "AI_TRANSLATOR_KEY_PROVIDER_TEST" not in os.environ
 
     def test_store_key_persisted_when_keyring_available(
         self, reset_secure_storage_state, monkeypatch
@@ -72,9 +91,7 @@ class TestStorageStatus:
         fake_module.set_password = fake_keyring.set_password
         fake_module.get_password = fake_keyring.get_password
 
-        monkeypatch.setattr(
-            "src.utils.secure_storage._detect_keyring", lambda: True
-        )
+        monkeypatch.setattr("src.utils.secure_storage._detect_keyring", lambda: True)
         reset_secure_storage_state._keyring_available = True
 
         with patch.dict("sys.modules", {"keyring": fake_module}):
@@ -96,9 +113,7 @@ class TestStorageStatus:
         fake_module.set_password = fake_keyring.set_password
         fake_module.get_password = fake_keyring.get_password
 
-        monkeypatch.setattr(
-            "src.utils.secure_storage._detect_keyring", lambda: True
-        )
+        monkeypatch.setattr("src.utils.secure_storage._detect_keyring", lambda: True)
         reset_secure_storage_state._keyring_available = True
 
         with patch.dict("sys.modules", {"keyring": fake_module}):
@@ -111,12 +126,11 @@ class TestStorageStatus:
 
 # ── ConfigManager 迁移测试 ───────────────────────────
 
+
 class TestConfigMigration:
     """R2-BUG-002：ConfigManager._migrate_plaintext_keys 行为。"""
 
-    def test_migration_preserves_plaintext_when_session_only(
-        self, tmp_config_manager, monkeypatch
-    ):
+    def test_migration_preserves_plaintext_when_session_only(self, tmp_config_manager, monkeypatch):
         """密钥环不可用时（SESSION_ONLY），磁盘 JSON 保留明文 Key。"""
         api_config_file = tmp_config_manager.api_config_file
 
@@ -135,9 +149,8 @@ class TestConfigMigration:
 
         # 强制 keyring 不可用
         from src.utils import secure_storage
-        monkeypatch.setattr(
-            secure_storage, "_detect_keyring", lambda: False
-        )
+
+        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: False)
         secure_storage._keyring_available = False
 
         # 重新加载配置（触发迁移）
@@ -151,9 +164,7 @@ class TestConfigMigration:
         # 但运行时 config 应能从环境变量读取到 Key
         assert config["api_key"] == "sk-plaintext-secret-key"
 
-    def test_migration_removes_plaintext_when_persisted(
-        self, tmp_config_manager, monkeypatch
-    ):
+    def test_migration_removes_plaintext_when_persisted(self, tmp_config_manager, monkeypatch):
         """密钥环持久化成功后，磁盘 JSON 不再包含明文 Key。"""
         api_config_file = tmp_config_manager.api_config_file
 
@@ -184,9 +195,8 @@ class TestConfigMigration:
         fake_module.get_password = fake_get_password
 
         from src.utils import secure_storage
-        monkeypatch.setattr(
-            secure_storage, "_detect_keyring", lambda: True
-        )
+
+        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: True)
         secure_storage._keyring_available = True
 
         with patch.dict("sys.modules", {"keyring": fake_module}):
@@ -203,9 +213,7 @@ class TestConfigMigration:
         # 密钥环中应有该密钥
         assert stored.get("provider:siliconflow") == "sk-plaintext-to-migrate"
 
-    def test_migration_with_provider_keys_dict(
-        self, tmp_config_manager, monkeypatch
-    ):
+    def test_migration_with_provider_keys_dict(self, tmp_config_manager, monkeypatch):
         """迁移 provider_keys 字典中的多个密钥。"""
         api_config_file = tmp_config_manager.api_config_file
 
@@ -238,9 +246,8 @@ class TestConfigMigration:
         fake_module.get_password = fake_get_password
 
         from src.utils import secure_storage
-        monkeypatch.setattr(
-            secure_storage, "_detect_keyring", lambda: True
-        )
+
+        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: True)
         secure_storage._keyring_available = True
 
         with patch.dict("sys.modules", {"keyring": fake_module}):
@@ -258,12 +265,11 @@ class TestConfigMigration:
 
 # ── R2-BUG-003：预设迁移测试 ─────────────────────────
 
+
 class TestPresetMigration:
     """R2-BUG-003：预设迁移不写回明文 Key。"""
 
-    def test_preset_migration_separates_runtime_and_disk(
-        self, tmp_config_manager, monkeypatch
-    ):
+    def test_preset_migration_separates_runtime_and_disk(self, tmp_config_manager, monkeypatch):
         """迁移旧预设后磁盘 JSON 中不存在 api_key，运行时仍能使用。"""
         presets_file = tmp_config_manager.config_dir / "api_presets.json"
 
@@ -299,9 +305,8 @@ class TestPresetMigration:
         fake_module.get_password = fake_get_password
 
         from src.utils import secure_storage
-        monkeypatch.setattr(
-            secure_storage, "_detect_keyring", lambda: True
-        )
+
+        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: True)
         secure_storage._keyring_available = True
 
         with patch.dict("sys.modules", {"keyring": fake_module}):
@@ -340,9 +345,8 @@ class TestPresetMigration:
         )
 
         from src.utils import secure_storage
-        monkeypatch.setattr(
-            secure_storage, "_detect_keyring", lambda: False
-        )
+
+        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: False)
         secure_storage._keyring_available = False
 
         presets = tmp_config_manager.load_api_presets()
@@ -355,9 +359,7 @@ class TestPresetMigration:
         # 运行时仍能使用
         assert presets["preset1"]["api_key"] == "sk-preset-secret"
 
-    def test_preset_no_plaintext_in_logs(
-        self, tmp_config_manager, monkeypatch, caplog
-    ):
+    def test_preset_no_plaintext_in_logs(self, tmp_config_manager, monkeypatch, caplog):
         """搜索日志找不到完整测试 Key。"""
         presets_file = tmp_config_manager.config_dir / "api_presets.json"
 
@@ -389,12 +391,12 @@ class TestPresetMigration:
         fake_module.get_password = fake_get_password
 
         from src.utils import secure_storage
-        monkeypatch.setattr(
-            secure_storage, "_detect_keyring", lambda: True
-        )
+
+        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: True)
         secure_storage._keyring_available = True
 
         import logging
+
         with caplog.at_level(logging.DEBUG):
             with patch.dict("sys.modules", {"keyring": fake_module}):
                 tmp_config_manager.load_api_presets()
@@ -405,6 +407,7 @@ class TestPresetMigration:
 
 
 # ── mask_key 测试 ────────────────────────────────────
+
 
 class TestMaskKey:
     """mask_key 脱敏函数。"""

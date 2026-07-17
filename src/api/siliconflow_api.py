@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 硅基流动API接口模块
 继承 BaseAPI，仅保留差异配置：HTTP/2、心跳保活、增强 vision_query 日志。
 """
 
-import httpx
-import threading
 import json
-from typing import Dict, Any, Optional
-from .base_api import BaseAPI
+import threading
+from typing import Any, Dict
+
+import httpx
+
 from ..utils.logger import get_logger
+from .base_api import BaseAPI
 
 logger = get_logger(__name__)
 
@@ -45,8 +46,8 @@ class SiliconFlowAPI(BaseAPI):
             if self._current_client:
                 try:
                     self._current_client.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("关闭旧 HTTP 客户端失败: %s", exc)
             expiry = getattr(self, "_keepalive_expiry", 300.0)
             limits = httpx.Limits(
                 max_keepalive_connections=self._max_keepalive,
@@ -75,6 +76,7 @@ class SiliconFlowAPI(BaseAPI):
         通过 _recreate_client_if_safe() 检查活动请求计数，仅在没有翻译
         请求进行时才重建。流式翻译持续超过多个心跳周期也不会被中断。
         """
+
         def worker():
             while not self._heartbeat_stop_event.is_set():
                 if self._heartbeat_stop_event.wait(timeout=self._heartbeat_interval):
@@ -102,11 +104,16 @@ class SiliconFlowAPI(BaseAPI):
 
     # ── 增强 vision_query（带 debug 日志）──────────────
 
-    def vision_query(self, image_base64: str, mime_type: str, prompt: str,
-                     model_override: str = None) -> Optional[str]:
+    def vision_query(
+        self, image_base64: str, mime_type: str, prompt: str, model_override: str = None
+    ) -> str | None:
         logger.debug("[vision_query] ====== 开始视觉查询 ======")
-        logger.debug("[vision_query] mime_type=%s, base64长度=%s, model_override=%s",
-                     mime_type, len(image_base64), model_override)
+        logger.debug(
+            "[vision_query] mime_type=%s, base64长度=%s, model_override=%s",
+            mime_type,
+            len(image_base64),
+            model_override,
+        )
 
         if not self.api_key:
             logger.warning("[vision_query] API密钥为空")
@@ -142,8 +149,11 @@ class SiliconFlowAPI(BaseAPI):
                     "temperature": 0.3,
                     "stream": False,
                 }
-                logger.debug("[vision_query] model=%s, URL=%s/chat/completions",
-                             request_data["model"], self.base_url)
+                logger.debug(
+                    "[vision_query] model=%s, URL=%s/chat/completions",
+                    request_data["model"],
+                    self.base_url,
+                )
 
                 resp = client.post(
                     f"{self.base_url}/chat/completions",
@@ -159,14 +169,20 @@ class SiliconFlowAPI(BaseAPI):
                         logger.debug("[vision_query] 成功获取响应")
                         return content
                     else:
-                        logger.warning("[vision_query] 响应中没有choices: %s",
-                                       json.dumps(result, ensure_ascii=False)[:200])
+                        logger.warning(
+                            "[vision_query] 响应中没有choices: %s",
+                            json.dumps(result, ensure_ascii=False)[:200],
+                        )
                 else:
-                    logger.error("[vision_query] 视觉查询失败: status=%s, text=%s",
-                                 resp.status_code, resp.text)
+                    logger.error(
+                        "[vision_query] 视觉查询失败: status=%s, text=%s",
+                        resp.status_code,
+                        resp.text,
+                    )
 
         except Exception as e:
-            logger.error("[vision_query] 视觉查询请求异常: %s: %s",
-                         type(e).__name__, e, exc_info=True)
+            logger.error(
+                "[vision_query] 视觉查询请求异常: %s: %s", type(e).__name__, e, exc_info=True
+            )
 
         return None

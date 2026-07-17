@@ -4,7 +4,10 @@
 #
 # 用途：为图片翻译默认 Manga Provider 提供深度学习依赖。
 # 本文件与 requirements.txt 互补，仅在需要启用图片翻译功能时安装：
-#   pip install -r requirements-image-manga.txt
+#   python -m pip install -r requirements-image-manga.txt
+#
+# Python 版本：3.10 或 3.11。上游明确声明 requires-python <3.12，
+# 请使用全局 Python 3.11 执行安装和运行，不要使用项目内虚拟环境。
 #
 # 设计原则：
 # - 所有版本经过验证，确保 CPU/GPU 均可运行（默认 device=auto）。
@@ -28,7 +31,7 @@ onnxruntime>=1.16.0,<1.20
 opencv-python>=4.8.0,<4.10
 
 # NumPy：torch/opencv 共同依赖，明确锁定以避免 ABI 冲突
-numpy>=1.24.0,<2.0
+numpy==1.26.4
 
 # Pillow：图片加载、EXIF 处理（主 requirements.txt 已有，此处冗余声明以防升级冲突）
 Pillow>=9.0.0
@@ -43,20 +46,69 @@ safetensors>=0.4.0
 # Tokenizers：部分翻译器（m2m100/mbart50/nllb）使用
 tokenizers>=0.15.0,<0.20
 
-# Transformers：m2m100/mbart50/nllb 翻译器依赖
-# 注意：本项目默认使用 external_llm 翻译器（复用主 API 配置），
-# transformers 仅在用户显式切换到本地翻译器时需要。
+# Transformers：m2m100/mbart50/nllb 翻译器依赖。上游 translators 包会在
+# 导入时注册这些实现，因此默认使用 external_llm 时也必须安装。
 transformers>=4.38.0,<4.46
+sentencepiece>=0.1.99
+ctranslate2>=4.0.0
+accelerate>=0.27.0
+open-clip-torch>=2.24.0
+timm>=0.9.16
 
-# ── 文本渲染 ───────────────────────────────────────
-# Manga 渲染模块使用 Pillow + FreeType 渲染译文，无需额外包
+# ── 文本检测、OCR、修复与渲染 ───────────────────────
+einops>=0.7.0
+scikit-image>=0.22.0
+pyclipper>=1.3.0
+shapely>=2.0.0
+freetype-py>=2.4.0
+kornia>=0.7.0
+ImageHash>=4.3.0
+manga-ocr>=0.1.11
+omegaconf>=2.3.0
+python-bidi>=0.4.2
+arabic-reshaper>=3.0.0
+pyhyphen>=4.0.3
 
-# ── 辅助 ───────────────────────────────────────────
-# ultralytics：YOLO 检测（CTD detector 可选依赖，缺失时回退到 default detector）
-ultralytics>=8.1.0,<8.4
+# ── 翻译器与运行时辅助 ─────────────────────────────
+# 引擎的 translators 包会统一注册实现，因此即使默认使用 external_llm，
+# 这些轻量客户端和语言模块也必须能够被导入。
+openai==1.63.0
+httpx[http2]==0.27.2
+pydantic==2.5.0
+aiohttp>=3.9.0
+aiofiles>=23.2.1
+aioshutil>=1.5
+rich>=13.7.0
+regex>=2023.12.25
+requests>=2.31.0
+cryptography>=41.0.0
+tqdm>=4.66.0
+networkx>=3.2.0
+py3langid==0.2.2
+langdetect>=1.0.9
+langcodes[data]>=3.3.0
+editdistance>=0.8.1
+tensorboardX>=2.6.0
+websockets>=12.0
+tiktoken>=0.6.0
+colorama>=0.4.6
+python-dotenv>=1.0.0
+nest-asyncio>=1.6.0
+marshmallow>=3.20.0
+backports.cached-property>=1.0.2
+groq>=0.9.0
+deepl>=1.18.0
+google-genai>=1.0.0
+protobuf>=3.20.2,<6.0.0
+pandas>=2.1.0
+torch-summary>=1.4.5
+
+# 上游 detection 包在注册 Paddle detector 时会导入该 Rust 扩展。
+--extra-index-url https://frederik-uni.github.io/manga-image-translator-rust/python/wheels/simple/
+rusty-manga-image-translator
 
 # ── 不纳入的依赖（按需说明）────────────────────────
 # - PyQt5：manga-image-translator 的独立 GUI，本项目使用 Tkinter，不需要
 # - fastapi / uvicorn：manga-image-translator 的 web 服务模式，本项目不使用
-# - pydensecrf：mask 精化可选依赖，未安装时使用默认精化
+# - pydensecrf：mask 精化可选依赖，默认流水线不要求
 # - waifu2x-ncnn-vulkan：独立可执行文件，由 MangaProvider 在运行时探测

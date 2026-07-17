@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 轻量智能缓存（内存版）
 提供最小可用接口：get、set、get_stats、clear_all、optimize_cache
 """
 
-import time
+import hashlib
 import json
 import threading
-import hashlib
-from typing import Any, Dict, Optional
+import time
+from typing import Any, Dict
 
 
 class SmartCache:
@@ -27,16 +26,18 @@ class SmartCache:
         self._hits = 0
         self._misses = 0
 
-    def _make_key(self, text: str, context: Optional[Dict[str, Any]]) -> str:
+    def _make_key(self, text: str, context: Dict[str, Any] | None) -> str:
         ctx = context or {}
         # 使用稳定序列化保证同一上下文生成相同key
-        payload = json.dumps({"t": text, "c": ctx}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        payload = json.dumps(
+            {"t": text, "c": ctx}, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _is_expired(self, item: Dict[str, Any]) -> bool:
         return time.time() > item["expire_at"]
 
-    def get(self, text: str, context: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    def get(self, text: str, context: Dict[str, Any] | None = None) -> str | None:
         key = self._make_key(text, context)
         with self._lock:
             item = self._store.get(key)
@@ -53,7 +54,7 @@ class SmartCache:
             self._hits += 1
             return item["value"]
 
-    def set(self, text: str, value: str, context: Optional[Dict[str, Any]] = None) -> None:
+    def set(self, text: str, value: str, context: Dict[str, Any] | None = None) -> None:
         key = self._make_key(text, context)
         with self._lock:
             # PERF-009：LRU 容量控制，优先淘汰过期项，再淘汰最久未访问的项
@@ -66,7 +67,9 @@ class SmartCache:
                             del self._store[k]
                     # 仍超容量则淘汰最久未访问的
                     if len(self._store) >= self.max_memory_size:
-                        lru_key = min(self._store, key=lambda k: self._store[k].get("last_access", 0))
+                        lru_key = min(
+                            self._store, key=lambda k: self._store[k].get("last_access", 0)
+                        )
                         del self._store[lru_key]
                 except Exception:
                     pass

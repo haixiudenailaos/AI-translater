@@ -10,4 +10,3 @@ def estimate_tokens(text: str) -> int:
     ascii_chars = sum(1 for char in text if ord(char) < 128)
     non_ascii_chars = len(text) - ascii_chars
     return max(1, math.ceil(ascii_chars / 4 + non_ascii_chars))
-

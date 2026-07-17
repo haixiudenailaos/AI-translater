@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 EPUB 段落提取模块
 
@@ -16,16 +15,16 @@ EPUB 段落提取模块
 """
 
 import hashlib
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 
 from ..utils.logger import get_logger
-from .document_order import normalize_chapter_id, get_item_name
 
 logger = get_logger(__name__)
 
 # 块级标签集合：导入和导出共用，不能有两份定义
-BLOCK_TAGS = frozenset({"p", "h1", "h2", "h3", "h4", "h5", "h6", "li",
-                        "blockquote", "caption", "figcaption"})
+BLOCK_TAGS = frozenset(
+    {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "caption", "figcaption"}
+)
 
 
 def compute_source_checksum(text: str) -> str:
@@ -39,8 +38,7 @@ def is_leaf_block(node) -> bool:
     避免重复提取嵌套内容。
     """
     has_block_children = any(
-        child.name in BLOCK_TAGS
-        for child in node.find_all(True, recursive=False)
+        child.name in BLOCK_TAGS for child in node.find_all(True, recursive=False)
     )
     return not has_block_children
 
@@ -133,21 +131,23 @@ def match_existing_translation(
     seq_key = f"{chapter_id}|{block_index}"
     if seq_key in existing_by_chapter_seq:
         candidate = existing_by_chapter_seq[seq_key]
-        if (candidate.get("source_checksum") == checksum
-                or candidate.get("original_text", "").strip() == original_text.strip()):
+        if (
+            candidate.get("source_checksum") == checksum
+            or candidate.get("original_text", "").strip() == original_text.strip()
+        ):
             return candidate["translated_text"], candidate["translated_at"]
         else:
             logger.warning(
                 "位置降级匹配失败（原文已变化）: %s|%s, 旧 checksum=%s, 新 checksum=%s",
-                chapter_id, block_index,
-                candidate.get("source_checksum"), checksum,
+                chapter_id,
+                block_index,
+                candidate.get("source_checksum"),
+                checksum,
             )
 
     # 3. 原文匹配（降级）
     if original_text in existing_translations:
-        text_occurrence_count[original_text] = (
-            text_occurrence_count.get(original_text, 0) + 1
-        )
+        text_occurrence_count[original_text] = text_occurrence_count.get(original_text, 0) + 1
         record = existing_translations[original_text]
         return record["translated_text"], record["translated_at"]
 

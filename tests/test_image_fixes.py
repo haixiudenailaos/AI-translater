@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 图片相关修复测试
 
@@ -10,23 +9,28 @@
 - R2-BUG-025：OpenAI 客户端显式关闭
 """
 
-import json
 import base64
-from pathlib import Path
-from unittest.mock import MagicMock, patch, AsyncMock
+import json
+from unittest.mock import MagicMock, patch
 
-import pytest
+import httpx
+from openai import APIConnectionError
 
-from src.core.image_translator import _detect_image_format, _FORMAT_TO_EXT, ImageTranslator
 from src.core.image_text_translator import (
-    ImageTextTranslator,
-    DETECTION_NO_TEXT,
-    DETECTION_FOREIGN_TEXT,
     DETECTION_FAILED,
+    DETECTION_FOREIGN_TEXT,
+    DETECTION_NO_TEXT,
+    ImageTextTranslator,
+)
+from src.core.image_translator import (
+    _FORMAT_TO_EXT,
+    ImageTranslator,
+    _build_image_data_uri,
+    _detect_image_format,
 )
 
-
 # ── R2-BUG-016：图片格式检测 ──────────────────────────
+
 
 class TestImageFormatDetection:
     """R2-BUG-016：根据魔术字节检测真实格式"""
@@ -64,6 +68,7 @@ class TestImageFormatDetection:
 
 # ── R2-BUG-016：唯一文件名 ────────────────────────────
 
+
 class TestUniqueFilename:
     """R2-BUG-016：不同目录同名图片生成不同文件名"""
 
@@ -94,6 +99,7 @@ class TestUniqueFilename:
 
 
 # ── R2-BUG-017：检测状态区分 ──────────────────────────
+
 
 class TestDetectionStatus:
     """R2-BUG-017：区分"无外文"和"检测失败" """
@@ -162,13 +168,16 @@ class TestDetectionStatus:
 
 # ── R2-BUG-018：空结果写入文件 ────────────────────────
 
+
 class TestEmptyResultFile:
     """R2-BUG-018：空结果始终写入结果文件"""
 
     def test_write_empty_result_file(self, tmp_path):
         """空结果也写入 image_translation_result.json"""
         translator = MagicMock()
-        translator._write_image_translation_result = ImageTextTranslator._write_image_translation_result.__get__(translator)
+        translator._write_image_translation_result = (
+            ImageTextTranslator._write_image_translation_result.__get__(translator)
+        )
 
         result_map = {}
         ImageTextTranslator._write_image_translation_result(translator, tmp_path, result_map)
@@ -184,7 +193,9 @@ class TestEmptyResultFile:
     def test_write_non_empty_result_file(self, tmp_path):
         """非空结果正确写入"""
         translator = MagicMock()
-        translator._write_image_translation_result = ImageTextTranslator._write_image_translation_result.__get__(translator)
+        translator._write_image_translation_result = (
+            ImageTextTranslator._write_image_translation_result.__get__(translator)
+        )
 
         result_map = {"images/cover.jpg": "cover_abc12345_translated.png"}
         ImageTextTranslator._write_image_translation_result(translator, tmp_path, result_map)
@@ -215,6 +226,7 @@ class TestEmptyResultFile:
 
 # ── R2-BUG-018：结果文件格式兼容 ──────────────────────
 
+
 class TestResultFileCompat:
     """R2-BUG-018：新格式向后兼容"""
 
@@ -230,10 +242,7 @@ class TestResultFileCompat:
 
         # 模拟读取逻辑（与 translation_controller.py 一致）
         raw = json.loads(result_file.read_text(encoding="utf-8"))
-        if isinstance(raw, dict) and "result_map" in raw:
-            image_map = raw["result_map"]
-        else:
-            image_map = raw
+        image_map = raw["result_map"] if isinstance(raw, dict) and "result_map" in raw else raw
 
         assert image_map == {"a.jpg": "a_translated.png"}
 
@@ -244,15 +253,13 @@ class TestResultFileCompat:
         result_file.write_text(json.dumps(old_format), encoding="utf-8")
 
         raw = json.loads(result_file.read_text(encoding="utf-8"))
-        if isinstance(raw, dict) and "result_map" in raw:
-            image_map = raw["result_map"]
-        else:
-            image_map = raw
+        image_map = raw["result_map"] if isinstance(raw, dict) and "result_map" in raw else raw
 
         assert image_map == {"a.jpg": "a_translated.png"}
 
 
 # ── R2-BUG-025 / PERF-005：OpenAI 客户端复用与关闭 ────
+
 
 class TestOpenAIClientClose:
     """R2-BUG-025 / PERF-005：OpenAI 客户端复用与显式关闭"""
@@ -282,15 +289,88 @@ class TestOpenAIClientClose:
         }
 
         with patch("src.core.image_translator.OpenAI", return_value=FakeClient()):
-            with patch("src.core.image_utils.convert_to_png",
-                       return_value=("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "image/png")):
+            with patch(
+                "src.core.image_utils.convert_to_png",
+                return_value=(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+                    "image/png",
+                ),
+            ):
                 with patch("src.core.image_translator.time.sleep"):
                     translator.translate_images(
-                        str(tmp_path), "zh", None,
+                        str(tmp_path),
+                        "zh",
+                        None,
                         image_mappings_override=image_data,
                     )
 
         assert closed["called"] is False, "PERF-005：translate_images 不应关闭复用的客户端"
+
+    def test_client_uses_single_retry_layer_and_no_keepalive(self):
+        """图片客户端由外层重试，并避免复用 Windows 半失效长连接。"""
+        config_manager = MagicMock()
+        config_manager.get_volc_key.return_value = "test-key"
+        translator = ImageTranslator(config_manager)
+        fake_client = MagicMock()
+        fake_http_client = MagicMock()
+
+        with patch(
+            "src.core.image_translator.httpx.Client",
+            return_value=fake_http_client,
+        ) as http_client_cls, patch(
+            "src.core.image_translator.OpenAI",
+            return_value=fake_client,
+        ) as openai_cls:
+            assert translator._get_client() is fake_client
+
+        assert openai_cls.call_args.kwargs["max_retries"] == 0
+        assert openai_cls.call_args.kwargs["http_client"] is fake_http_client
+        limits = http_client_cls.call_args.kwargs["limits"]
+        assert limits.max_keepalive_connections == 0
+
+    def test_connection_error_rebuilds_client_before_retry(self, tmp_path):
+        """WinError 10053 后不得继续复用发生错误的连接池。"""
+        config_manager = MagicMock()
+        config_manager.get_volc_key.return_value = "test-key"
+        translator = ImageTranslator(config_manager)
+        request = httpx.Request(
+            "POST", "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+        )
+        error = APIConnectionError(request=request)
+        error.__cause__ = httpx.ReadError(
+            "[WinError 10053] connection aborted", request=request
+        )
+
+        failed_client = MagicMock()
+        failed_client.images.generate.side_effect = error
+        replacement_client = MagicMock()
+        replacement_client.images.generate.return_value = MagicMock(
+            data=[MagicMock(url="https://ark.volces.com/generated.png")]
+        )
+        translator._client = failed_client
+        translator._client_api_key = "test-key"
+        generated_image = b"\x89PNG\r\n\x1a\n" + b"x" * 128
+
+        with patch.object(
+            translator, "_get_client", return_value=replacement_client
+        ), patch(
+            "src.core.image_translator._safe_download_image",
+            return_value=generated_image,
+        ), patch("src.core.image_translator.time.sleep"):
+            result = translator._process_single_image(
+                failed_client,
+                "cover.png",
+                base64.b64encode(b"original-image").decode("ascii"),
+                "中文",
+                tmp_path,
+                mime_type="image/png",
+                original_path="images/cover.png",
+            )
+
+        assert result is not None
+        failed_client.close.assert_called_once()
+        replacement_client.images.generate.assert_called_once()
+        assert translator.last_error == ""
 
     def test_close_releases_client(self, tmp_path):
         """PERF-005：translator.close() 显式关闭客户端"""
@@ -317,11 +397,18 @@ class TestOpenAIClientClose:
         }
 
         with patch("src.core.image_translator.OpenAI", return_value=FakeClient()):
-            with patch("src.core.image_utils.convert_to_png",
-                       return_value=("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "image/png")):
+            with patch(
+                "src.core.image_utils.convert_to_png",
+                return_value=(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+                    "image/png",
+                ),
+            ):
                 with patch("src.core.image_translator.time.sleep"):
                     translator.translate_images(
-                        str(tmp_path), "zh", None,
+                        str(tmp_path),
+                        "zh",
+                        None,
                         image_mappings_override=image_data,
                     )
                     translator.close()
@@ -354,12 +441,78 @@ class TestOpenAIClientClose:
         }
 
         with patch("src.core.image_translator.OpenAI", return_value=FakeClient()):
-            with patch("src.core.image_utils.convert_to_png",
-                       return_value=("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "image/png")):
+            with patch(
+                "src.core.image_utils.convert_to_png",
+                return_value=(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+                    "image/png",
+                ),
+            ):
                 with patch("src.core.image_translator.time.sleep"):
                     translator.translate_images(
-                        str(tmp_path), "zh", None,
+                        str(tmp_path),
+                        "zh",
+                        None,
                         image_mappings_override=image_data,
                     )
 
         assert closed["called"] is False, "PERF-005：异常时不应关闭复用的客户端"
+
+    def test_generate_uses_openai_compatible_extra_body(self, tmp_path):
+        """火山专用参数应通过 OpenAI SDK 的 extra_body 传递。"""
+        config_manager = MagicMock()
+        translator = ImageTranslator(config_manager)
+        client = MagicMock()
+        client.images.generate.return_value = MagicMock(
+            data=[MagicMock(url="https://ark.volces.com/generated.png")]
+        )
+        generated_image = b"\x89PNG\r\n\x1a\n" + b"x" * 128
+
+        # P1-9：mock _safe_download_image，避免依赖其内部实现
+        with patch(
+            "src.core.image_translator._safe_download_image",
+            return_value=generated_image,
+        ):
+            result = translator._process_single_image(
+                client,
+                "cover.png",
+                base64.b64encode(b"original-image").decode("ascii"),
+                "中文",
+                tmp_path,
+                mime_type="image/png",
+                original_path="images/cover.png",
+            )
+
+        assert result is not None
+        kwargs = client.images.generate.call_args.kwargs
+        assert kwargs["response_format"] == "url"
+        assert kwargs["extra_body"]["image"].startswith("data:image/png;base64,")
+        assert kwargs["extra_body"]["watermark"] is True
+        assert "image" not in kwargs
+
+    def test_build_image_data_uri_normalizes_legacy_mime_and_padding(self):
+        """Ark receives canonical ASCII Base64 regardless of mapping legacy format."""
+        raw = base64.b64encode(b"jpeg-bytes").decode("ascii")
+        uri, mime = _build_image_data_uri(f"data:image/jpg;base64,{raw}\n", "image/jpg")
+
+        assert mime == "image/jpeg"
+        assert uri == f"data:image/jpeg;base64,{raw}"
+
+    def test_invalid_image_base64_fails_before_api_call(self, tmp_path):
+        config_manager = MagicMock()
+        translator = ImageTranslator(config_manager)
+        client = MagicMock()
+
+        result = translator._process_single_image(
+            client,
+            "cover.jpg",
+            "not-base64",
+            "中文",
+            tmp_path,
+            mime_type="image/jpeg",
+            original_path="images/cover.jpg",
+        )
+
+        assert result is None
+        assert "Base64" in translator.last_error
+        client.images.generate.assert_not_called()

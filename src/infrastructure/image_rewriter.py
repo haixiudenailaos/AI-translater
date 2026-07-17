@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 EPUB 图片重写模块
 
@@ -15,14 +14,91 @@ EPUB 图片重写模块
 - match_and_get_new_path：匹配图片路径并计算新的相对路径
 """
 
-import os
+import hashlib
+import io
+import mimetypes
+import posixpath
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from types import MethodType
+from typing import Dict, Tuple
+from urllib.parse import unquote, urlsplit
 
 from ..utils.logger import get_logger
-from .document_order import normalize_chapter_id
+from .document_order import get_item_name, normalize_chapter_id
 
 logger = get_logger(__name__)
+
+_MEDIA_TYPE_EXTENSIONS = {
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/svg+xml": ".svg",
+    "image/webp": ".webp",
+}
+
+
+def get_document_content(item) -> bytes:
+    """Return the XHTML bytes stored in the archive without ebooklib templating.
+
+    ``EpubHtml.get_content()`` rebuilds the document from ebooklib's chapter
+    template. On books loaded with ``read_epub`` that drops the original head,
+    stylesheet links, body classes and case-sensitive SVG attributes.
+    """
+    content = getattr(item, "content", None)
+    if isinstance(content, str):
+        return content.encode("utf-8")
+    if isinstance(content, bytes):
+        return content
+    return item.get_content()
+
+
+def _return_raw_document_content(item, default=None):
+    content = getattr(item, "content", None)
+    return content if content is not None else default
+
+
+def set_document_content(item, content: bytes) -> None:
+    """Make ebooklib write a complete XHTML document without rebuilding it."""
+    item.content = content
+    item.get_content = MethodType(_return_raw_document_content, item)
+
+
+def _normalize_epub_path(path: str) -> str:
+    """Normalize an EPUB-internal path without changing its root namespace."""
+    value = unquote(str(path or "")).replace("\\", "/").strip()
+    if not value:
+        return ""
+    normalized = posixpath.normpath(value)
+    if normalized == ".":
+        return ""
+    return normalized.lstrip("/")
+
+
+def _path_alias(path: str) -> str:
+    """Return a comparison alias that only removes a known package prefix."""
+    return normalize_chapter_id(_normalize_epub_path(path))
+
+
+def _paths_equivalent(left: str, right: str) -> bool:
+    left_norm = _normalize_epub_path(left)
+    right_norm = _normalize_epub_path(right)
+    if not left_norm or not right_norm:
+        return False
+    return left_norm == right_norm or _path_alias(left_norm) == _path_alias(right_norm)
+
+
+def _resolve_resource_path(src: str, doc_dir: Path) -> str:
+    """Resolve an XHTML resource reference in the same coordinate system as doc_dir."""
+    parsed = urlsplit(str(src or ""))
+    if parsed.scheme or parsed.netloc:
+        return ""
+    clean_src = _normalize_epub_path(parsed.path)
+    if not clean_src:
+        return ""
+    current_dir = _normalize_epub_path(str(doc_dir))
+    if str(parsed.path).replace("\\", "/").startswith("/"):
+        return clean_src
+    return _normalize_epub_path(posixpath.join(current_dir, clean_src))
 
 
 def match_and_get_new_path(
@@ -35,6 +111,10 @@ def match_and_get_new_path(
     R2-BUG-016：禁止仅按 basename 匹配图片，避免同名图片互换译文。
     仅允许精确匹配和路径尾部匹配（至少包含一级目录）。
 
+    EPUB 导出修复（见 docs/EPUB_EXPORT_MIXED_TEXT_AND_BLANK_PAGE_REPAIR.md 5.3.2）：
+    对 src 先拆除 URL fragment 和 query 再匹配，避免 `a.jpg#fragment`
+    或 `a.jpg?x=1` 无法匹配。
+
     Args:
         src: 原始 src 属性值
         path_mapping: {original_epub_path: new_epub_path}
@@ -44,47 +124,29 @@ def match_and_get_new_path(
         (matched: bool, new_rel_path: str)
     """
     try:
-        # 模拟绝对路径计算
-        current_dir = str(doc_dir).replace("\\", "/")
-        if current_dir == ".":
-            current_dir = ""
+        resolved_src = _resolve_resource_path(src, doc_dir)
+        if not resolved_src:
+            return False, ""
 
-        # 处理 ../
-        src_parts = src.split("/")
-        curr_parts = current_dir.split("/") if current_dir else []
-
-        while src_parts and src_parts[0] == "..":
-            src_parts.pop(0)
-            if curr_parts:
-                curr_parts.pop()
-
-        abs_src = "/".join(curr_parts + src_parts)
-        if abs_src.startswith("/"):
-            abs_src = abs_src[1:]
-
-        # 检查映射
-        matched = False
-        new_abs_path = None
-        if abs_src in path_mapping:
-            new_abs_path = path_mapping[abs_src]
-            matched = True
-        else:
-            # R2-BUG-016：路径尾部匹配（不含纯 basename）
-            src_norm = src.replace("\\", "/")
-            for orig_path, new_path in path_mapping.items():
-                orig_norm = orig_path.replace("\\", "/")
-                if orig_norm.endswith(src_norm) or src_norm.endswith(orig_norm):
-                    new_abs_path = new_path
-                    matched = True
-                    break
-
-        if matched and new_abs_path:
-            rel_path = os.path.relpath(new_abs_path, str(doc_dir))
-            rel_path = rel_path.replace("\\", "/")
+        # Only accept a unique full-path match. The old endswith comparison also
+        # matched a bare "cover.jpg" and could replace it with another directory's
+        # image of the same name.
+        matches = [
+            (orig_path, new_path)
+            for orig_path, new_path in path_mapping.items()
+            if _paths_equivalent(orig_path, resolved_src)
+        ]
+        if len(matches) > 1:
+            logger.error("图片引用匹配不唯一，保留原图: src=%s, resolved=%s", src, resolved_src)
+            return False, ""
+        if matches:
+            new_abs_path = _normalize_epub_path(matches[0][1])
+            current_dir = _normalize_epub_path(str(doc_dir)) or "."
+            rel_path = posixpath.relpath(new_abs_path, current_dir)
             return True, rel_path
 
         return False, ""
-    except Exception as e:
+    except (OSError, AttributeError, ValueError) as e:
         logger.error("match_and_get_new_path 异常: %s: %s", type(e).__name__, e, exc_info=True)
         return False, ""
 
@@ -92,54 +154,294 @@ def match_and_get_new_path(
 def add_translated_images(
     book,
     image_map: Dict[str, str],
-    local_images_dir: Path,
-) -> Dict[str, str]:
+    mapping_dir: Path,
+) -> Tuple[Dict[str, str], int]:
     """将翻译后的图片添加到 EPUB book。
+
+    EPUB 导出修复（见 docs/EPUB_EXPORT_MIXED_TEXT_AND_BLANK_PAGE_REPAIR.md 5.3.1）：
+    统一 result_map 的相对路径契约，兼容两种 provider 的输出：
+
+    - 新格式（Manga Provider）: {orig_path: "translated_images/manga/x.png"}
+      值为相对于 mapping_dir 的完整路径。
+    - 旧格式（AI Provider）: {orig_path: "x.png"}
+      值仅为文件名，文件位于 mapping_dir/images/。
 
     Args:
         book: ebooklib epub.Book 实例
-        image_map: {original_epub_path: local_new_filename}
-        local_images_dir: 本地图片目录
+        image_map: {original_epub_path: local_relative_path_or_filename}
+        mapping_dir: mapping 根目录（不再固定为 images/ 子目录）
 
     Returns:
-        path_mapping: {original_epub_path: new_epub_path}
+        (path_mapping, failed_count)
+        - path_mapping: {original_epub_path: new_epub_path} 成功添加的图片
+        - failed_count: 添加失败的图片数量（用于诊断和警告）
     """
     from ebooklib import epub
-    import mimetypes
 
     path_mapping: Dict[str, str] = {}
+    failed_images: list[tuple[str, str, str]] = []
+    protected_cover_paths = _collect_cover_image_paths(book)
 
-    for orig_path, new_filename in image_map.items():
-        local_file = local_images_dir / new_filename
-        if not local_file.exists():
-            print(f"⚠ 警告：新图片文件丢失: {local_file}")
+    for orig_path, new_path_value in image_map.items():
+        if any(_paths_equivalent(orig_path, path) for path in protected_cover_paths):
+            logger.info("封面图片保持原样，不应用批量插图翻译结果: %s", orig_path)
+            continue
+
+        # 解析本地文件路径（支持新旧两种 result_map 格式）
+        local_file = _resolve_local_image_path(mapping_dir, new_path_value)
+        if local_file is None or not local_file.exists():
+            failed_images.append((orig_path, new_path_value, "本地文件不存在"))
+            logger.error(
+                "翻译图片本地文件缺失: orig=%s, expected=%s, resolved=%s",
+                orig_path,
+                new_path_value,
+                local_file,
+            )
             continue
 
         try:
-            with open(local_file, "rb") as f:
-                img_content = f.read()
+            img_content = local_file.read_bytes()
 
-            # 构建新图片在 EPUB 中的路径（保持在同一目录下）
-            orig_p = Path(orig_path)
-            new_epub_path = str(orig_p.parent / new_filename).replace("\\", "/")
+            original_item = _find_unique_image_item(book, orig_path)
+            valid, reason = _validate_replacement_geometry(original_item, img_content)
+            if not valid:
+                failed_images.append((orig_path, new_path_value, reason))
+                logger.error("翻译图片校验失败，保留原图: orig=%s, reason=%s", orig_path, reason)
+                continue
 
-            new_id = f"img_{Path(new_filename).stem}"
+            # 规范化 EPUB 内资源路径
+            # - 使用 POSIX 分隔符
+            # - 保持原资源所在的路径坐标（不能擅自剥离 OEBPS/EPUB/OPS）
+            # - 使用实际下载文件名（保留扩展名）
+            original_epub_path = (
+                get_item_name(original_item) if original_item is not None else orig_path
+            )
+            orig_p = Path(original_epub_path)
+            detected_media_type = _detect_image_media_type(img_content)
+            media_type = (
+                detected_media_type or mimetypes.guess_type(local_file.name)[0] or "image/jpeg"
+            )
+            new_filename = _filename_for_media_type(local_file.name, media_type)
+            new_epub_path = _normalize_epub_image_path(orig_p.parent, new_filename)
+
+            # UID 基于原始 EPUB 路径哈希，确保全书唯一
+            # 旧实现使用 `img_{Path(new_filename).stem}`，
+            # 不同目录同名文件会产生重复 UID，导致 manifest 冲突。
+            new_id = _generate_image_uid(orig_path)
+
             img_item = epub.EpubImage(
                 uid=new_id,
                 file_name=new_epub_path,
-                media_type=mimetypes.guess_type(new_filename)[0] or "image/jpeg",
+                media_type=media_type,
                 content=img_content,
             )
             book.add_item(img_item)
             path_mapping[orig_path] = new_epub_path
-        except Exception as e:
-            logger.error("添加图片 %s 失败: %s: %s", new_filename, type(e).__name__, e, exc_info=True)
-            print(f"⚠ 添加图片 {new_filename} 失败: {e}")
+        except (AttributeError, TypeError, OSError) as e:
+            failed_images.append((orig_path, new_path_value, str(e)))
+            logger.error(
+                "添加图片失败: orig=%s: %s: %s",
+                orig_path,
+                type(e).__name__,
+                e,
+                exc_info=True,
+            )
 
-    return path_mapping
+    # 输出诊断记录：每张失败图片的原路径、期望路径和原因
+    if failed_images:
+        print(f"⚠ 警告：{len(failed_images)} 张翻译图片添加失败")
+        for orig, expected, reason in failed_images:
+            print(f"  - 原路径: {orig}, 期望文件: {expected}, 原因: {reason}")
+
+    return path_mapping, len(failed_images)
 
 
-def rewrite_image_references(book, path_mapping: Dict[str, str], skip_names: Optional[set] = None) -> None:
+def _resolve_local_image_path(mapping_dir: Path, new_path_value: str | None) -> Path | None:
+    """解析本地图片文件路径，兼容新旧两种 result_map 格式。
+
+    新格式（Manga Provider）: new_path_value 是相对于 mapping_dir 的路径，
+        如 "translated_images/manga/x.png"。
+    旧格式（AI Provider）: new_path_value 仅是文件名（如 "x.png"），
+        文件位于 mapping_dir/images/。
+
+    Args:
+        mapping_dir: mapping 根目录
+        new_path_value: result_map 中的值
+
+    Returns:
+        本地文件路径（调用方需检查 exists），或 None 表示路径无效
+    """
+    if not new_path_value:
+        return None
+
+    # 规范化为 POSIX 路径，并拒绝绝对路径或目录穿越。
+    value_norm = new_path_value.replace("\\", "/")
+    value_path = Path(value_norm)
+    if value_path.is_absolute() or ".." in value_path.parts:
+        logger.error("图片结果路径越出 mapping_dir，已拒绝: %s", new_path_value)
+        return None
+
+    # 优先按相对路径解析（Manga Provider 新格式）
+    candidate = mapping_dir / value_norm
+    if candidate.exists():
+        return candidate
+
+    # 兼容旧格式：值仅为文件名（无路径分隔符），文件位于 mapping_dir/images/
+    if "/" not in value_norm:
+        legacy = mapping_dir / "images" / value_norm
+        if legacy.exists():
+            return legacy
+        return legacy
+
+    # 最佳努力：返回相对路径候选（调用方检查 exists）
+    return candidate
+
+
+def _normalize_epub_image_path(parent_dir: Path, filename: str) -> str:
+    """规范化 EPUB 内部图片路径。
+
+    必须保留 parent_dir 的路径坐标。ebooklib 的 item 名称通常相对于 OPF，
+    但某些文件仍带 OEBPS/EPUB/OPS；只改一边会让 XHTML 引用越出资源目录。
+    """
+    # 拼接父目录与文件名
+    full = str(parent_dir / filename).replace("\\", "/")
+    return _normalize_epub_path(full)
+
+
+def _filename_for_media_type(filename: str, media_type: str) -> str:
+    """Keep the filename extension consistent with the actual image bytes."""
+    expected = _MEDIA_TYPE_EXTENSIONS.get(media_type)
+    if not expected:
+        return filename
+    path = Path(filename)
+    current = path.suffix.lower()
+    if media_type == "image/jpeg" and current in {".jpg", ".jpeg"}:
+        return filename
+    if current == expected:
+        return filename
+    return f"{path.stem}{expected}"
+
+
+def _detect_image_media_type(data: bytes) -> str | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    head = data[:512].lstrip().lower()
+    if head.startswith((b"<?xml", b"<svg")) and b"<svg" in head:
+        return "image/svg+xml"
+    return None
+
+
+def _find_unique_image_item(book, image_path: str):
+    matches = []
+    try:
+        items = list(book.get_items())
+    except (AttributeError, TypeError):
+        return None
+    for item in items:
+        name = get_item_name(item)
+        if name and _paths_equivalent(name, image_path):
+            matches.append(item)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.error("EPUB 中原始图片路径不唯一: %s", image_path)
+    return None
+
+
+def _collect_cover_image_paths(book) -> set[str]:
+    """Collect EPUB2/EPUB3 cover image paths so batch translation cannot replace them."""
+    try:
+        items = list(book.get_items())
+    except (AttributeError, TypeError):
+        return set()
+
+    cover_ids: set[str] = set()
+    try:
+        metadata = book.get_metadata("OPF", "cover") or []
+        for value, attrs in metadata:
+            attrs = attrs or {}
+            cover_id = attrs.get("content") or value
+            if cover_id:
+                cover_ids.add(str(cover_id))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+
+    result: set[str] = set()
+    for item in items:
+        name = get_item_name(item)
+        if not name:
+            continue
+        properties = getattr(item, "properties", []) or []
+        if isinstance(properties, str):
+            properties = properties.split()
+        item_id = getattr(item, "id", None) or getattr(item, "uid", None) or ""
+        if "cover-image" in properties or str(item_id) in cover_ids:
+            result.add(_normalize_epub_path(name))
+
+    return result
+
+
+def _validate_replacement_geometry(original_item, replacement: bytes) -> tuple[bool, str]:
+    """Reject corrupt or substantially different aspect ratios to prevent blank pages."""
+    if not replacement:
+        return False, "结果图片为空"
+    if _detect_image_media_type(replacement) is None:
+        return False, "无法识别结果图片格式"
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return True, ""
+
+    try:
+        with Image.open(io.BytesIO(replacement)) as new_image:
+            new_width, new_height = new_image.size
+            new_image.verify()
+    except Exception as exc:
+        return False, f"结果图片损坏: {exc}"
+
+    if new_width <= 0 or new_height <= 0:
+        return False, "结果图片尺寸无效"
+    if original_item is None:
+        return True, ""
+
+    try:
+        original = original_item.get_content()
+        with Image.open(io.BytesIO(original)) as old_image:
+            old_width, old_height = old_image.size
+    except Exception:
+        return True, ""
+
+    old_ratio = old_width / old_height
+    new_ratio = new_width / new_height
+    ratio_delta = abs(new_ratio / old_ratio - 1.0)
+    if ratio_delta > 0.03:
+        return False, (
+            f"结果图片宽高比与原图不一致 ({old_width}x{old_height} -> {new_width}x{new_height})"
+        )
+    return True, ""
+
+
+def _generate_image_uid(orig_path: str) -> str:
+    """基于原始 EPUB 路径生成全书唯一的图片 UID。
+
+    EPUB 导出修复（见 docs/EPUB_EXPORT_MIXED_TEXT_AND_BLANK_PAGE_REPAIR.md 5.3.2）：
+    旧实现使用 `img_{Path(new_filename).stem}`，不同目录同名文件
+    会产生重复 UID，导致 manifest 冲突。改用原始 EPUB 路径哈希。
+    """
+    path_hash = hashlib.sha256(orig_path.encode("utf-8")).hexdigest()[:12]
+    return f"img_{path_hash}"
+
+
+def rewrite_image_references(
+    book, path_mapping: Dict[str, str], skip_names: set | None = None
+) -> None:
     """替换文档中的图片引用（img 标签和 SVG image 标签）。
 
     Args:
@@ -158,8 +460,8 @@ def rewrite_image_references(book, path_mapping: Dict[str, str], skip_names: Opt
         if skip_names and doc_name in skip_names:
             continue  # PERF-007：已在导出循环中处理
         try:
-            content = item.get_content().decode("utf-8", errors="ignore")
-            soup = BeautifulSoup(content, "html.parser")
+            content = get_document_content(item).decode("utf-8", errors="ignore")
+            soup = BeautifulSoup(content, "xml")
             modified = False
 
             doc_path = Path(doc_name)
@@ -187,9 +489,11 @@ def rewrite_image_references(book, path_mapping: Dict[str, str], skip_names: Opt
                         modified = True
 
             if modified:
-                item.set_content(str(soup).encode("utf-8"))
-        except Exception as e:
-            logger.error("处理图片引用失败 (%s): %s: %s", item.get_name(), type(e).__name__, e, exc_info=True)
+                set_document_content(item, str(soup).encode("utf-8"))
+        except (AttributeError, TypeError) as e:
+            logger.error(
+                "处理图片引用失败 (%s): %s: %s", item.get_name(), type(e).__name__, e, exc_info=True
+            )
             print(f"⚠ 处理图片引用失败 ({item.get_name()}): {e}")
 
 
@@ -201,7 +505,7 @@ def inject_figcaption(
     """注入图片文字翻译注释（figcaption）。
 
     R2-BUG-016：禁止仅按 basename 匹配图片，避免同名图片互换注释。
-    优先完整路径匹配，降级到路径尾部匹配，再降级到相对路径解析匹配。
+    与图片资源重写共用相同的文档相对路径解析和唯一匹配规则。
 
     Args:
         soup: BeautifulSoup 文档对象
@@ -211,36 +515,34 @@ def inject_figcaption(
     if not image_text_map:
         return
 
+    # 独立插图页通常按整页高度排版。向这类页面追加 figcaption 会让内容
+    # 超出单页，阅读器会把溢出区域分页成插图前后的空白页。
+    if _is_image_only_document(soup):
+        logger.debug("纯图片页保持原始 DOM，不注入图片文字注释: %s", doc_name)
+        return
+
     for img in soup.find_all("img"):
         src = img.get("src", "")
         if not src:
             continue
 
-        matched_key = None
-        doc_name_norm = normalize_chapter_id(doc_name)
-        for img_path in image_text_map:
-            # 1. 完整路径匹配
-            if img_path == src:
-                matched_key = img_path
-                break
-            # 2. 路径尾部匹配
-            img_path_norm = img_path.replace("\\", "/")
-            src_norm = src.replace("\\", "/")
-            if img_path_norm.endswith(src_norm) or src_norm.endswith(img_path_norm):
-                matched_key = img_path
-                break
-            # 3. 解析相对路径后完整匹配
-            try:
-                resolved = os.path.normpath(
-                    os.path.join(os.path.dirname(doc_name_norm), src_norm)
-                ).replace("\\", "/")
-                if resolved == img_path_norm:
-                    matched_key = img_path
-                    break
-            except Exception:
-                pass
+        resolved_src = _resolve_resource_path(src, Path(doc_name).parent)
+        if not resolved_src:
+            continue
+
+        matches = [
+            img_path for img_path in image_text_map if _paths_equivalent(img_path, resolved_src)
+        ]
+        if len(matches) != 1:
+            if len(matches) > 1:
+                logger.error("图片注释匹配不唯一，已跳过: %s", src)
+            continue
+        matched_key = matches[0]
 
         if matched_key and image_text_map[matched_key].get("translated_text"):
+            sibling = img.find_next_sibling()
+            if sibling is not None and sibling.name == "figcaption":
+                continue
             trans_info = image_text_map[matched_key]
             translated = trans_info["translated_text"]
             original = trans_info.get("original_text", "")
@@ -255,3 +557,75 @@ def inject_figcaption(
                 "font-style: italic;"
             )
             img.insert_after(figcaption)
+
+
+def _is_image_only_document(soup) -> bool:
+    """Return whether the body is a fixed/full-page image without visible text."""
+    body = soup.find("body")
+    if body is None:
+        return False
+    has_image = body.find("img") is not None or body.find("image") is not None
+    return has_image and not _has_visible_body_text(body)
+
+
+_NON_VISIBLE_TEXT_CONTAINERS = {
+    "desc",
+    "metadata",
+    "noscript",
+    "script",
+    "style",
+    "template",
+    "title",
+}
+_HIDDEN_CLASS_NAMES = {
+    "display-none",
+    "hidden",
+    "sr-only",
+    "visually-hidden",
+}
+_ZERO_WIDTH_CHARACTERS = "\u200b\u200c\u200d\ufeff"
+_ZERO_WIDTH_TRANSLATION = str.maketrans("", "", _ZERO_WIDTH_CHARACTERS)
+
+
+def _has_visible_body_text(body) -> bool:
+    """Return whether body contains text that is intended to be rendered.
+
+    Full-page SVG illustrations commonly contain ``title`` or ``desc`` nodes for
+    accessibility. Some publishers also include hidden running titles. Neither
+    should turn an illustration page into a text page and enable figcaption
+    injection, which can overflow the fixed page and create blank pages.
+    """
+    for text_node in body.find_all(string=True):
+        text = str(text_node).translate(_ZERO_WIDTH_TRANSLATION)
+        if not text.strip():
+            continue
+
+        element = getattr(text_node, "parent", None)
+        hidden = False
+        while element is not None and element is not body:
+            name = str(getattr(element, "name", "") or "").lower()
+            if name in _NON_VISIBLE_TEXT_CONTAINERS:
+                hidden = True
+                break
+
+            attrs = getattr(element, "attrs", {}) or {}
+            classes = attrs.get("class", [])
+            if isinstance(classes, str):
+                classes = classes.split()
+            if _HIDDEN_CLASS_NAMES.intersection(str(value).lower() for value in classes):
+                hidden = True
+                break
+            if element.has_attr("hidden") or str(attrs.get("aria-hidden", "")).lower() == "true":
+                hidden = True
+                break
+
+            inline_style = "".join(str(attrs.get("style", "")).lower().split())
+            if "display:none" in inline_style or "visibility:hidden" in inline_style:
+                hidden = True
+                break
+            element = getattr(element, "parent", None)
+
+        if not hidden:
+            return True
+
+    return False

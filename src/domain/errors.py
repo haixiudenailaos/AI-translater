@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 领域异常定义
 
@@ -12,7 +11,7 @@
 - 不在此处导入任何项目内模块，保持领域层纯净。
 """
 
-from typing import List, Optional
+from typing import List
 
 
 class TranslationRequestError(Exception):
@@ -24,13 +23,22 @@ class TranslationRequestError(Exception):
     Attributes:
         failed_indices: 该批次内失败的行索引（0-based，相对于批次起始）
         status_code: HTTP 状态码（如适用），用于诊断
+        retry_after_seconds: 429 响应的 ``Retry-After`` 秒数（如适用），
+            供共享 ``ProviderLimiter`` 在 Provider 范围统一 cooldown。
+            解析失败或非 429 时为 ``None``。
     """
 
-    def __init__(self, message: str, failed_indices: Optional[List[int]] = None,
-                 status_code: Optional[int] = None):
+    def __init__(
+        self,
+        message: str,
+        failed_indices: List[int] | None = None,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ):
         super().__init__(message)
         self.failed_indices = failed_indices or []
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class TranslationCancelled(Exception):
@@ -45,8 +53,7 @@ class TranslationCancelled(Exception):
         partial_lines: 取消前已确认的部分译文（流式场景下可能有部分行已完成）
     """
 
-    def __init__(self, message: str = "翻译已被用户取消",
-                 partial_lines: Optional[List[str]] = None):
+    def __init__(self, message: str = "翻译已被用户取消", partial_lines: List[str] | None = None):
         super().__init__(message)
         self.partial_lines = partial_lines or []
 
@@ -62,8 +69,12 @@ class EpubFingerprintMismatchError(Exception):
         actual: 当前源文件的实际指纹
     """
 
-    def __init__(self, message: str = "源 EPUB 文件已变化，请重新关联",
-                 expected: Optional[str] = None, actual: Optional[str] = None):
+    def __init__(
+        self,
+        message: str = "源 EPUB 文件已变化，请重新关联",
+        expected: str | None = None,
+        actual: str | None = None,
+    ):
         super().__init__(message)
         self.expected = expected
         self.actual = actual
@@ -79,8 +90,7 @@ class SegmentMappingError(Exception):
         reason: 具体原因（"source_changed" / "ambiguous_id" / "missing_locator"）
     """
 
-    def __init__(self, message: str, segment_id: Optional[str] = None,
-                 reason: Optional[str] = None):
+    def __init__(self, message: str, segment_id: str | None = None, reason: str | None = None):
         super().__init__(message)
         self.segment_id = segment_id
         self.reason = reason
@@ -102,4 +112,35 @@ class ImageTranslationConfigError(Exception):
 
     在执行前校验失败时抛出，不静默回退为中文或切换 AI Provider。
     """
+
     pass
+
+
+class ImageManifestPersistenceError(Exception):
+    """图片翻译 manifest 持久化失败异常（P1-1）
+
+    Provider 执行成功但结果保存失败时抛出，替代旧的"吞掉异常并返回成功"。
+
+    调用方（UI）必须捕获并：
+    - 不得向用户报告整体成功；
+    - 提示"翻译已完成，但结果保存失败"；
+    - 提供重试保存入口（调用 Service.save_manifest）。
+
+    Attributes:
+        partial_result: Provider 已返回的成功结果（可能含完整 result_map），
+                        供 UI 展示已完成内容并支持重试保存。
+        mapping_dir: 失败时的映射目录，用于重试。
+        run_at: 失败时记录的运行时间戳。
+    """
+
+    def __init__(
+        self,
+        message: str = "图片翻译已完成，但结果保存失败",
+        partial_result: object | None = None,
+        mapping_dir: object | None = None,
+        run_at: str = "",
+    ):
+        super().__init__(message)
+        self.partial_result = partial_result
+        self.mapping_dir = mapping_dir
+        self.run_at = run_at

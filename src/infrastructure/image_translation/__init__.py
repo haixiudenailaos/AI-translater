@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 图片翻译基础设施层
 
@@ -7,8 +6,8 @@
 本包内的 Provider。
 """
 
+from .manifest_repository import ManifestData, ManifestRepository
 from .registry import ImageTranslationProviderRegistry, get_registry
-from .manifest_repository import ManifestRepository, ManifestData
 
 __all__ = [
     "ImageTranslationProviderRegistry",

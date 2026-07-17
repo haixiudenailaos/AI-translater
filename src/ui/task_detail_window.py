@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 任务详情窗口
 展示单个翻译任务的原文/译文对照表，支持双击编辑译文。
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox, ttk
+
 from .table_editor import TableCellEditor
 
 
 class TaskDetailWindow:
     """任务详情窗口：展示原文/译文对照，实时刷新进度"""
 
+    # 队列翻译并发优化阶段 4：覆盖新状态机的全部状态
     STATUS_MAP = {
         "pending": "等待中",
+        "ready": "准备中",
         "running": "翻译中",
+        "pause_requested": "暂停中",
         "paused": "已暂停",
         "completed": "已完成",
         "partial": "部分完成",
@@ -30,6 +33,12 @@ class TaskDetailWindow:
         self.win.title("任务详情")
         self.win.geometry("900x600")
         self.win.minsize(700, 400)
+
+        # P1-7：增量刷新缓存，避免每 500ms 扫描全部行
+        # _row_metadata 存 (行号, 原文) 避免每次刷新都读 table.item()
+        # _last_target_snapshot 存上次写入表格的译文，用于 diff 只更新变化行
+        self._row_metadata: list[tuple[int, str]] = []
+        self._last_target_snapshot: list[str] = []
 
         self._build_ui()
         self._load_data()
@@ -75,7 +84,9 @@ class TaskDetailWindow:
         table_frame.pack(fill=tk.BOTH, expand=True)
 
         columns = ("line_number", "source_text", "target_text")
-        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        self.table = ttk.Treeview(
+            table_frame, columns=columns, show="headings", selectmode="browse"
+        )
         self.table.heading("line_number", text="行号")
         self.table.heading("source_text", text="原文")
         self.table.heading("target_text", text="译文")
@@ -105,9 +116,14 @@ class TaskDetailWindow:
             return
         self.file_label.config(text=task.file_name)
         self.table.delete(*self.table.get_children())
+        # P1-7：初始化增量刷新缓存，保持快照与表格内容一致
+        self._row_metadata = []
+        self._last_target_snapshot = []
         for i, src in enumerate(task.source_lines):
             tgt = task.target_lines[i] if i < len(task.target_lines) else ""
             self.table.insert("", "end", values=(i + 1, src, tgt))
+            self._row_metadata.append((i + 1, src))
+            self._last_target_snapshot.append(tgt)
         self._refresh_status()
 
     def _schedule_refresh(self):
@@ -131,7 +147,9 @@ class TaskDetailWindow:
         is_pending = task.status == "pending"
         is_partial = task.status == "partial"
         # R2-BUG-011：partial 状态允许重新开始以继续翻译失败行
-        self.start_btn.config(state=tk.NORMAL if (is_pending or is_paused or is_partial) else tk.DISABLED)
+        self.start_btn.config(
+            state=tk.NORMAL if (is_pending or is_paused or is_partial) else tk.DISABLED
+        )
         self.pause_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
         can_cancel = task.status not in ("completed", "cancelled")
         self.cancel_btn.config(state=tk.NORMAL if can_cancel else tk.DISABLED)
@@ -140,14 +158,27 @@ class TaskDetailWindow:
         task = self.manager.get_task(self.task_id)
         if not task:
             return
+        targets = task.target_lines
+        snapshot = self._last_target_snapshot
         items = self.table.get_children()
-        for i, item in enumerate(items):
-            if i < len(task.target_lines):
-                tgt = task.target_lines[i]
-                vals = list(self.table.item(item)["values"])
-                if str(vals[2]) != str(tgt):
-                    vals[2] = tgt
-                    self.table.item(item, values=vals)
+        n_items = len(items)
+        n_snap = len(snapshot)
+        n_tgt = len(targets)
+        # P1-7：增量 diff——只更新发生变化的行，避免对 10,000 行文档每 500ms 全量扫描。
+        # 不再调用 table.item(item)["values"] 读取，直接用缓存的行号/原文构造新值。
+        upper = min(n_items, n_snap, n_tgt)
+        for i in range(upper):
+            tgt = targets[i]
+            if snapshot[i] != tgt:
+                line_no, src = self._row_metadata[i]
+                self.table.item(items[i], values=(line_no, src, tgt))
+                snapshot[i] = tgt
+        # 处理 target_lines 增长（理论上 _load_data 已对齐，此处兜底）
+        if n_tgt > n_snap and n_items >= n_tgt:
+            for i in range(n_snap, n_tgt):
+                line_no, src = self._row_metadata[i]
+                self.table.item(items[i], values=(line_no, src, targets[i]))
+                snapshot.append(targets[i])
 
     # ── 操作 ────────────────────────────────────────
     def _on_start(self):
@@ -164,7 +195,12 @@ class TaskDetailWindow:
         self.manager.cancel_task(self.task_id)
 
     def _on_cell_edited(self, item_id, col_idx, old_value, new_value):
-        """TableCellEditor 回调：同步编辑结果到 task 数据并持久化（R2-BUG-015）"""
+        """P0-2：TableCellEditor 回调——更新 Treeview、Coordinator 内部数据并持久化。
+
+        不再修改 get_task 返回的快照副本（那是不可变视图），
+        而是通过 manager.update_task_line 直接更新 Coordinator 内部 _TaskSlot，
+        确保 save_task_now 持久化的是用户编辑后的新值。
+        """
         values = self.table.item(item_id)["values"]
         row_idx = int(values[0]) - 1
         task = self.manager.get_task(self.task_id)
@@ -172,21 +208,30 @@ class TaskDetailWindow:
             return
         # R2-BUG-015：运行中任务不允许编辑，避免进度回调覆盖用户编辑
         if task.status == "running":
-            vals = list(self.table.item(item_id)["values"])
-            vals[col_idx] = old_value
-            self.table.item(item_id, values=vals)
             messagebox.showwarning(
                 "编辑受限",
                 "任务正在翻译中，请先暂停或取消后再编辑译文。",
                 parent=self.win,
             )
             return
-        # 保存新值到内存
-        task.target_lines[row_idx] = new_value
-        # R2-BUG-015：持久化到文件，失败时恢复旧值
+        # P0-2：更新 Treeview（TableCellEditor 不再直接修改树）
+        vals = list(self.table.item(item_id)["values"])
+        vals[col_idx] = new_value
+        self.table.item(item_id, values=vals)
+        # P0-2：通过 manager 更新 Coordinator 内部数据，而非修改快照副本
+        if not self.manager.update_task_line(self.task_id, row_idx, new_value):
+            # 更新失败，恢复旧值
+            vals[col_idx] = old_value
+            self.table.item(item_id, values=vals)
+            messagebox.showwarning(
+                "更新失败",
+                "译文更新失败，任务可能已被清理。已恢复原值。",
+                parent=self.win,
+            )
+            return
+        # P0-2：持久化到文件，失败时恢复旧值
         if not self.manager.save_task(self.task_id):
-            task.target_lines[row_idx] = old_value
-            vals = list(self.table.item(item_id)["values"])
+            self.manager.update_task_line(self.task_id, row_idx, old_value)
             vals[col_idx] = old_value
             self.table.item(item_id, values=vals)
             messagebox.showwarning(
@@ -194,3 +239,7 @@ class TaskDetailWindow:
                 "译文保存失败，已恢复原值。请检查文件权限或磁盘空间。",
                 parent=self.win,
             )
+            return
+        # P1-7：同步增量刷新快照，避免下次 500ms 刷新冗余重写用户刚编辑的行
+        if 0 <= row_idx < len(self._last_target_snapshot):
+            self._last_target_snapshot[row_idx] = new_value

@@ -30,8 +30,7 @@ class UsageStatistics:
         self.output_tokens += max(0, output_tokens)
         if input_price_per_million is not None and output_price_per_million is not None:
             self.estimated_cost += (
-                input_tokens * input_price_per_million
-                + output_tokens * output_price_per_million
+                input_tokens * input_price_per_million + output_tokens * output_price_per_million
             ) / 1_000_000
 
     def record_retry(self) -> None:

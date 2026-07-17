@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 翻译领域模型
 
@@ -17,7 +16,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Tuple
 
 
 class OperationStatus(str, Enum):
@@ -26,10 +25,11 @@ class OperationStatus(str, Enum):
     所有层（domain / application / infrastructure / presentation）共享
     同一套状态语义，禁止用字符串字面量比较。
     """
-    SUCCEEDED = "succeeded"   # 所有必需行成功
-    PARTIAL = "partial"       # 部分成功，必须保留成功结果并向用户提示
-    CANCELLED = "cancelled"   # 用户停止，不能显示失败或完成
-    FAILED = "failed"         # 重试耗尽，不能调用完成回调
+
+    SUCCEEDED = "succeeded"  # 所有必需行成功
+    PARTIAL = "partial"  # 部分成功，必须保留成功结果并向用户提示
+    CANCELLED = "cancelled"  # 用户停止，不能显示失败或完成
+    FAILED = "failed"  # 重试耗尽，不能调用完成回调
 
 
 @dataclass(frozen=True)
@@ -47,6 +47,7 @@ class TranslationOptions:
         temperature: 采样温度
         max_tokens: 单次请求最大 token 数
     """
+
     target_language: str
     model_name: str
     batch_size: int = 20
@@ -67,6 +68,7 @@ class TranslationProgress:
         batch_start: 当前批次起始行号（0-based，全局）
         preview_lines: 当前批次已完成的译文预览（tuple，不可变）
     """
+
     completed: int
     total: int
     batch_start: int
@@ -88,10 +90,11 @@ class TranslationResult:
         failed_indices: 失败行索引元组（0-based）
         error_message: 最后一次错误消息（失败时提供）
     """
+
     status: OperationStatus
     lines: Tuple[str, ...]
     failed_indices: Tuple[int, ...] = ()
-    error_message: Optional[str] = None
+    error_message: str | None = None
 
     @property
     def is_success(self) -> bool:

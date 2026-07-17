@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 图片翻译运行时
 
@@ -15,7 +14,7 @@ ImageTranslationProvider.translate() 协议内执行。
 
 import asyncio
 import threading
-from typing import Awaitable, Callable, TypeVar
+from typing import Awaitable, TypeVar
 
 from ...utils.logger import get_logger
 
@@ -48,9 +47,7 @@ class MangaRuntime:
                 asyncio.set_event_loop(self._loop)
                 self._loop.run_forever()
 
-            self._thread = threading.Thread(
-                target=_run, name="manga-runtime", daemon=True
-            )
+            self._thread = threading.Thread(target=_run, name="manga-runtime", daemon=True)
             self._thread.start()
             self._started = True
 

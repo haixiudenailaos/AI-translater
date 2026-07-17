@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 翻译结果语义模块（兼容层）
 
@@ -19,11 +18,12 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
+
+from ..domain.errors import TranslationCancelled, TranslationRequestError
 
 # 领域层 re-export
 from ..domain.translation import OperationStatus
-from ..domain.errors import TranslationRequestError, TranslationCancelled
 
 # 兼容别名：旧代码使用 TranslationStatus，新代码应直接用 OperationStatus
 TranslationStatus = OperationStatus
@@ -42,10 +42,11 @@ class BatchTranslationResult:
         failed_indices: 失败行索引（0-based）
         error_message: 最后一次错误消息（失败时提供）
     """
+
     status: OperationStatus
     lines: List[str]
     failed_indices: List[int] = field(default_factory=list)
-    error_message: Optional[str] = None
+    error_message: str | None = None
 
     @property
     def is_success(self) -> bool:
@@ -61,8 +62,8 @@ class BatchTranslationResult:
 
 
 __all__ = [
-    "TranslationStatus",        # = OperationStatus 别名
-    "BatchTranslationResult",   # list 版本（旧）
+    "TranslationStatus",  # = OperationStatus 别名
+    "BatchTranslationResult",  # list 版本（旧）
     "TranslationRequestError",
     "TranslationCancelled",
     # 以下为领域层类型的再导出，方便单点导入

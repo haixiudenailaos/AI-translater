@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 R2-BUG-022：原子写入使用唯一临时文件
 
@@ -11,12 +10,9 @@ R2-BUG-022：原子写入使用唯一临时文件
 
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
-import pytest
-
-from src.utils.file_handler import write_text_atomic, write_json_atomic
+from src.utils.file_handler import write_json_atomic, write_text_atomic
 
 
 class TestAtomicWriteUniqueTemp:
