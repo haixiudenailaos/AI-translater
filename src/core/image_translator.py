@@ -33,7 +33,7 @@ from ..config.volcengine_image import (
     VOLCENGINE_IMAGE_MODEL_HIGH_QUALITY,
 )
 from ..domain.errors import ImageTranslationCancelled
-from ..infrastructure.image_asset_store import load_image_base64, load_image_bytes
+from ..infrastructure.image_asset_store import load_image_bytes
 
 # P2-7：移除模块导入期 logging.basicConfig() 副作用。
 # 全局日志配置应由 src.utils.logger.setup_logging 在组合根中显式完成，
@@ -784,9 +784,7 @@ class ImageTranslator:
                 logger.error("[_process_single_image] %s", self._last_error)
                 return None
             except AuthenticationError:
-                self._last_error = (
-                    "火山方舟 API Key 无效或格式错误，请在设置中重新保存。"
-                )
+                self._last_error = "火山方舟 API Key 无效或格式错误，请在设置中重新保存。"
                 logger.error("[_process_single_image] 火山方舟鉴权失败")
                 return None
             except (APIConnectionError, APITimeoutError) as e:
@@ -814,9 +812,7 @@ class ImageTranslator:
                     exc_info=True,
                 )
                 if attempt == self.max_retries - 1:
-                    self._last_error = (
-                        f"火山方舟图片生成失败: {type(e).__name__}: {str(e)[:160]}"
-                    )
+                    self._last_error = f"火山方舟图片生成失败: {type(e).__name__}: {str(e)[:160]}"
                     print(
                         f"Failed to process {original_name} after {self.max_retries} attempts: {e}"
                     )

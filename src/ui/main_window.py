@@ -442,12 +442,8 @@ class MainWindow:
         # Enter：打开上下文编辑器（与 F2 等价，符合桌面列表交互直觉）
         self.translation_table.bind("<Return>", lambda _event: self.open_context_editor())
         # Shift+F10 与 Menu 键：等价于右键，弹出上下文菜单
-        self.translation_table.bind(
-            "<Shift-F10>", self._show_context_menu_from_keyboard
-        )
-        self.translation_table.bind(
-            "<App>", self._show_context_menu_from_keyboard
-        )
+        self.translation_table.bind("<Shift-F10>", self._show_context_menu_from_keyboard)
+        self.translation_table.bind("<App>", self._show_context_menu_from_keyboard)
         # Delete：清空选中行译文（多选时弹确认，避免误删）
         self.translation_table.bind("<Delete>", lambda _event: self.clear_selected_translations())
 
@@ -1076,11 +1072,15 @@ class MainWindow:
             output_price_per_million=api_config.get("output_price_per_million"),
         )
         self._last_preflight_report = report
-        errors = [issue.message for issue in report.issues if issue.severity is PreflightSeverity.ERROR]
+        errors = [
+            issue.message for issue in report.issues if issue.severity is PreflightSeverity.ERROR
+        ]
         if errors:
             messagebox.showerror("翻译预检", "\n".join(errors), parent=self.root)
             return False
-        warnings = [issue.message for issue in report.issues if issue.severity is PreflightSeverity.WARNING]
+        warnings = [
+            issue.message for issue in report.issues if issue.severity is PreflightSeverity.WARNING
+        ]
         if warnings and app_config.get("preflight_confirm_warnings", True):
             approved = messagebox.askyesno(
                 "翻译预检",
@@ -1221,9 +1221,7 @@ class MainWindow:
             image_state = tk.DISABLED if self._image_translation_busy else menu_state
             # P0-2：Text Edition 下禁用本地 Manga 入口。
             manga_state = image_state if self._manga_enabled() else tk.DISABLED
-            self.more_actions_menu.entryconfigure(
-                self._local_image_action_index, state=manga_state
-            )
+            self.more_actions_menu.entryconfigure(self._local_image_action_index, state=manga_state)
             self.more_actions_menu.entryconfigure(self._ai_image_action_index, state=image_state)
         if hasattr(self, "local_image_translate_btn"):
             image_state = tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
@@ -1236,9 +1234,7 @@ class MainWindow:
                 tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
             )
             # P0-2：Text Edition 下禁用本地 Manga 入口。
-            project_manga_state = (
-                project_image_state if self._manga_enabled() else tk.DISABLED
-            )
+            project_manga_state = project_image_state if self._manga_enabled() else tk.DISABLED
             self.project_menu.entryconfigure(
                 self._project_local_image_action_index, state=project_manga_state
             )
@@ -1422,8 +1418,7 @@ class MainWindow:
             return True
         should_stop = messagebox.askyesno(
             "翻译正在进行",
-            "当前翻译仍在运行。是否停止当前翻译并切换到新文档？\n\n"
-            "已完成的译文会保留并触发保存。",
+            "当前翻译仍在运行。是否停止当前翻译并切换到新文档？\n\n已完成的译文会保留并触发保存。",
             icon=messagebox.WARNING,
             parent=self.root,
         )
@@ -1568,7 +1563,9 @@ class MainWindow:
             except Exception as exc:
                 logger.debug("读取后台队列状态失败: %s", exc)
         if hasattr(self.root, "after"):
-            self._queue_status_after_id = self.root.after(500, self._schedule_queue_background_status)
+            self._queue_status_after_id = self.root.after(
+                500, self._schedule_queue_background_status
+            )
 
     def open_support_dialog(self):
         win = tk.Toplevel(self.root)
@@ -1611,8 +1608,8 @@ class MainWindow:
         Returns:
             ``"new"`` / ``"map"`` / ``"discard"`` 之一。
         """
-        from tkinter import messagebox as _msgbox
         from pathlib import Path
+        from tkinter import messagebox as _msgbox
 
         file_name = Path(str(info.get("file_path", ""))).name
         old_lines = info.get("old_total_lines", "?")

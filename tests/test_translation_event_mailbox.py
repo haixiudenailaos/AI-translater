@@ -613,7 +613,9 @@ def test_pump_drains_all_events_and_keeps_fixed_interval():
 
     pump.start()
     for batch_start in range(3):
-        mailbox.publish(_make_event(kind=TranslationEventKind.BATCH_COMPLETED, batch_start=batch_start))
+        mailbox.publish(
+            _make_event(kind=TranslationEventKind.BATCH_COMPLETED, batch_start=batch_start)
+        )
 
     root.trigger_next()
     assert [event.batch_start for event in rendered] == [0, 1, 2]

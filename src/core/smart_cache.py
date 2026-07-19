@@ -26,7 +26,7 @@ class SmartCache:
         self.max_entries = max_entries
         self.ttl_seconds = ttl_hours * 3600
 
-        self._store: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._store: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0

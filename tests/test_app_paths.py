@@ -7,7 +7,6 @@
 3. 显式参数优先级高于环境变量。
 """
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest

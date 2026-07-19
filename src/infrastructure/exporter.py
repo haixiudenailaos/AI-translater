@@ -341,7 +341,9 @@ def _ensure_toc_link_ids(book, epub_module) -> None:
             suffix = 1
             while candidate in used_ids:
                 suffix += 1
-                candidate = f"nav_{hashlib.sha256(f'{fingerprint}:{suffix}'.encode('utf-8')).hexdigest()[:16]}"
+                candidate = (
+                    f"nav_{hashlib.sha256(f'{fingerprint}:{suffix}'.encode()).hexdigest()[:16]}"
+                )
             item.uid = candidate
             used_ids.add(candidate)
 

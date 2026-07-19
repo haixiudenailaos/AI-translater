@@ -146,9 +146,7 @@ class ConcurrentWindow:
         toolbar.pack(fill=tk.X, pady=(0, 6))
 
         self.add_files_btn = ttk.Button(toolbar, text="添加文件", command=self._add_files)
-        self.add_files_btn.pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
+        self.add_files_btn.pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(toolbar, text="全部开始", command=self._start_all).pack(
             side=tk.LEFT, padx=(0, 4)
         )
@@ -177,7 +175,15 @@ class ConcurrentWindow:
 
         # 任务列表
         # P1-UX-3：新增 failed / error_summary 列展示失败行数与脱敏错误摘要
-        cols = ("task_id", "file_name", "status", "progress", "failed", "error_summary", "in_flight")
+        cols = (
+            "task_id",
+            "file_name",
+            "status",
+            "progress",
+            "failed",
+            "error_summary",
+            "in_flight",
+        )
         self.tree = ttk.Treeview(main, columns=cols, show="headings", selectmode="browse")
         self.tree.heading("task_id", text="ID")
         self.tree.heading("file_name", text="文件名")
@@ -527,7 +533,9 @@ class ConcurrentWindow:
                 return True
 
             try:
-                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="queue-import") as executor:
+                with ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="queue-import"
+                ) as executor:
                     while len(in_flight) < 2 and submit_next(executor):
                         pass
                     while in_flight:
@@ -605,7 +613,15 @@ class ConcurrentWindow:
             1
             for t in tasks
             if t.status
-            in ("running", "ready", "preparing", "pending", "pause_requested", "paused", "finalizing")
+            in (
+                "running",
+                "ready",
+                "preparing",
+                "pending",
+                "pause_requested",
+                "paused",
+                "finalizing",
+            )
         )
         finished = sum(1 for t in tasks if t.status in ("cancelled", "error", "partial"))
 
@@ -705,9 +721,7 @@ class ConcurrentWindow:
                         # P1-9：进度通过邮箱投递，零跨线程 Tk 调用
                         self._submit_export_ui(
                             run_id,
-                            lambda i=idx: self.win.title(
-                                f"队列翻译管理 - 正在导出 {i}/{total}"
-                            ),
+                            lambda i=idx: self.win.title(f"队列翻译管理 - 正在导出 {i}/{total}"),
                         )
 
                         if task.file_type == "txt":
@@ -801,6 +815,7 @@ class ConcurrentWindow:
 
         与 ``_submit_ui`` 同构，但比对 ``_export_run_id``。
         """
+
         def guarded():
             if self._export_run_id != run_id:
                 return
@@ -1020,6 +1035,7 @@ class ConcurrentWindow:
         不匹配说明是旧 run 的迟到回调（窗口已开始新一轮或已结束），安全跳过。
         邮箱关闭后（窗口销毁）submit 也会被丢弃并计数。
         """
+
         def guarded():
             if self._image_translate_run_id != run_id:
                 return

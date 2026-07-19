@@ -18,11 +18,11 @@ from typing import Any, Callable, Dict, Generator, List
 
 import httpx
 
-from ..core.smart_cache import SmartCache
 from ..config.translation_profile import normalize_openai_base_url
+from ..core.smart_cache import SmartCache
 from ..domain.errors import TranslationRequestError
-from ..utils.logger import get_logger
 from ..utils.log_sanitizer import sanitize_for_log
+from ..utils.logger import get_logger
 from ..utils.token_estimator import estimate_tokens
 
 logger = get_logger(__name__)
@@ -60,11 +60,7 @@ class BaseAPI:
         # Validate at the transport boundary too.  Callers can construct an
         # API directly from a file, queue task, or migration and must not be
         # able to send a Bearer token to a remote plain-HTTP endpoint.
-        self.base_url = (
-            normalize_openai_base_url(raw_base_url)
-            if raw_base_url
-            else ""
-        )
+        self.base_url = normalize_openai_base_url(raw_base_url) if raw_base_url else ""
         self.api_key = config.get("api_key", "").strip()
         self.model_name = config.get("model_name", self.DEFAULT_MODEL)
         self.max_tokens = config.get("max_tokens", 2048)

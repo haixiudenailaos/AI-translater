@@ -899,9 +899,7 @@ class TranslatorEngine:
                         cache_glossary_prompt = self.config_manager.get_glossary_prompt()
                         cache_temperature = float(api_cfg.get("temperature", 0.3))
                         cache_prompt_version = hashlib.sha256(
-                            f"schema:{cache_prompt_schema_version}\n{cache_base_prompt}".encode(
-                                "utf-8"
-                            )
+                            f"schema:{cache_prompt_schema_version}\n{cache_base_prompt}".encode()
                         ).hexdigest()[:16]
                         cache_glossary_version = hashlib.sha256(
                             cache_glossary_prompt.encode("utf-8")

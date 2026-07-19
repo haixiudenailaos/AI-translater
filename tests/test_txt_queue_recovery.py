@@ -29,14 +29,12 @@ import pytest
 
 from src.core.concurrent_manager import ConcurrentTranslationManager
 from src.core.translation_result import BatchTranslationResult
-from src.domain.project import TranslationProject
 from src.domain.translation import OperationStatus
 from src.infrastructure.project_repository import (
     ProjectRepository,
     compute_file_fingerprint,
     compute_project_id,
 )
-
 
 # ── MockEngine 与 fixtures ─────────────────────────────
 

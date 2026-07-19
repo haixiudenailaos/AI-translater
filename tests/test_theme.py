@@ -18,7 +18,6 @@ import pytest
 from src.ui.theme import (
     COLORS,
     FONT_APP,
-    FONT_TREEVIEW,
     accent_button_options,
     apply_theme,
     configure_named_fonts,
@@ -69,8 +68,7 @@ class TestContrastTokens:
         bg = COLORS[bg_token]
         ratio = _contrast_ratio(fg, bg)
         assert ratio >= 4.5, (
-            f"{fg_token}({fg}) on {bg_token}({bg}) 对比度仅 {ratio:.2f}:1，"
-            f"未达到 WCAG AA 4.5:1"
+            f"{fg_token}({fg}) on {bg_token}({bg}) 对比度仅 {ratio:.2f}:1，未达到 WCAG AA 4.5:1"
         )
 
     def test_old_low_contrast_green_replaced(self):

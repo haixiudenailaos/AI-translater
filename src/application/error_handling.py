@@ -18,7 +18,6 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from random import Random
-from typing import Optional
 
 from ..domain.errors import TranslationRequestError
 from ..utils.logger import get_logger
@@ -44,9 +43,7 @@ class ErrorCategory(str, Enum):
 
 # Windows / POSIX 路径前缀（盘符或 / 开头），含中文与 ASCII。
 # 不替换单纯的「译文.txt」这种相对名，但仍会替换「C:\Users\...」之类绝对路径。
-_PATH_PATTERN = re.compile(
-    r"(?:[A-Za-z]:[\\/]|[\\/])(?:[^\s:<>\"|?*]+\.)+[A-Za-z0-9_]+"
-)
+_PATH_PATTERN = re.compile(r"(?:[A-Za-z]:[\\/]|[\\/])(?:[^\s:<>\"|?*]+\.)+[A-Za-z0-9_]+")
 # 显式 API Key 头部（Authorization: Bearer xxx / X-API-Key: xxx / api_key=xxx）
 _APIKEY_PATTERN = re.compile(
     r"(?i)"
@@ -58,9 +55,7 @@ _URL_PATTERN = re.compile(
     r"https?://[^\s\"'<>]+",
 )
 # 形如 "response: {...}" / "body: ..." 的响应摘要（只保留首尾提示）
-_RESPONSE_BODY_PATTERN = re.compile(
-    r"(?is)\b(response|body|content)\s*[:=]\s*[\[{].*?[\]}]"
-)
+_RESPONSE_BODY_PATTERN = re.compile(r"(?is)\b(response|body|content)\s*[:=]\s*[\[{].*?[\]}]")
 
 
 def sanitize_error_message(text: str) -> str:
@@ -115,7 +110,7 @@ class ActionableError:
 def classify_error(
     error: BaseException,
     *,
-    correlation_id: Optional[str] = None,
+    correlation_id: str | None = None,
 ) -> ActionableError:
     """将基础设施异常转换为用户可读的 ``ActionableError``。
 
@@ -171,9 +166,7 @@ def classify_error(
         )
 
     # 404/410/503：模型不可用
-    if status_code in (404, 410, 503) or (
-        "model" in lowered and "available" in lowered
-    ):
+    if status_code in (404, 410, 503) or ("model" in lowered and "available" in lowered):
         return ActionableError(
             ErrorCategory.MODEL_UNAVAILABLE,
             safe_message or "模型不可用",
@@ -184,8 +177,7 @@ def classify_error(
 
     # 网络超时 / 连接失败
     if isinstance(error, (TimeoutError, ConnectionError)) or any(
-        token in lowered
-        for token in ("timeout", "connect", "network", "连接", "超时", "网络")
+        token in lowered for token in ("timeout", "connect", "network", "连接", "超时", "网络")
     ):
         return ActionableError(
             ErrorCategory.NETWORK,
@@ -241,7 +233,7 @@ def format_diagnostic_info(
     error: BaseException,
     actionable: ActionableError,
     *,
-    extra: Optional[dict] = None,
+    extra: dict | None = None,
 ) -> str:
     """格式化可安全复制的诊断信息字符串。
 
@@ -266,7 +258,7 @@ def log_classified_error(
     error: BaseException,
     actionable: ActionableError,
     *,
-    context: Optional[dict] = None,
+    context: dict | None = None,
 ) -> None:
     """记录分类后的错误到日志。
 

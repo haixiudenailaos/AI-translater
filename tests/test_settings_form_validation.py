@@ -6,11 +6,10 @@
 """
 
 import sys
-import types
 import tkinter as tk
+import types
 import unittest
-from tkinter import ttk
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from src.ui.form_validation import (
     FormValidator,

@@ -162,8 +162,12 @@ def test_main_window_preflight_runs_silently_when_no_risks(monkeypatch):
         {"target_language": "中文", "batch_lines": 20, "preflight_confirm_warnings": True},
     )
     dialogs: list[str] = []
-    monkeypatch.setattr("src.ui.main_window.messagebox.showerror", lambda *args, **kwargs: dialogs.append("error"))
-    monkeypatch.setattr("src.ui.main_window.messagebox.askyesno", lambda *args, **kwargs: dialogs.append("warning"))
+    monkeypatch.setattr(
+        "src.ui.main_window.messagebox.showerror", lambda *args, **kwargs: dialogs.append("error")
+    )
+    monkeypatch.setattr(
+        "src.ui.main_window.messagebox.askyesno", lambda *args, **kwargs: dialogs.append("warning")
+    )
 
     assert window._run_preflight("full")
     assert dialogs == []

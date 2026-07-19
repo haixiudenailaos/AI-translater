@@ -14,9 +14,9 @@
 
 from __future__ import annotations
 
+import tempfile
 import threading
 import time
-import tempfile
 from pathlib import Path
 from typing import List
 from unittest.mock import MagicMock
@@ -430,16 +430,12 @@ class TestSchedulerFairness:
 
             assert _wait_for(lambda: probe.max_seen == 2, timeout=4.0)
             assert len(engines) == 2
-            assert sum(
-                slot.state == QueueTaskState.PENDING
-                for slot in coord._tasks.values()
-            ) == 6
+            assert sum(slot.state == QueueTaskState.PENDING for slot in coord._tasks.values()) == 6
 
             probe.release_event.set()
             assert _wait_for(
                 lambda: all(
-                    coord.get_task_data(f"t{index}")["status"] == "completed"
-                    for index in range(8)
+                    coord.get_task_data(f"t{index}")["status"] == "completed" for index in range(8)
                 ),
                 timeout=10.0,
             )

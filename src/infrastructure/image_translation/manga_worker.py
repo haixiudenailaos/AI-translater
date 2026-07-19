@@ -122,7 +122,10 @@ def run_worker(args: argparse.Namespace) -> int:
 
             request = _request_from_payload(command["request"])
 
-            def on_progress(progress: ImageTranslationProgress) -> None:
+            def on_progress(
+                progress: ImageTranslationProgress,
+                request_id: str = request_id,
+            ) -> None:
                 _send(
                     {
                         "type": "progress",

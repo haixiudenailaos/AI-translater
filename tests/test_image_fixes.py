@@ -283,9 +283,7 @@ class TestOpenAIClientClose:
     def test_unknown_custom_volc_model_is_not_replaced(self):
         config_manager = MagicMock()
         config_manager.get_app_config.return_value = {
-            "image_translation": {
-                "ai_volcengine": {"model": "user-defined-model"}
-            }
+            "image_translation": {"ai_volcengine": {"model": "user-defined-model"}}
         }
 
         translator = ImageTranslator(config_manager)
@@ -343,13 +341,16 @@ class TestOpenAIClientClose:
         fake_client = MagicMock()
         fake_http_client = MagicMock()
 
-        with patch(
-            "src.core.image_translator.httpx.Client",
-            return_value=fake_http_client,
-        ) as http_client_cls, patch(
-            "src.core.image_translator.OpenAI",
-            return_value=fake_client,
-        ) as openai_cls:
+        with (
+            patch(
+                "src.core.image_translator.httpx.Client",
+                return_value=fake_http_client,
+            ) as http_client_cls,
+            patch(
+                "src.core.image_translator.OpenAI",
+                return_value=fake_client,
+            ) as openai_cls,
+        ):
             assert translator._get_client() is fake_client
 
         assert openai_cls.call_args.kwargs["max_retries"] == 0
@@ -366,9 +367,7 @@ class TestOpenAIClientClose:
             "POST", "https://ark.cn-beijing.volces.com/api/v3/images/generations"
         )
         error = APIConnectionError(request=request)
-        error.__cause__ = httpx.ReadError(
-            "[WinError 10053] connection aborted", request=request
-        )
+        error.__cause__ = httpx.ReadError("[WinError 10053] connection aborted", request=request)
 
         failed_client = MagicMock()
         failed_client.images.generate.side_effect = error
@@ -380,12 +379,14 @@ class TestOpenAIClientClose:
         translator._client_api_key = "test-key"
         generated_image = b"\x89PNG\r\n\x1a\n" + b"x" * 128
 
-        with patch.object(
-            translator, "_get_client", return_value=replacement_client
-        ), patch(
-            "src.core.image_translator._safe_download_image",
-            return_value=generated_image,
-        ), patch("src.core.image_translator.time.sleep"):
+        with (
+            patch.object(translator, "_get_client", return_value=replacement_client),
+            patch(
+                "src.core.image_translator._safe_download_image",
+                return_value=generated_image,
+            ),
+            patch("src.core.image_translator.time.sleep"),
+        ):
             result = translator._process_single_image(
                 failed_client,
                 "cover.png",

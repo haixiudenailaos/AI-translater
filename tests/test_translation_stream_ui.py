@@ -112,9 +112,7 @@ def test_apply_to_document_filters_manually_edited_rows():
     controller = _make_controller_with_document(doc)
 
     # 机器结果同时覆盖行 0（受保护）和行 1/2（未保护）
-    accepted = controller._apply_to_document(
-        {0: "新机器A", 1: "新机器B", 2: "新机器C"}
-    )
+    accepted = controller._apply_to_document({0: "新机器A", 1: "新机器B", 2: "新机器C"})
 
     # 只有未保护的行被接受
     assert accepted == {1: "新机器B", 2: "新机器C"}
@@ -167,4 +165,3 @@ def test_apply_to_document_clear_manual_flag_allows_overwrite():
     accepted = controller._apply_to_document({0: "新机器"})
     assert accepted == {0: "新机器"}
     assert doc.target_lines() == ["新机器"]
-

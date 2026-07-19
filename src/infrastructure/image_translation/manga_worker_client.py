@@ -239,9 +239,7 @@ class MangaWorkerClient:
                             logger.debug("on_progress 回调异常: %s", exc)
                     continue
                 if mtype == "error":
-                    raise ImageTranslationConfigError(
-                        str(message.get("message") or "worker error")
-                    )
+                    raise ImageTranslationConfigError(str(message.get("message") or "worker error"))
                 if mtype == "response":
                     return message
                 # 未知消息类型：忽略，继续等待

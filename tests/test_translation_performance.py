@@ -572,7 +572,7 @@ def test_run_context_temperature_and_versions_reused_across_batches():
     expected_temp = config.api["temperature"]
     expected_prompt_version = hashlib.sha256(
         f"schema:{config.app.get('prompt_schema_version', 1)}\n"
-        f"{config.app['translation_prompt']}".encode("utf-8")
+        f"{config.app['translation_prompt']}".encode()
     ).hexdigest()[:16]
     expected_glossary_version = hashlib.sha256(
         config.get_glossary_prompt().encode("utf-8")

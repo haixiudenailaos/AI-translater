@@ -123,15 +123,27 @@ class AppPaths:
             AppPathsInitError: 必要目录无法创建时抛出。
         """
         resource = _resource_dir()
-        base_data = Path(data_dir) if data_dir else (_env_path("AI_TRANSLATOR_DATA_DIR") or _user_data_dir())
+        base_data = (
+            Path(data_dir)
+            if data_dir
+            else (_env_path("AI_TRANSLATOR_DATA_DIR") or _user_data_dir())
+        )
 
-        cfg = Path(config_dir) if config_dir else (_env_path("AI_TRANSLATOR_CONFIG_DIR") or (base_data / "config"))
+        cfg = (
+            Path(config_dir)
+            if config_dir
+            else (_env_path("AI_TRANSLATOR_CONFIG_DIR") or (base_data / "config"))
+        )
         ws = (
             Path(workspace_dir)
             if workspace_dir
             else (_env_path("AI_TRANSLATOR_WORKSPACE_DIR") or (base_data / "workspace"))
         )
-        lg = Path(log_dir) if log_dir else (_env_path("AI_TRANSLATOR_LOG_DIR") or (base_data / "logs"))
+        lg = (
+            Path(log_dir)
+            if log_dir
+            else (_env_path("AI_TRANSLATOR_LOG_DIR") or (base_data / "logs"))
+        )
 
         # P2-7：必要目录创建失败抛出结构化错误，避免后续在无效路径上反复失败
         failed: list[tuple[Path, str]] = []

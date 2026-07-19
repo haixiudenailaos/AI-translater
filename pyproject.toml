@@ -145,6 +145,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"main.py" = ["E402"]
 # 测试文件允许使用 assert、宽捕获和未使用导入
 "tests/**" = ["S101", "B017", "F841"]
 # third_party 不检查

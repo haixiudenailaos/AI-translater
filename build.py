@@ -230,9 +230,7 @@ class BuildManager:
         """执行完整构建流程"""
         self.print_status("=" * 60)
         # P1-12：展示版本来自单一版本源
-        self.print_status(
-            f"LightNovelTranslator V{self.display_version} - automated build", "INFO"
-        )
+        self.print_status(f"LightNovelTranslator V{self.display_version} - automated build", "INFO")
         self.print_status("=" * 60)
 
         # 1. 清理构建目录（可选）

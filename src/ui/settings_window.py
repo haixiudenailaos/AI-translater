@@ -43,7 +43,7 @@ from ..config.volcengine_image import (
     VOLCENGINE_IMAGE_MODEL_SUGGESTIONS,
 )
 from ..domain.edition import EditionCapabilities, detect_edition_capabilities
-from .form_validation import FormValidator, clamp_int
+from .form_validation import FormValidator
 from .theme import COLORS, status_color
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 
@@ -224,7 +224,9 @@ class SettingsWindow:
         width = min(self.WINDOW_WIDTH, avail_width)
         height = min(self.WINDOW_HEIGHT, avail_height)
         # minsize 服从工作区，避免在小屏 / 高 DPI 下超出可视范围
-        self.window.minsize(min(self.WINDOW_WIDTH, avail_width), min(self.WINDOW_HEIGHT, avail_height))
+        self.window.minsize(
+            min(self.WINDOW_WIDTH, avail_width), min(self.WINDOW_HEIGHT, avail_height)
+        )
         x = max(0, (screen_width - width) // 2)
         y = max(0, (screen_height - height) // 2)
         self.window.geometry(f"{width}x{height}+{x}+{y}")
@@ -507,7 +509,9 @@ class SettingsWindow:
         )
         max_tokens_spin.grid(row=4, column=1, padx=10, pady=10)
         # P2-5：字段级校验 + FocusOut 自动收敛
-        self._register_spin(max_tokens_spin, self.max_tokens_var, 1000, 32768, "max_tokens", "最大令牌数")
+        self._register_spin(
+            max_tokens_spin, self.max_tokens_var, 1000, 32768, "max_tokens", "最大令牌数"
+        )
 
         # 温度参数
         ttk.Label(api_frame, text="温度参数:").grid(row=5, column=0, sticky=tk.W, padx=10, pady=10)
@@ -570,8 +574,12 @@ class SettingsWindow:
         )
         batch_spin.grid(row=2, column=1, padx=10, pady=10)
         self._register_spin(
-            batch_spin, self.batch_lines_var, 1, MAX_STABLE_TRANSLATION_BATCH_LINES,
-            "batch_lines", "批次翻译行数",
+            batch_spin,
+            self.batch_lines_var,
+            1,
+            MAX_STABLE_TRANSLATION_BATCH_LINES,
+            "batch_lines",
+            "批次翻译行数",
         )
 
         # 批次行数提示
@@ -599,9 +607,12 @@ class SettingsWindow:
         )
         batch_token_spin.grid(row=4, column=1, padx=10, pady=8)
         self._register_spin(
-            batch_token_spin, self.batch_token_budget_var,
-            1000, MAX_STABLE_TRANSLATION_INPUT_TOKENS,
-            "batch_token_budget", "批次输入预算",
+            batch_token_spin,
+            self.batch_token_budget_var,
+            1000,
+            MAX_STABLE_TRANSLATION_INPUT_TOKENS,
+            "batch_token_budget",
+            "批次输入预算",
         )
 
         ttk.Label(trans_frame, text="主界面局部并发:").grid(
@@ -619,8 +630,12 @@ class SettingsWindow:
         )
         concurrency_spin.grid(row=5, column=1, padx=10, pady=8)
         self._register_spin(
-            concurrency_spin, self.translation_concurrency_var, 1, 8,
-            "translation_concurrency", "主界面局部并发",
+            concurrency_spin,
+            self.translation_concurrency_var,
+            1,
+            8,
+            "translation_concurrency",
+            "主界面局部并发",
         )
 
         # 自动保存
@@ -637,8 +652,12 @@ class SettingsWindow:
         )
         font_size_spin.grid(row=7, column=1, padx=10, pady=8)
         self._register_spin(
-            font_size_spin, self.ui_font_size_var, 8, 18,
-            "ui_font_size", "界面字号",
+            font_size_spin,
+            self.ui_font_size_var,
+            8,
+            18,
+            "ui_font_size",
+            "界面字号",
         )
 
         # 翻译提示词
@@ -695,9 +714,12 @@ class SettingsWindow:
         )
         q_max_in_flight_spin.grid(row=12, column=1, padx=10, pady=4)
         self._register_spin(
-            q_max_in_flight_spin, self.queue_max_in_flight_var,
-            1, MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS,
-            "queue_max_in_flight", "全局最大在途请求",
+            q_max_in_flight_spin,
+            self.queue_max_in_flight_var,
+            1,
+            MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS,
+            "queue_max_in_flight",
+            "全局最大在途请求",
         )
 
         # 硬上限（ThreadPoolExecutor max_workers）
@@ -717,9 +739,12 @@ class SettingsWindow:
         )
         q_hard_cap_spin.grid(row=13, column=1, padx=10, pady=4)
         self._register_spin(
-            q_hard_cap_spin, self.queue_hard_cap_var,
-            1, MAX_QUEUE_HARD_REQUEST_CAP,
-            "queue_hard_cap", "硬并发上限",
+            q_hard_cap_spin,
+            self.queue_hard_cap_var,
+            1,
+            MAX_QUEUE_HARD_REQUEST_CAP,
+            "queue_hard_cap",
+            "硬并发上限",
         )
 
         # 最大活跃任务数
@@ -739,9 +764,12 @@ class SettingsWindow:
         )
         q_max_active_spin.grid(row=14, column=1, padx=10, pady=4)
         self._register_spin(
-            q_max_active_spin, self.queue_max_active_var,
-            1, MAX_QUEUE_MAX_ACTIVE_TASKS,
-            "queue_max_active", "最大活跃任务",
+            q_max_active_spin,
+            self.queue_max_active_var,
+            1,
+            MAX_QUEUE_MAX_ACTIVE_TASKS,
+            "queue_max_active",
+            "最大活跃任务",
         )
 
         # 每任务软上限（round-robin 第一轮）
@@ -763,9 +791,12 @@ class SettingsWindow:
         )
         q_per_task_spin.grid(row=15, column=1, padx=10, pady=4)
         self._register_spin(
-            q_per_task_spin, self.queue_per_task_soft_var,
-            1, MAX_QUEUE_PER_TASK_SOFT_LIMIT,
-            "queue_per_task_soft", "每任务软上限",
+            q_per_task_spin,
+            self.queue_per_task_soft_var,
+            1,
+            MAX_QUEUE_PER_TASK_SOFT_LIMIT,
+            "queue_per_task_soft",
+            "每任务软上限",
         )
 
         # 队列批次行数
@@ -785,9 +816,12 @@ class SettingsWindow:
         )
         q_batch_lines_spin.grid(row=16, column=1, padx=10, pady=4)
         self._register_spin(
-            q_batch_lines_spin, self.queue_batch_lines_var,
-            1, MAX_QUEUE_TRANSLATION_BATCH_LINES,
-            "queue_batch_lines", "队列批次行数",
+            q_batch_lines_spin,
+            self.queue_batch_lines_var,
+            1,
+            MAX_QUEUE_TRANSLATION_BATCH_LINES,
+            "queue_batch_lines",
+            "队列批次行数",
         )
 
         # 队列批次输入预算
@@ -809,9 +843,12 @@ class SettingsWindow:
         )
         q_batch_tokens_spin.grid(row=17, column=1, padx=10, pady=4)
         self._register_spin(
-            q_batch_tokens_spin, self.queue_batch_tokens_var,
-            512, MAX_QUEUE_TRANSLATION_INPUT_TOKENS,
-            "queue_batch_tokens", "队列批次输入预算",
+            q_batch_tokens_spin,
+            self.queue_batch_tokens_var,
+            512,
+            MAX_QUEUE_TRANSLATION_INPUT_TOKENS,
+            "queue_batch_tokens",
+            "队列批次输入预算",
         )
 
         # RPM 限制
@@ -831,9 +868,12 @@ class SettingsWindow:
         )
         q_rpm_spin.grid(row=18, column=1, padx=10, pady=4)
         self._register_spin(
-            q_rpm_spin, self.queue_rpm_var,
-            0, MAX_QUEUE_RPM_LIMIT,
-            "queue_rpm", "RPM 限制",
+            q_rpm_spin,
+            self.queue_rpm_var,
+            0,
+            MAX_QUEUE_RPM_LIMIT,
+            "queue_rpm",
+            "RPM 限制",
         )
 
         # TPM 限制
@@ -853,9 +893,12 @@ class SettingsWindow:
         )
         q_tpm_spin.grid(row=19, column=1, padx=10, pady=4)
         self._register_spin(
-            q_tpm_spin, self.queue_tpm_var,
-            0, MAX_QUEUE_TPM_LIMIT,
-            "queue_tpm", "TPM 限制",
+            q_tpm_spin,
+            self.queue_tpm_var,
+            0,
+            MAX_QUEUE_TPM_LIMIT,
+            "queue_tpm",
+            "TPM 限制",
         )
 
         # 自适应并发（AIMD）
@@ -945,9 +988,7 @@ class SettingsWindow:
             text="浏览...",
             command=self._browse_manga_model_dir,
             state="normal",
-        ).grid(
-            row=5, column=2, padx=(0, 10), pady=6, sticky=tk.W
-        )
+        ).grid(row=5, column=2, padx=(0, 10), pady=6, sticky=tk.W)
 
         # 模型状态
         ttk.Label(volc_frame, text="模型状态:").grid(row=6, column=0, sticky=tk.W, padx=10, pady=6)
@@ -990,15 +1031,9 @@ class SettingsWindow:
         self.volc_base_url_var = tk.StringVar(
             value=ai_volc_cfg.get("base_url", VOLCENGINE_IMAGE_DEFAULT_BASE_URL)
         )
-        ttk.Label(volc_frame, text="API 地址:").grid(
-            row=10, column=0, sticky=tk.W, padx=10, pady=6
-        )
-        volc_base_url_entry = ttk.Entry(
-            volc_frame, textvariable=self.volc_base_url_var, width=42
-        )
-        volc_base_url_entry.grid(
-            row=10, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W
-        )
+        ttk.Label(volc_frame, text="API 地址:").grid(row=10, column=0, sticky=tk.W, padx=10, pady=6)
+        volc_base_url_entry = ttk.Entry(volc_frame, textvariable=self.volc_base_url_var, width=42)
+        volc_base_url_entry.grid(row=10, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W)
         self._form_validator.register_required_string(
             "volc_base_url", "火山引擎 API 地址", self.volc_base_url_var, volc_base_url_entry
         )
@@ -1016,9 +1051,7 @@ class SettingsWindow:
             state="normal",
             width=39,
         )
-        volc_model_combo.grid(
-            row=11, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W
-        )
+        volc_model_combo.grid(row=11, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W)
         self._form_validator.register_required_string(
             "volc_model", "火山引擎翻译模型 ID", self.volc_model_var, volc_model_combo
         )
@@ -1068,9 +1101,7 @@ class SettingsWindow:
         if capabilities is None:
             capabilities = detect_edition_capabilities()
         if not capabilities.manga_enabled:
-            self.manga_status_label.config(
-                text="Text Edition 不可用", foreground=COLORS["muted"]
-            )
+            self.manga_status_label.config(text="Text Edition 不可用", foreground=COLORS["muted"])
             return
 
         # P2-5：避免重复启动
@@ -1180,9 +1211,7 @@ class SettingsWindow:
                 cfg["image_translation"] = img
                 return cfg
 
-        temp_config = _TemporaryVolcConfig(
-            self.config_manager, api_key, base_url, model
-        )
+        temp_config = _TemporaryVolcConfig(self.config_manager, api_key, base_url, model)
 
         def worker():
             translator = None
@@ -1618,9 +1647,7 @@ class SettingsWindow:
             return
 
         # ENG-2：返回 SecretSaveResult，按三态分支提示
-        result = self.config_manager.save_api_and_model_preset(
-            preset_name, api_key, model_name
-        )
+        result = self.config_manager.save_api_and_model_preset(preset_name, api_key, model_name)
         if result.failed:
             messagebox.showerror(
                 "保存失败",

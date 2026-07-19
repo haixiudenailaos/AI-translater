@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 
-from src.config.config_manager import ConfigManager, DEFAULT_PROMPT_SCHEMA_VERSION
+from src.config.config_manager import DEFAULT_PROMPT_SCHEMA_VERSION, ConfigManager
 
 
-def test_known_legacy_prompt_is_replaced_but_custom_prompt_is_preserved(
-    tmp_app_paths, monkeypatch
-):
+def test_known_legacy_prompt_is_replaced_but_custom_prompt_is_preserved(tmp_app_paths, monkeypatch):
     manager = ConfigManager(app_paths=tmp_app_paths)
     legacy_prompt = "historical bundled default"
     monkeypatch.setattr(

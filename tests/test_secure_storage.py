@@ -187,9 +187,7 @@ class TestConfigMigration:
         # 但运行时 config 应能从 SecretStore 读取到 Key（SESSION_ONLY 时环境变量降级）
         # FakeSecretStore 在 SESSION_ONLY 时不写入 values，retrieve 返回 ""
         # load_api_config 会通过 _ensure_api_key_loaded 读取，此处直接验证 store 被调用
-        assert any(
-            ident == "provider:siliconflow" for ident, _ in fake_store.store_calls
-        )
+        assert any(ident == "provider:siliconflow" for ident, _ in fake_store.store_calls)
 
     def test_migration_removes_plaintext_when_persisted(self, tmp_config_manager):
         """SecretStore 持久化成功后，磁盘 JSON 不再包含明文 Key。"""
@@ -309,9 +307,7 @@ class TestPresetMigration:
         # SecretStore 中应有 preset1 的密钥
         assert fake_store.values.get("preset:preset1") == "sk-preset-secret-key"
 
-    def test_preset_migration_preserves_plaintext_when_session_only(
-        self, tmp_config_manager
-    ):
+    def test_preset_migration_preserves_plaintext_when_session_only(self, tmp_config_manager):
         """SecretStore 返回 SESSION_ONLY 时，预设磁盘 JSON 保留明文 Key。"""
         # P1-4：注入返回 SESSION_ONLY 的 FakeSecretStore
         fake_store = _FakeSecretStore(status=StorageStatus.SESSION_ONLY)

@@ -63,7 +63,9 @@ class TranslationEventMailbox:
                 self._latest_stream.pop(key, None)
             self._terminal.append(event)
 
-    def drain(self) -> Tuple[
+    def drain(
+        self,
+    ) -> Tuple[
         Tuple[TranslationProgressEvent, ...],
         Tuple[TranslationProgressEvent, ...],
     ]:

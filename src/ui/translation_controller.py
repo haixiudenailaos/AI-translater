@@ -1428,9 +1428,7 @@ class TranslationController:
             mapping_failed = False
             if current_mapping_dir:
                 try:
-                    self.epub_processor.save_translations(
-                        str(current_mapping_dir), target_lines
-                    )
+                    self.epub_processor.save_translations(str(current_mapping_dir), target_lines)
                 except Exception as e:
                     # BUG-006：EPUB映射同步失败需可见，但不影响已保存的txt
                     mapping_failed = True
@@ -1621,14 +1619,10 @@ class TranslationController:
                 return
 
             image_map = (
-                load_image_translation_result(current_mapping_dir)
-                if current_mapping_dir
-                else None
+                load_image_translation_result(current_mapping_dir) if current_mapping_dir else None
             )
             image_text_map = (
-                load_image_text_translations(current_mapping_dir)
-                if current_mapping_dir
-                else None
+                load_image_text_translations(current_mapping_dir) if current_mapping_dir else None
             )
             mapping_dir = str(current_mapping_dir)
             target_snapshot = tuple(target_lines)

@@ -118,9 +118,8 @@ class TranslatorApp:
         # 阶段 2：保存配置（ENG-1：聚合结果 + 重试/不保存退出/取消）。
         # 所有仍允许用户取消关闭的操作必须发生在资源 teardown 之前；否则
         # “取消退出”会留下看似可用、实际已关闭服务的主窗口。
-        if self.app_context is not None:
-            if not self._save_config_with_retry():
-                return  # 用户取消关闭
+        if self.app_context is not None and not self._save_config_with_retry():
+            return  # 用户取消关闭
 
         # 阶段 3：关闭主窗口资源。配置保存已完成或用户已明确选择不保存，
         # 因此从这里开始不再提供返回应用的分支。

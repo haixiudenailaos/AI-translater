@@ -14,7 +14,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_TARGETS = {
     "text-win-py310": ("requirements.txt", "requirements-text-win-py310.lock.txt"),

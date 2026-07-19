@@ -884,4 +884,3 @@ def test_drain_result_inline_with_discard_flag_forces_clean():
     assert coordinator.state == CLEAN
     # 不应调度新的 after 回调（不启动新保存）
     assert root.scheduled == scheduled_before
-

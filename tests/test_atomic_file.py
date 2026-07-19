@@ -132,4 +132,3 @@ class TestAtomicWriteUniqueTemp:
 
         assert target.read_text(encoding="utf-8") == "durable-content"
         assert fsync_calls, "原子写入必须调用 os.fsync 刷盘"
-

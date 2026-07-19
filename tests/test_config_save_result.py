@@ -11,10 +11,7 @@ ENG-1 回归测试：配置保存聚合结果与关闭流程一致性
 
 from types import SimpleNamespace
 
-import pytest
-
 from src.domain.secret import ConfigSaveResult, SecretSaveResult, StorageStatus
-
 
 # ── 测试替身 ──────────────────────────────────────
 
@@ -157,9 +154,7 @@ class TestSaveConfigAggregatedResult:
         assert bool(result) is False
         assert "API 配置" in result.user_message
 
-    def test_save_config_aggregates_app_config_failure(
-        self, tmp_config_manager, monkeypatch
-    ):
+    def test_save_config_aggregates_app_config_failure(self, tmp_config_manager, monkeypatch):
         """应用配置写入失败（磁盘满）时，整体结果标记为 failed"""
         # 让 app_config_file 的写入抛 OSError
         from src.config import config_manager as cm_mod
@@ -181,9 +176,7 @@ class TestSaveConfigAggregatedResult:
         assert "磁盘满" in result.app_config_error
         assert "应用配置" in result.user_message
 
-    def test_save_config_aggregates_glossary_failure(
-        self, tmp_config_manager, monkeypatch
-    ):
+    def test_save_config_aggregates_glossary_failure(self, tmp_config_manager, monkeypatch):
         """术语表写入失败时，整体结果标记为 failed"""
         from src.config import config_manager as cm_mod
 
@@ -229,9 +222,7 @@ class TestSaveConfigAggregatedResult:
         assert secret not in result.user_message
         assert secret not in result.api.error_message
 
-    def test_save_config_partial_failure_keeps_other_results(
-        self, tmp_config_manager, monkeypatch
-    ):
+    def test_save_config_partial_failure_keeps_other_results(self, tmp_config_manager, monkeypatch):
         """API 失败但应用配置/术语表仍成功时，结果正确反映各部分状态"""
         tmp_config_manager._secret_store = FakeSecretStore(status=StorageStatus.FAILED)
         tmp_config_manager.api_config["api_key"] = "sk-existing"
@@ -306,9 +297,7 @@ class TestSaveConfigRetryFlow:
 
         def fake_ask(*args, **kwargs):
             # askyesnocancel(title, message, **kwargs)
-            called_args["message"] = kwargs.get("message") or (
-                args[1] if len(args) > 1 else ""
-            )
+            called_args["message"] = kwargs.get("message") or (args[1] if len(args) > 1 else "")
             return None  # 用户取消
 
         import main as main_mod
@@ -333,9 +322,7 @@ class TestSaveConfigRetryFlow:
         import main as main_mod
 
         # Mock：第一次失败后用户选"否"
-        monkeypatch.setattr(
-            main_mod.messagebox, "askyesnocancel", lambda *a, **kw: False
-        )
+        monkeypatch.setattr(main_mod.messagebox, "askyesnocancel", lambda *a, **kw: False)
 
         result = app._save_config_with_retry()
 
@@ -363,18 +350,14 @@ class TestSaveConfigRetryFlow:
 
         # 第一次失败 → 选"是"重试；第二次仍然失败 → 选"否"不保存退出
         choices = iter([True, False])
-        monkeypatch.setattr(
-            main_mod.messagebox, "askyesnocancel", lambda *a, **kw: next(choices)
-        )
+        monkeypatch.setattr(main_mod.messagebox, "askyesnocancel", lambda *a, **kw: next(choices))
 
         result = app._save_config_with_retry()
 
         assert result is True
         assert call_count["n"] == 2  # 调用了两次
 
-    def test_session_only_shows_info_dialog_and_returns_true(
-        self, tmp_config_manager, monkeypatch
-    ):
+    def test_session_only_shows_info_dialog_and_returns_true(self, tmp_config_manager, monkeypatch):
         """SESSION_ONLY 时不阻断，但弹提示对话框"""
         tmp_config_manager._secret_store = FakeSecretStore(status=StorageStatus.SESSION_ONLY)
         tmp_config_manager.api_config["api_key"] = "sk-session"

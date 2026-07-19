@@ -64,7 +64,9 @@ def generate_sbom(pyproject_path: Path, extras: tuple[str, ...]) -> dict[str, An
                 "name": name,
                 "version": version,
                 "purl": f"pkg:pypi/{name}@{version}",
-                "properties": [{"name": "ai-translater:declared-requirement", "value": requirement}],
+                "properties": [
+                    {"name": "ai-translater:declared-requirement", "value": requirement}
+                ],
             }
         )
 

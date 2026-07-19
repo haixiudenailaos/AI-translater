@@ -11,10 +11,7 @@ ENG-2 回归测试：API 预设保存返回三态（PERSISTED/SESSION_ONLY/FAILE
 
 import json
 
-import pytest
-
 from src.domain.secret import SecretSaveResult, StorageStatus
-
 
 # ── 测试替身 ──────────────────────────────────────
 
@@ -127,9 +124,7 @@ class TestPresetSaveTriState:
         """SecretStore.store 抛异常时返回 FAILED"""
         tmp_config_manager._secret_store = FailingSecretStore()
 
-        result = tmp_config_manager.save_api_and_model_preset(
-            "exc-preset", "sk-exc", "exc-model"
-        )
+        result = tmp_config_manager.save_api_and_model_preset("exc-preset", "sk-exc", "exc-model")
 
         assert result.failed
         assert bool(result) is False
@@ -152,9 +147,7 @@ class TestPresetSaveTriState:
 
         monkeypatch.setattr(cm_mod, "write_json_atomic", failing_write)
 
-        result = tmp_config_manager.save_api_and_model_preset(
-            "json-fail", "sk-json", "json-model"
-        )
+        result = tmp_config_manager.save_api_and_model_preset("json-fail", "sk-json", "json-model")
 
         # 密钥已存储但配置文件写入失败
         assert not result.config_saved
@@ -169,9 +162,7 @@ class TestPresetSaveTriState:
         tmp_config_manager._secret_store = store
 
         secret = "sk-super-secret-preset-12345"
-        result = tmp_config_manager.save_api_and_model_preset(
-            "leak-test", secret, "leak-model"
-        )
+        result = tmp_config_manager.save_api_and_model_preset("leak-test", secret, "leak-model")
 
         assert secret not in str(result)
         assert secret not in result.error_message
@@ -183,21 +174,15 @@ class TestPresetSaveTriState:
         """ENG-2 向后兼容：旧 `if save_api_and_model_preset(...)` 仍工作"""
         # PERSISTED 路径
         tmp_config_manager._secret_store = FakeSecretStore(status=StorageStatus.PERSISTED)
-        assert bool(
-            tmp_config_manager.save_api_and_model_preset("p1", "k1", "m1")
-        ) is True
+        assert bool(tmp_config_manager.save_api_and_model_preset("p1", "k1", "m1")) is True
 
         # SESSION_ONLY 路径
         tmp_config_manager._secret_store = FakeSecretStore(status=StorageStatus.SESSION_ONLY)
-        assert bool(
-            tmp_config_manager.save_api_and_model_preset("p2", "k2", "m2")
-        ) is True
+        assert bool(tmp_config_manager.save_api_and_model_preset("p2", "k2", "m2")) is True
 
         # FAILED 路径
         tmp_config_manager._secret_store = FakeSecretStore(status=StorageStatus.FAILED)
-        assert bool(
-            tmp_config_manager.save_api_and_model_preset("p3", "k3", "m3")
-        ) is False
+        assert bool(tmp_config_manager.save_api_and_model_preset("p3", "k3", "m3")) is False
 
 
 # ── 不修改无关配置测试 ──────────────────────────────────────
@@ -299,8 +284,6 @@ class TestSimpleDialogImport:
         模拟文档 §ENG-2 描述的"直接导入/测试 settings_window 或改变导入顺序
         时该属性不存在"的脆弱契约场景。
         """
-        import importlib
-        import sys
 
         # 移除 tkinter.filedialog 缓存以模拟未加载状态
         # 注意：实际不能移除已加载模块（其他测试可能依赖），
@@ -367,7 +350,7 @@ class TestSaveApiPresetUIStateHandling:
 
     def test_persisted_shows_success_message(self, tmp_config_manager, monkeypatch):
         """PERSISTED 时显示"已保存"成功提示"""
-        from src.domain.secret import SecretSaveResult, StorageStatus
+        from src.domain.secret import StorageStatus
 
         window, calls = self._make_settings_window_with_mocks(monkeypatch)
         calls["askstring"] = "my-preset"
@@ -428,9 +411,7 @@ class TestSaveApiPresetUIStateHandling:
 
         def counting_save(*args, **kwargs):
             save_calls["n"] += 1
-            return SecretSaveResult(
-                secret_status=StorageStatus.PERSISTED, config_saved=True
-            )
+            return SecretSaveResult(secret_status=StorageStatus.PERSISTED, config_saved=True)
 
         tmp_config_manager.save_api_and_model_preset = counting_save
 

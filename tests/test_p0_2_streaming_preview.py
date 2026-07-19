@@ -15,7 +15,6 @@ from src.application.translation_document import TranslationDocument
 from src.core.translation_result import BatchTranslationResult, TranslationStatus
 from src.ui.translation_controller import TranslationController
 
-
 # ── 测试桩 ──────────────────────────────────────────────
 
 
@@ -108,9 +107,7 @@ def test_full_streaming_preview_does_not_write_to_document():
     assert doc.target_lines() == ["", "", ""]
     assert doc.dirty_indices == frozenset()
     # 预览通过 apply_streaming_preview 写入 Treeview
-    assert controller._table_adapter.preview_calls == [
-        {0: "流式A", 1: "流式B", 2: "流式C"}
-    ]
+    assert controller._table_adapter.preview_calls == [{0: "流式A", 1: "流式B", 2: "流式C"}]
     # 不调度保存
     assert controller._save_calls == []
     # 行被记录为未提交预览

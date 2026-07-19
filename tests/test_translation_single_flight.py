@@ -40,8 +40,8 @@ def test_selected_translation_command_is_rejected_while_run_is_active():
 
 def test_session_replacement_cancels_and_retires_active_run():
     """P0-2：导入新会话前停止旧请求并立刻恢复可用状态。"""
-    from collections import deque
     import threading
+    from collections import deque
     from types import SimpleNamespace
 
     class _Widget:

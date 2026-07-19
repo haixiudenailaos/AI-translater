@@ -76,9 +76,7 @@ def test_schedule_save_marks_session_only_after_model_change():
     assert window._unsaved_edits is True
     assert session.dirty is True
     assert window._autosave.paths == [(Path("target.txt"), None)]
-    assert window._autosave.dirty_calls == [
-        {"source": "edit", "debounce_ms": 1000}
-    ]
+    assert window._autosave.dirty_calls == [{"source": "edit", "debounce_ms": 1000}]
 
 
 def test_clean_save_result_clears_document_and_session_dirty_state():

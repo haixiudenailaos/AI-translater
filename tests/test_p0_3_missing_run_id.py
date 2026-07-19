@@ -19,7 +19,6 @@ from src.application.translation_events import (
 from src.core.translation_result import BatchTranslationResult, TranslationStatus
 from src.ui.translation_controller import TranslationController
 
-
 # ── 测试桩 ──────────────────────────────────────────────
 
 
@@ -110,9 +109,7 @@ def test_missing_worker_success_binds_run_id_to_callbacks():
     # 所有事件都应携带正确的 run_id
     assert len(mailbox.events) == 2  # 进度 + 终态
     for event in mailbox.events:
-        assert event.run_id == run_id, (
-            f"事件 run_id 应为 {run_id}，实际为 {event.run_id}"
-        )
+        assert event.run_id == run_id, f"事件 run_id 应为 {run_id}，实际为 {event.run_id}"
 
 
 def test_missing_worker_streaming_progress_binds_run_id():
@@ -263,7 +260,9 @@ def test_three_workers_share_same_callback_signature_pattern():
 
     expected = ["self", "content", "run_id"]
     assert full_params == expected, f"全文 worker 签名应为 {expected}，实际为 {full_params}"
-    assert selected_params == expected, f"选中行 worker 签名应为 {expected}，实际为 {selected_params}"
+    assert selected_params == expected, (
+        f"选中行 worker 签名应为 {expected}，实际为 {selected_params}"
+    )
     assert missing_params == expected, f"查漏 worker 签名应为 {expected}，实际为 {missing_params}"
 
 

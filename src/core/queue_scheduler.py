@@ -739,11 +739,7 @@ class QueueTranslationCoordinator:
         restored_failed_indices: List[int] = []
         restored_completed_indices: set = set()
 
-        if (
-            file_type == "txt"
-            and self._project_repository is not None
-            and source_lines
-        ):
+        if file_type == "txt" and self._project_repository is not None and source_lines:
             try:
                 source_fingerprint = compute_file_fingerprint(Path(file_path))
             except Exception as exc:  # noqa: BLE001
@@ -1659,9 +1655,7 @@ class QueueTranslationCoordinator:
                 hint = slot.final_state_hint or QueueTaskState.COMPLETED
                 if not checkpoint_ok:
                     slot.state = QueueTaskState.ERROR
-                    slot.error_message = (
-                        f"翻译完成但保存失败：{checkpoint_error or '未知保存错误'}"
-                    )
+                    slot.error_message = f"翻译完成但保存失败：{checkpoint_error or '未知保存错误'}"
                     checkpoint_exc = OSError(checkpoint_error or "checkpoint save failed")
                     slot.actionable_error = classify_error(checkpoint_exc)
                     log_classified_error(
@@ -1829,8 +1823,10 @@ class QueueTranslationCoordinator:
             }
             save_fn = self._make_save_fn(slot, snapshot_data)
         if save_fn is None:
+
             def save_fn(generation: int) -> None:
                 return None
+
         return CheckpointSnapshot(
             task_id=task_id,
             generation=generation,

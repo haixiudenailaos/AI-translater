@@ -312,6 +312,7 @@ class CheckpointCoordinator:
                     try:
                         snap = snapshot_factory(generation)
                     except Exception as exc:  # noqa: BLE001
+
                         def _raise_snapshot_error(_generation: int, error=exc) -> None:
                             raise error
 

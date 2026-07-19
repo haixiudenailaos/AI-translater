@@ -118,10 +118,7 @@ def detect_edition_capabilities() -> EditionCapabilities:
         available = importlib.util.find_spec("manga_translator") is not None
     except (ImportError, AttributeError, ValueError):
         available = False
-    if available:
-        _cached = EditionCapabilities.full()
-    else:
-        _cached = EditionCapabilities.text()
+    _cached = EditionCapabilities.full() if available else EditionCapabilities.text()
     return _cached
 
 

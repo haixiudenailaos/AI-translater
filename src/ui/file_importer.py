@@ -260,9 +260,7 @@ class FileImporter:
 
         def worker() -> None:
             result = self._build_txt_import_result(src_path)
-            self._ui_mailbox.submit(
-                lambda: self._finish_txt_import(generation, src_path, result)
-            )
+            self._ui_mailbox.submit(lambda: self._finish_txt_import(generation, src_path, result))
 
         threading.Thread(
             target=worker,

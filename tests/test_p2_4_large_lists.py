@@ -13,7 +13,6 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-
 # ──────────────────────────────────────────────────────────────
 # TranslationTableAdapter 缓存同步测试（纯 Python，无需 Tk 显示）
 # ──────────────────────────────────────────────────────────────
@@ -172,9 +171,7 @@ class FilterCacheTests(unittest.TestCase):
         window._review_filter_var = SimpleNamespace()
         window.translation_table = _FakeTreeviewForFilter(items_values)
         if populate_cache:
-            window._row_values_cache = {
-                iid: vals for iid, vals in items_values.items()
-            }
+            window._row_values_cache = {iid: vals for iid, vals in items_values.items()}
         else:
             window._row_values_cache = {}
         return window
@@ -346,10 +343,7 @@ class GlossaryIndexTests(unittest.TestCase):
 
     def test_render_generation_cancels_stale_chunks(self):
         """快速连续渲染时，旧批次应被取消。"""
-        terms = [
-            {"source": f"term{i}", "target": f"译{i}", "category": "通用"}
-            for i in range(10)
-        ]
+        terms = [{"source": f"term{i}", "target": f"译{i}", "category": "通用"} for i in range(10)]
         window = self._make_window(terms)
 
         # 第一次渲染（启动分块）

@@ -158,9 +158,7 @@ class VolcengineImageTranslationProvider:
             status=status,
             result_map=result_map,
             failed_images=(
-                {"_global": failure_message or "AI 图片翻译未产生结果"}
-                if not result_map
-                else {}
+                {"_global": failure_message or "AI 图片翻译未产生结果"} if not result_map else {}
             ),
             provider_id=ImageTranslationProviderId.AI_VOLCENGINE,
             run_id=run_id,

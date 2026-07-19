@@ -17,12 +17,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
-
 import tkinter as tk
+from dataclasses import dataclass
+from typing import List, Tuple
 
-TkVar = Union[tk.IntVar, tk.DoubleVar, tk.StringVar, tk.BooleanVar]
+TkVar = tk.IntVar | tk.DoubleVar | tk.StringVar | tk.BooleanVar
 
 
 @dataclass
@@ -36,10 +35,10 @@ class FieldSpec:
     label: str
     var: TkVar
     kind: str  # "int" | "string"
-    lo: Optional[int] = None
-    hi: Optional[int] = None
+    lo: int | None = None
+    hi: int | None = None
     required: bool = False
-    widget: Optional[object] = None
+    widget: object | None = None
 
 
 @dataclass
@@ -48,10 +47,10 @@ class ValidationResult:
 
     ok: bool
     errors: List[Tuple[str, str]]  # [(field_name, message), ...]
-    first_failed_widget: Optional[object] = None
+    first_failed_widget: object | None = None
 
     @property
-    def first_message(self) -> Optional[str]:
+    def first_message(self) -> str | None:
         if not self.errors:
             return None
         return self.errors[0][1]
@@ -70,7 +69,7 @@ def clamp_int(value: object, lo: int, hi: int, default: int) -> int:
     return v
 
 
-def validate_int_range(value: object, lo: int, hi: int, label: str) -> Optional[str]:
+def validate_int_range(value: object, lo: int, hi: int, label: str) -> str | None:
     """整数范围校验。返回 ``None`` 表示通过，否则返回错误消息。"""
     try:
         v = int(value)  # type: ignore[arg-type]
@@ -83,7 +82,7 @@ def validate_int_range(value: object, lo: int, hi: int, label: str) -> Optional[
     return None
 
 
-def validate_required_string(value: object, label: str) -> Optional[str]:
+def validate_required_string(value: object, label: str) -> str | None:
     """必填字符串校验。"""
     if value is None:
         return f"{label}不能为空"
@@ -117,7 +116,7 @@ class FormValidator:
         var: TkVar,
         lo: int,
         hi: int,
-        widget: Optional[object] = None,
+        widget: object | None = None,
     ) -> FieldSpec:
         spec = FieldSpec(
             name=name,
@@ -137,7 +136,7 @@ class FormValidator:
         name: str,
         label: str,
         var: TkVar,
-        widget: Optional[object] = None,
+        widget: object | None = None,
     ) -> FieldSpec:
         spec = FieldSpec(
             name=name,
@@ -150,7 +149,7 @@ class FormValidator:
         self._fields.append(spec)
         return spec
 
-    def validate_field(self, spec: FieldSpec) -> Optional[str]:
+    def validate_field(self, spec: FieldSpec) -> str | None:
         """单字段校验。"""
         try:
             value = spec.var.get()
@@ -165,7 +164,7 @@ class FormValidator:
 
     def validate_all(self) -> ValidationResult:
         errors: List[Tuple[str, str]] = []
-        first_failed_widget: Optional[object] = None
+        first_failed_widget: object | None = None
         for spec in self._fields:
             msg = self.validate_field(spec)
             if msg is not None:

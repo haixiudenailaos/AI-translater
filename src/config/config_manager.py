@@ -15,6 +15,7 @@ from typing import Any, Dict
 from ..domain.secret import ConfigSaveResult, SecretSaveResult, StorageStatus
 from ..utils.file_handler import write_json_atomic
 from ..utils.logger import get_logger
+
 # P1-4：移除全局 get_key/store_key/delete_key 导入，密钥读写全部走注入的 SecretStore。
 # 这样测试可通过注入 FakeSecretStore 验证密钥操作，不依赖 keyring 后端。
 from .translation_profile import (
@@ -185,9 +186,7 @@ class ConfigManager:
                 provider = merged_config.get("provider", "siliconflow")
                 # P1-4：通过注入的 SecretStore 读取，不调用全局 get_key
                 merged_config["api_key"] = (
-                    self._get_secret_store().retrieve(f"provider:{provider}")
-                    if load_secret
-                    else ""
+                    self._get_secret_store().retrieve(f"provider:{provider}") if load_secret else ""
                 )
 
                 merged_config = apply_text_translation_profile(merged_config)
@@ -822,9 +821,7 @@ class ConfigManager:
                 if legacy_key and legacy_key.strip():
                     # R2-BUG-003：迁移旧明文密钥
                     # P1-4：通过注入的 SecretStore 存储
-                    status = self._get_secret_store().store(
-                        f"preset:{name}", legacy_key.strip()
-                    )
+                    status = self._get_secret_store().store(f"preset:{name}", legacy_key.strip())
                     if status == StorageStatus.PERSISTED:
                         needs_rewrite = True
                         logger.info(
@@ -849,13 +846,10 @@ class ConfigManager:
                     # 迁移失败时仍使用 legacy_key，迁移成功时从密钥环读取
                     # P1-4：通过注入的 SecretStore 读取
                     runtime_data["api_key"] = (
-                        self._get_secret_store().retrieve(f"preset:{name}")
-                        or legacy_key.strip()
+                        self._get_secret_store().retrieve(f"preset:{name}") or legacy_key.strip()
                     )
                 else:
-                    runtime_data["api_key"] = self._get_secret_store().retrieve(
-                        f"preset:{name}"
-                    )
+                    runtime_data["api_key"] = self._get_secret_store().retrieve(f"preset:{name}")
                 runtime_presets[name] = runtime_data
 
                 # 构造持久化对象（不含 api_key）
@@ -1017,9 +1011,7 @@ class ConfigManager:
                             "volc:ark_api_key", legacy_key
                         )
                         if migration_status != StorageStatus.PERSISTED:
-                            logger.warning(
-                                "火山引擎旧密钥未持久化，保留明文迁移文件以便下次重试"
-                            )
+                            logger.warning("火山引擎旧密钥未持久化，保留明文迁移文件以便下次重试")
                             return legacy_key
                         try:
                             self.volc_key_file.unlink()

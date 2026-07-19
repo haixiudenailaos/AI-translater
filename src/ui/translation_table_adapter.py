@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 class TranslationTableAdapter:
@@ -27,9 +27,9 @@ class TranslationTableAdapter:
         # P2-4：可选的行值缓存引用（由 MainWindow 注入）。
         # 翻译热路径更新译文时同步写入缓存，避免 apply_review_filter
         # 对 5000+ 行逐行调用 ``Treeview.item()``。
-        self._row_values_cache: Optional[Dict[str, tuple]] = None
+        self._row_values_cache: Dict[str, tuple] | None = None
 
-    def set_row_values_cache(self, cache: Optional[Dict[str, tuple]]) -> None:
+    def set_row_values_cache(self, cache: Dict[str, tuple] | None) -> None:
         """P2-4：注入行值缓存。``None`` 表示禁用缓存同步。"""
         self._row_values_cache = cache
 

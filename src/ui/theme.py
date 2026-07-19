@@ -72,7 +72,7 @@ _DEFAULT_FONT_FAMILY = "TkDefaultFont"
 
 # P2-2：持有 named font 的 Python 引用，避免 Font 对象被 GC 时
 # 把 Tk 解释器里的 named font 一并删除（tkinter.Font 默认 delete_font=True）。
-_font_registry: dict[str, "tkfont.Font"] = {}
+_font_registry: dict[str, tkfont.Font] = {}
 
 
 def _resolve_family(config_family: str | None) -> str:

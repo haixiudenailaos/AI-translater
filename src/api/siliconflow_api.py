@@ -51,9 +51,7 @@ class SiliconFlowAPI(BaseAPI):
             )
             # 重试由 BaseAPI 统一处理，transport 不再隐式重复请求。
             transport = httpx.HTTPTransport(retries=0, limits=limits, http2=True)
-            return httpx.Client(
-                timeout=self._http_timeout, transport=transport, http2=True
-            )
+            return httpx.Client(timeout=self._http_timeout, transport=transport, http2=True)
         except Exception as e:
             logger.error("重建HTTP客户端失败: %s", e)
             limits = httpx.Limits(

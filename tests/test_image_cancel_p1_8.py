@@ -645,9 +645,7 @@ class MangaWorkerClientCloseTests(unittest.TestCase):
                 # Keep the first exchange open long enough for a second caller
                 # to contend for the request lock.
                 time.sleep(0.05)
-                client._stdout_queue.put(
-                    {"type": "response", "request_id": payload["request_id"]}
-                )
+                client._stdout_queue.put({"type": "response", "request_id": payload["request_id"]})
             finally:
                 with state_lock:
                     active -= 1
