@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+
+from pathlib import Path
+
+_project_root = Path(__file__).resolve().parents[1]
+_manga_root = _project_root / "third_party" / "manga-image-translator" / "manga_translator"
 PyInstaller hook: manga-image-translator
 
 收集 manga_translator 包及其运行时所需的数据文件（YAML 配置、tokenizer 资源等）。
@@ -15,18 +20,32 @@ PyInstaller hook: manga-image-translator
 # ── manga_translator 包内数据文件 ─────────────────
 # inpainting 模块的 SD 配置 YAML（guided_ldm_inpaint4_v15.yaml / guided_ldm_inpaint9_v15.yaml）
 datas = [
-    ('manga_translator/inpainting/guided_ldm_inpaint4_v15.yaml',
-     'manga_translator/inpainting'),
-    ('manga_translator/inpainting/guided_ldm_inpaint9_v15.yaml',
-     'manga_translator/inpainting'),
+    (
+        str(_manga_root / "inpainting" / "guided_ldm_inpaint4_v15.yaml"),
+        "manga_translator/inpainting",
+    ),
+    (
+        str(_manga_root / "inpainting" / "guided_ldm_inpaint9_v15.yaml"),
+        "manga_translator/inpainting",
+    ),
 ]
 
 # translators/tokenizers 下的预置 tokenizer 配置（deepseek 等）
 datas += [
-    ('manga_translator/translators/tokenizers/deepseek/tokenizer.json',
-     'manga_translator/translators/tokenizers/deepseek'),
-    ('manga_translator/translators/tokenizers/deepseek/tokenizer_config.json',
-     'manga_translator/translators/tokenizers/deepseek'),
+    (
+        str(_manga_root / "translators" / "tokenizers" / "deepseek" / "tokenizer.json"),
+        "manga_translator/translators/tokenizers/deepseek",
+    ),
+    (
+        str(
+            _manga_root
+            / "translators"
+            / "tokenizers"
+            / "deepseek"
+            / "tokenizer_config.json"
+        ),
+        "manga_translator/translators/tokenizers/deepseek",
+    ),
 ]
 
 # ── 隐藏导入：子模块被动态加载，PyInstaller 静态分析无法识别 ──
