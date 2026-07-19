@@ -69,8 +69,7 @@ jobs:
         # P1-11：验证 `pip install .` 能成功构建 wheel 并安装，
         # 确保 pyproject.toml 的包发现（src*）和依赖声明可用
         run: |
-          python -m pip install --upgrade build
-          python -m build --wheel
+          python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
           python -m venv "$RUNNER_TEMP/wheel-smoke"
           "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --no-deps dist/*.whl
           cd "$RUNNER_TEMP"
