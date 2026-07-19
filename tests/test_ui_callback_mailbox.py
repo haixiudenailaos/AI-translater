@@ -106,6 +106,19 @@ class TestUICallbackMailbox:
         mailbox.drain()
         assert mailbox.pending_count == 0
 
+    def test_submit_keyed_coalesces_to_the_latest_pending_callback(self):
+        mailbox = UICallbackMailbox()
+        values: List[int] = []
+
+        mailbox.submit_keyed("progress", lambda: values.append(1))
+        mailbox.submit_keyed("progress", lambda: values.append(2))
+        mailbox.submit_keyed("progress", lambda: values.append(3))
+
+        callbacks = mailbox.drain()
+        assert len(callbacks) == 1
+        callbacks[0]()
+        assert values == [3]
+
 
 # ── 邮箱：关闭与迟到事件 ────────────────────────────────────
 
@@ -187,7 +200,10 @@ class TestMailboxConcurrency:
 
         assert errors == []
 
-        callbacks = mailbox.drain()
+        # PERF-6a：drain 现在有界（默认 64/轮），需循环排空
+        callbacks: list = []
+        while mailbox.pending_count > 0:
+            callbacks.extend(mailbox.drain())
         assert len(callbacks) == 800
 
     def test_concurrent_submit_and_close(self):

@@ -47,6 +47,10 @@ class TranslationTask:
     队列翻译并发优化阶段 2：动态字段由 ``ConcurrentTranslationManager.get_task``
     从 ``QueueTranslationCoordinator`` 快照重建。直接修改本对象的 ``status`` /
     ``progress`` / ``target_lines`` 不会影响 Coordinator 状态。
+
+    P1-UX-3：``error_category`` / ``error_safe_message`` / ``recommended_action``
+    / ``error_retryable`` / ``correlation_id`` / ``failed_count`` 由 Coordinator
+    落库的 ``ActionableError`` 派生，UI 直接展示安全文案与建议动作。
     """
 
     task_id: str
@@ -60,6 +64,13 @@ class TranslationTask:
     error_message: str | None = None
     mapping_dir: str | None = None  # EPUB专用
     failed_indices: List[int] = field(default_factory=list)
+    # P1-UX-3：分类错误字段（None 表示无错误或未分类）
+    error_category: str | None = None
+    error_safe_message: str | None = None
+    recommended_action: str | None = None
+    error_retryable: bool = False
+    correlation_id: str | None = None
+    failed_count: int = 0
 
 
 class ConcurrentTranslationManager:
@@ -94,6 +105,25 @@ class ConcurrentTranslationManager:
         self._progress_callback: Callable | None = None
         self._closed = False
 
+        # P1-UX-2：TXT 跨重启续传的项目仓库。从 app_paths.data_dir/projects
+        # 加载/保存项目状态。app_paths 为 None（旧测试路径）时不接入，
+        # Coordinator 降级为只写 _译文.txt 的旧行为。
+        self._project_repository = None
+        if app_paths is not None:
+            try:
+                from pathlib import Path
+
+                from ..infrastructure.project_repository import ProjectRepository
+
+                projects_dir = Path(app_paths.data_dir) / "projects"
+                self._project_repository = ProjectRepository(projects_dir)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("初始化 ProjectRepository 失败，TXT 续传降级: %s", exc)
+                self._project_repository = None
+        # P1-UX-2：指纹变化回调。默认 None（按新建处理），
+        # 由 UI 层通过 set_fingerprint_mismatch_callback 注入。
+        self._fingerprint_mismatch_callback: Callable | None = None
+
         # 构造 QueuePolicy 并启动 Coordinator
         app_config = config_manager.get_app_config()
         self._policy: QueuePolicy = build_queue_policy_from_app_config(app_config)
@@ -104,8 +134,32 @@ class ConcurrentTranslationManager:
             epub_processor=self._epub_processor,
             app_paths=app_paths,
             limiter_registry=limiter_registry,
+            project_repository=self._project_repository,
+            fingerprint_mismatch_callback=self._invoke_fingerprint_mismatch_callback,
         )
         self._coordinator.start()
+
+    # ── P1-UX-2：指纹变化回调 ──────────────────────────
+
+    def set_fingerprint_mismatch_callback(self, callback: Callable | None) -> None:
+        """P1-UX-2：注册指纹变化回调（UI 层注入）。
+
+        回调签名：``callback(info: dict) -> str``，返回 ``"new" / "map" / "discard"``。
+        回调在 Tk 主线程同步调用（``add_task`` 路径），可安全弹出 Tk 对话框。
+        """
+        self._fingerprint_mismatch_callback = callback
+
+    def _invoke_fingerprint_mismatch_callback(self, info: dict) -> str:
+        """包装回调以便异常时降级为 ``"new"``。"""
+        cb = self._fingerprint_mismatch_callback
+        if cb is None:
+            return "new"
+        try:
+            result = cb(info)
+            return result if result in ("new", "map", "discard") else "new"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("指纹变化回调异常，按新建处理: %s", exc)
+            return "new"
 
     # ── 旧 API 兼容层 ────────────────────────────────────
 
@@ -266,6 +320,13 @@ class ConcurrentTranslationManager:
             error_message=data.get("error_message"),
             mapping_dir=data.get("mapping_dir"),
             failed_indices=list(data.get("failed_indices", [])),
+            # P1-UX-3：分类错误字段透传
+            error_category=data.get("error_category"),
+            error_safe_message=data.get("error_safe_message"),
+            recommended_action=data.get("recommended_action"),
+            error_retryable=bool(data.get("error_retryable", False)),
+            correlation_id=data.get("correlation_id"),
+            failed_count=int(data.get("failed_count", 0)),
         )
 
     def get_all_tasks(self) -> List[TranslationTask]:

@@ -44,6 +44,30 @@ def convert_to_png(b64_data: str, mime_type: str) -> tuple:
     return new_b64, "image/png"
 
 
+def convert_to_png_bytes(raw: bytes, mime_type: str) -> tuple:
+    """PERF-6d：以 bytes 为输入输出进行格式转换，避免多余 base64 编解码。
+
+    内部管道统一传 bytes，只在 HTTP JSON 边界编码一次 base64。
+
+    Args:
+        raw: 原始图片二进制数据
+        mime_type: 图片MIME类型
+
+    Returns:
+        (new_raw_bytes, new_mime_type) 转换成功时返回PNG二进制数据，
+        失败时返回 (None, None)。如果原格式已支持，直接返回原数据。
+    """
+    if mime_type in SUPPORTED_MIME_TYPES:
+        return raw, mime_type
+
+    png_data = _convert_svg(raw) if mime_type == "image/svg+xml" else _convert_with_pillow(raw)
+
+    if png_data is None:
+        return None, None
+
+    return png_data, "image/png"
+
+
 def _convert_svg(raw: bytes) -> bytes | None:
     """SVG转PNG，需要cairosvg库。"""
     try:

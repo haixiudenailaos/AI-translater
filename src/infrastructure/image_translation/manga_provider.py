@@ -91,6 +91,14 @@ class _LocalMangaImageTranslationProvider:
         self._cancel_event = threading.Event()
         self._closed = False
         self._engine_lock = threading.Lock()
+        # P1-3：稳定的 progress hook 桥接。
+        # 旧实现每次 translate() 都向缓存的 engine 追加新的 progress_hook，
+        # 没有 finally 移除路径——N 次任务后 engine._progress_hooks 会有 N 个
+        # 闭包，旧闭包仍引用前一次任务的 result_map/on_progress，造成：
+        # 1) 重复回调  2) 闭包内存泄漏  3) 旧闭包向旧 UI 状态写更新。
+        # 改为：engine 上只安装一个固定的桥接 hook，translate() 仅替换
+        # ``_current_progress_hook`` 指针；finally 中清空指针，避免悬挂引用。
+        self._current_progress_hook: callable | None = None
 
     # ── 公共协议方法 ──────────────────────────────────
 
@@ -192,7 +200,10 @@ class _LocalMangaImageTranslationProvider:
         engine = self._get_or_create_engine()
         config = self._build_config(manga_lang)
 
-        # 注册进度 hook（检测取消）
+        # P1-3：稳定的 progress hook 桥接。
+        # 不再每次 translate() 都 add_progress_hook——engine 已在首次创建时
+        # 注册了 _bridge_progress_hook，它从 ``_current_progress_hook`` 读取
+        # 当前任务的可调用对象。这里把本任务的 hook 设置进去，并在 finally 中清空。
         def progress_hook(state: str, finished: bool) -> None:
             label = stage_label(state)
             if on_progress is not None:
@@ -211,58 +222,62 @@ class _LocalMangaImageTranslationProvider:
                 # 抛出外部中断异常，由 translate 协程内捕获
                 raise _TranslationInterruptProxy()
 
-        engine.add_progress_hook(progress_hook)
+        self._current_progress_hook = progress_hook
+        try:
+            for idx, (image_path, image_info) in enumerate(image_mappings.items()):
+                if self._cancel_event.is_set():
+                    break
 
-        for idx, (image_path, image_info) in enumerate(image_mappings.items()):
-            if self._cancel_event.is_set():
-                break
-
-            if on_progress is not None:
-                try:
-                    on_progress(
-                        ImageTranslationProgress(
-                            stage="准备中",
-                            current=idx,
-                            total=total,
-                            image_path=image_path,
+                if on_progress is not None:
+                    try:
+                        on_progress(
+                            ImageTranslationProgress(
+                                stage="准备中",
+                                current=idx,
+                                total=total,
+                                image_path=image_path,
+                            )
                         )
-                    )
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
-            try:
-                pil_image = self._load_image(mapping_dir, image_info)
-                if pil_image is None:
-                    failed_images[image_path] = "图片加载失败或损坏"
-                    continue
+                try:
+                    pil_image = self._load_image(mapping_dir, image_info)
+                    if pil_image is None:
+                        failed_images[image_path] = "图片加载失败或损坏"
+                        continue
 
-                ctx = self._run_translate(engine, pil_image, config)
+                    ctx = self._run_translate(engine, pil_image, config)
 
-                # 无文字 -> skipped
-                if not getattr(ctx, "text_regions", None):
-                    skipped_images.append(image_path)
-                    logger.info("图片无文字，跳过: %s", image_path)
-                    continue
+                    # 无文字 -> skipped
+                    if not getattr(ctx, "text_regions", None):
+                        skipped_images.append(image_path)
+                        logger.info("图片无文字，跳过: %s", image_path)
+                        continue
 
-                result_image = getattr(ctx, "result", None)
-                if result_image is None:
-                    failed_images[image_path] = "翻译未产生结果图片"
-                    continue
+                    result_image = getattr(ctx, "result", None)
+                    if result_image is None:
+                        failed_images[image_path] = "翻译未产生结果图片"
+                        continue
 
-                # 保存结果
-                rel_path = self._save_result(result_image, output_dir, image_path, image_info)
-                if rel_path:
-                    result_map[image_path] = rel_path
-                else:
-                    failed_images[image_path] = "结果图片保存失败"
+                    # 保存结果
+                    rel_path = self._save_result(result_image, output_dir, image_path, image_info)
+                    if rel_path:
+                        result_map[image_path] = rel_path
+                    else:
+                        failed_images[image_path] = "结果图片保存失败"
 
-            except ImageTranslationCancelled:
-                break
-            except Exception as exc:
-                # 单图失败不破坏整个任务
-                err = self._sanitize_error(str(exc))
-                failed_images[image_path] = err
-                logger.error("翻译图片失败: %s: %s", image_path, exc, exc_info=True)
+                except ImageTranslationCancelled:
+                    break
+                except Exception as exc:
+                    # 单图失败不破坏整个任务
+                    err = self._sanitize_error(str(exc))
+                    failed_images[image_path] = err
+                    logger.error("翻译图片失败: %s: %s", image_path, exc, exc_info=True)
+        finally:
+            # P1-3：清空当前 hook 指针，避免悬挂闭包引用本任务的 result_map/on_progress。
+            # engine 上的桥接 hook 仍保留，下次 translate() 只需设置新指针。
+            self._current_progress_hook = None
 
         # 确定最终状态
         if self._cancel_event.is_set():
@@ -305,7 +320,12 @@ class _LocalMangaImageTranslationProvider:
     # ── 引擎构造 ──────────────────────────────────
 
     def _get_or_create_engine(self):
-        """惰性创建 MangaTranslator 实例。"""
+        """惰性创建 MangaTranslator 实例。
+
+        P1-3：首次创建时只注册一个桥接 progress hook，它从
+        ``self._current_progress_hook`` 读取当前任务的可调用对象。
+        避免 N 次 translate() 后 engine._progress_hooks 累积 N 个闭包。
+        """
         with self._engine_lock:
             if self._engine is not None:
                 return self._engine
@@ -315,6 +335,17 @@ class _LocalMangaImageTranslationProvider:
 
             params = self._build_engine_params()
             engine = MangaTranslator(params)
+            # P1-3：稳定的桥接 hook，只安装一次
+            provider = self  # 闭包捕获 provider 引用，读取当前 hook 指针
+
+            def _bridge_progress_hook(state: str, finished: bool) -> None:
+                hook = provider._current_progress_hook
+                if hook is None:
+                    return
+                # 委托到当前任务的 hook，异常由任务侧的 try/except 处理
+                hook(state, finished)
+
+            engine.add_progress_hook(_bridge_progress_hook)
             self._engine = engine
             return engine
 

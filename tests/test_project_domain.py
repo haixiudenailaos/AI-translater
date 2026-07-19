@@ -192,6 +192,11 @@ class TestPendingIndices:
         project = _make_project()
         assert project.pending_count == 3
 
+    def test_completed_empty_translation_is_not_pending(self):
+        project = _make_project()
+        project.completed_indices.add(0)
+        assert 0 not in project.get_pending_indices()
+
 
 # ── UXF-001：手工编辑保护 ───────────────────────
 
@@ -326,6 +331,26 @@ class TestSerialization:
         assert restored.last_error == project.last_error
         assert restored.model_snapshot == project.model_snapshot
         assert restored.created_at == project.created_at
+
+    def test_round_trip_preserves_completed_empty_translation(self):
+        project = _make_project()
+        project.completed_indices.add(0)
+
+        restored = TranslationProject.from_dict(project.to_dict())
+
+        assert restored.translated_lines[0] == ""
+        assert restored.completed_indices == {0}
+        assert 0 not in restored.get_pending_indices()
+
+    def test_v1_payload_derives_completion_from_nonempty_and_manual_lines(self):
+        payload = _make_project(translations=["译文", "", "", ""]).to_dict()
+        payload["schema_version"] = 1
+        payload.pop("completed_indices")
+        payload["manually_edited_indices"] = [1]
+
+        restored = TranslationProject.from_dict(payload)
+
+        assert restored.completed_indices == {0, 1}
 
     def test_from_dict_missing_fields(self):
         """缺失字段时使用默认值"""

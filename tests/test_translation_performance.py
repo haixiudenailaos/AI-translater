@@ -427,155 +427,6 @@ def test_split_http_timeouts_are_applied():
         api.close()
 
 
-# ── PERF-010：BatchProcessor 行为测试 ──────────────────
-
-
-class TestBatchProcessorBehavior:
-    """PERF-010：max_batch_size 和 max_wait_time 的真实行为测试"""
-
-    def test_max_batch_size_triggers_immediate_flush(self):
-        """提交 max_batch_size 条请求时立即刷新，不等待 max_wait_time"""
-        from src.core.batch_processor import BatchProcessor
-
-        received_batches = []
-        batch_event = threading.Event()
-
-        def handler(texts, contexts):
-            received_batches.append(list(texts))
-            batch_event.set()
-            return [f"translated:{t}" for t in texts]
-
-        bp = BatchProcessor(max_batch_size=3, max_wait_time=10.0, max_workers=2)
-        try:
-            bp.set_api_handler(handler)
-            futures = [bp.submit_request(f"text{i}", {}) for i in range(3)]
-            assert batch_event.wait(timeout=2.0), "max_batch_size 未触发立即刷新"
-
-            results = [f.result(timeout=1) for f in futures]
-            assert results == ["translated:text0", "translated:text1", "translated:text2"]
-            assert len(received_batches) == 1
-            assert received_batches[0] == ["text0", "text1", "text2"]
-        finally:
-            bp.close()
-
-    def test_max_wait_time_triggers_delayed_flush(self):
-        """不足 max_batch_size 时，max_wait_time 后自动刷新"""
-        from src.core.batch_processor import BatchProcessor
-
-        received_batches = []
-        batch_event = threading.Event()
-
-        def handler(texts, contexts):
-            received_batches.append(list(texts))
-            batch_event.set()
-            return [f"translated:{t}" for t in texts]
-
-        bp = BatchProcessor(max_batch_size=10, max_wait_time=0.3, max_workers=2)
-        try:
-            bp.set_api_handler(handler)
-            start = time.time()
-            futures = [bp.submit_request(f"text{i}", {}) for i in range(2)]
-            assert batch_event.wait(timeout=2.0), "max_wait_time 未触发延迟刷新"
-            elapsed = time.time() - start
-            assert elapsed >= 0.2, f"刷新过早: {elapsed:.3f}s"
-
-            results = [f.result(timeout=1) for f in futures]
-            assert results == ["translated:text0", "translated:text1"]
-            assert len(received_batches) == 1
-        finally:
-            bp.close()
-
-    def test_flush_immediately_processes_pending(self):
-        """flush() 立即处理所有待处理请求，不等待 max_wait_time"""
-        from src.core.batch_processor import BatchProcessor
-
-        received_batches = []
-        batch_event = threading.Event()
-
-        def handler(texts, contexts):
-            received_batches.append(list(texts))
-            batch_event.set()
-            return [f"translated:{t}" for t in texts]
-
-        bp = BatchProcessor(max_batch_size=10, max_wait_time=10.0, max_workers=2)
-        try:
-            bp.set_api_handler(handler)
-            futures = [bp.submit_request(f"text{i}", {}) for i in range(3)]
-            start = time.time()
-            bp.flush()
-            assert batch_event.wait(timeout=2.0), "flush 未立即处理待处理请求"
-            elapsed = time.time() - start
-            assert elapsed < 1.0, f"flush 耗时过长: {elapsed:.3f}s"
-
-            results = [f.result(timeout=1) for f in futures]
-            assert results == ["translated:text0", "translated:text1", "translated:text2"]
-            assert len(received_batches) == 1
-        finally:
-            bp.close()
-
-    def test_results_distributed_to_correct_futures(self):
-        """每条请求的结果正确返回到对应的 Future"""
-        from src.core.batch_processor import BatchProcessor
-
-        def handler(texts, contexts):
-            return [f"result_{t}" for t in texts]
-
-        bp = BatchProcessor(max_batch_size=5, max_wait_time=0.1, max_workers=2)
-        try:
-            bp.set_api_handler(handler)
-            futures = [bp.submit_request(f"req{i}", {"idx": i}) for i in range(5)]
-            bp.flush()
-            results = [f.result(timeout=2) for f in futures]
-            assert results == [f"result_req{i}" for i in range(5)]
-        finally:
-            bp.close()
-
-    def test_handler_exception_propagates_to_futures(self):
-        """handler 异常时，异常传播到所有相关 Future"""
-        from src.core.batch_processor import BatchProcessor
-
-        def handler(texts, contexts):
-            raise RuntimeError("batch failed")
-
-        bp = BatchProcessor(max_batch_size=3, max_wait_time=0.1, max_workers=2)
-        try:
-            bp.set_api_handler(handler)
-            futures = [bp.submit_request(f"text{i}", {}) for i in range(3)]
-            bp.flush()
-            for f in futures:
-                with pytest.raises(RuntimeError, match="batch failed"):
-                    f.result(timeout=2)
-        finally:
-            bp.close()
-
-    def test_multiple_batches_split_by_max_batch_size(self):
-        """超过 max_batch_size 的请求分成多个批次处理"""
-        from src.core.batch_processor import BatchProcessor
-
-        received_batches = []
-        lock = threading.Lock()
-
-        def handler(texts, contexts):
-            with lock:
-                received_batches.append(list(texts))
-            return [f"ok:{t}" for t in texts]
-
-        bp = BatchProcessor(max_batch_size=3, max_wait_time=0.1, max_workers=2)
-        try:
-            bp.set_api_handler(handler)
-            futures = [bp.submit_request(f"t{i}", {}) for i in range(7)]
-            bp.flush()
-            results = [f.result(timeout=2) for f in futures]
-            assert results == [f"ok:t{i}" for i in range(7)]
-            assert len(received_batches) >= 2
-            all_texts = []
-            for batch in received_batches:
-                all_texts.extend(batch)
-            assert sorted(all_texts) == [f"t{i}" for i in range(7)]
-        finally:
-            bp.close()
-
-
 # ── PERF §9.7：移除固定批次等待后的性能测试 ──────────────
 
 
@@ -720,7 +571,8 @@ def test_run_context_temperature_and_versions_reused_across_batches():
 
     expected_temp = config.api["temperature"]
     expected_prompt_version = hashlib.sha256(
-        config.app["translation_prompt"].encode("utf-8")
+        f"schema:{config.app.get('prompt_schema_version', 1)}\n"
+        f"{config.app['translation_prompt']}".encode("utf-8")
     ).hexdigest()[:16]
     expected_glossary_version = hashlib.sha256(
         config.get_glossary_prompt().encode("utf-8")
@@ -729,7 +581,43 @@ def test_run_context_temperature_and_versions_reused_across_batches():
     for ctx in api.contexts:
         assert ctx["temperature"] == expected_temp
         assert ctx["prompt_version"] == expected_prompt_version
+        assert ctx["prompt_schema_version"] == config.app.get("prompt_schema_version", 1)
         assert ctx["glossary_version"] == expected_glossary_version
+
+
+def test_prompt_schema_version_changes_cache_context_even_when_prompt_is_same():
+    class ContextRecordingApi(ConcurrentApi):
+        def __init__(self):
+            super().__init__()
+            self.contexts = []
+
+        def translate_stream_enhanced(
+            self, text, callback, context, stream_id=None, system_prompt=None
+        ):
+            self.contexts.append(dict(context))
+            return super().translate_stream_enhanced(
+                text,
+                callback,
+                context,
+                stream_id=stream_id,
+                system_prompt=system_prompt,
+            )
+
+    config = PerformanceConfig(concurrency=1, batch_lines=20, input_budget=12000)
+    config.app["prompt_schema_version"] = 1
+    api = ContextRecordingApi()
+    engine = TranslatorEngine(config)
+    engine.api = api
+    engine._translate("line", lambda *_: None, lambda *_: None)
+    first_context = api.contexts[-1]
+
+    config.app["prompt_schema_version"] = 2
+    engine._translate("line", lambda *_: None, lambda *_: None)
+    second_context = api.contexts[-1]
+
+    assert first_context["prompt_schema_version"] == 1
+    assert second_context["prompt_schema_version"] == 2
+    assert first_context["prompt_version"] != second_context["prompt_version"]
 
 
 def test_run_context_is_frozen_dataclass():

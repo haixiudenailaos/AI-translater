@@ -16,7 +16,7 @@
 
 ### 环境要求
 
-- Python 3.11+
+- Python 3.10 及以上
 - Windows/macOS/Linux
 
 ### 安装依赖
@@ -33,34 +33,44 @@ python main.py
 
 ## 📦 预编译版本
 
-我们提供了预编译的可执行文件，无需安装Python环境即可使用：
+我们提供了两个分发的预编译版本，无需安装 Python 环境即可使用：
 
-- **Windows**: `LightNovelTranslator-1.6-Windows-x64.exe`
-- **macOS**: `LightNovelTranslator-1.6-macOS-Universal.app.zip`（解压后双击 `.app`）
+- **Text Edition**：仅包含 TXT/EPUB 文本翻译，体积小、依赖少。
+- **Full Edition**：在 Text 基础上加入本地漫画图片翻译（manga-image-translator 深度学习栈）。
 
-从 [Releases](https://github.com/haixiudenailaos/AI-translater/releases) 页面下载对应平台的版本。
+每个版本都是 **onedir 目录打包为 zip**（非单 exe），解压后运行目录内的可执行文件：
+
+- **Windows**: `LightNovelTranslator-1.6-Windows-x64-Text.zip` / `...-Full.zip`
+- **macOS**: `LightNovelTranslator-1.6-macOS-Text.app.zip` / `...-Full.app.zip`（解压后双击 `.app`）
+
+> macOS 产物为当前架构（`macos-latest` runner），不是 Universal 二进制。
+
+从 [Releases](https://github.com/haixiudenailaos/AI-translater/releases) 页面下载对应平台与版本的 zip。
 
 ## 🔧 配置说明
 
-### API配置
+### API 配置
+
+**推荐方式（安全）**：启动程序后在「设置」窗口中选择 API 提供商并填入密钥。
+密钥通过系统密钥环（keyring）加密存储，不会写入仓库配置文件，也不会以明文落盘。
+
+如需在仓库中保留一份示例配置（**不要填入真实密钥**），可复制示例：
 
 1. 复制 `config/api_config_sample.json` 为 `config/api_config.json`
-2. 填入您的API密钥：
+2. 保留占位符，**不要填入真实密钥**——真实密钥请通过「设置」窗口写入 keyring：
 
 ```json
 {
-  "deepseek": {
-    "api_key": "your_deepseek_api_key",
-    "base_url": "https://api.deepseek.com",
-    "model": "deepseek-chat"
-  },
-  "siliconflow": {
-    "api_key": "your_siliconflow_api_key",
-    "base_url": "https://api.siliconflow.cn/v1",
-    "model": "deepseek-ai/DeepSeek-V2.5"
-  }
+  "provider": "siliconflow",
+  "model_name": "deepseek-ai/DeepSeek-V3.2",
+  "base_url": "https://api.siliconflow.cn/v1",
+  "max_tokens": 8000,
+  "temperature": 0.3
 }
 ```
+
+> ⚠️ 把真实 API 密钥写入 `config/api_config.json` 并提交到仓库会导致密钥泄露，
+> 请始终通过「设置」窗口（keyring）管理密钥。
 
 ### 术语表配置
 
@@ -117,22 +127,27 @@ LightNovelTranslator-V1.6/
 ### 本地构建
 
 ```bash
-# 安装PyInstaller
-pip install pyinstaller
+# 安装 PyInstaller（固定版本，与 CI 一致）
+pip install "pyinstaller==6.11.1"
 
-# 构建可执行文件
-pyinstaller translator.spec
+# 构建 Text Edition（仅文本翻译，体积小）
+pyinstaller translator_text.spec --clean --noconfirm
+
+# 构建 Full Edition（含漫画图片翻译依赖）
+pyinstaller translator.spec --clean --noconfirm
 ```
+
+构建产物位于 `dist/LightNovelTranslatorV1.6-Text/` 与 `dist/LightNovelTranslatorV1.6/`（onedir 目录结构）。
 
 ### 自动化构建
 
-项目配置了GitHub Actions自动化构建，支持：
+项目配置了 GitHub Actions 自动化构建，支持：
 
-- ✅ GitHub Actions 构建 Windows `.exe` 和 macOS `.app`
-- ✅ 自动发布Release
-- ✅ 构建产物上传
+- ✅ 质量门禁（Ruff lint / format check / pytest）
+- ✅ 构建 Windows 与 macOS 的 Text / Full onedir 产物
+- ✅ 仅从版本 tag 发布 Release（V1.6 分支 push 不再复用固定 release tag）
 
-每次推送代码或创建标签时会自动触发构建。
+每次推送代码或创建 tag 时会自动触发构建。
 
 ## 🤝 贡献指南
 

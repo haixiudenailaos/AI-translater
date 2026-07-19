@@ -147,6 +147,7 @@ class TranslationProject:
     # 行级标记：用索引集合存储，避免逐行 dataclass 开销
     manually_edited_indices: Set[int] = field(default_factory=set)
     failed_indices: Set[int] = field(default_factory=set)
+    completed_indices: Set[int] = field(default_factory=set)
 
     # 任务状态
     status: TaskStatus = TaskStatus.PENDING
@@ -178,9 +179,11 @@ class TranslationProject:
 
     @property
     def translated_count(self) -> int:
-        """已成功翻译的行数（译文非空且非失败行）"""
+        """已确认完成的非失败行数。"""
         return sum(
-            1 for i, t in enumerate(self.translated_lines) if t and i not in self.failed_indices
+            index not in self.failed_indices
+            and (index in self.completed_indices or bool(value and value.strip()))
+            for index, value in enumerate(self.translated_lines)
         )
 
     @property
@@ -215,16 +218,19 @@ class TranslationProject:
         return self._compute_pending_indices()
 
     def _compute_pending_indices(self) -> Tuple[int, ...]:
-        """计算待翻译行索引：原文非空 + 译文为空 + 非手工编辑"""
+        """计算待翻译行索引：原文非空、未完成且非手工编辑。"""
         pending = []
-        for i, (orig, trans) in enumerate(
-            zip(self.original_lines, self.translated_lines, strict=False)
-        ):
+        for i, orig in enumerate(self.original_lines):
             if (
                 orig
                 and orig.strip()
-                and not (trans and trans.strip())
                 and i not in self.manually_edited_indices
+                and i not in self.completed_indices
+                and not (
+                    i < len(self.translated_lines)
+                    and self.translated_lines[i]
+                    and self.translated_lines[i].strip()
+                )
             ):
                 pending.append(i)
         return tuple(pending)
@@ -260,6 +266,7 @@ class TranslationProject:
         self.ensure_translated_capacity()
         self.translated_lines[index] = translated
         self.failed_indices.discard(index)
+        self.completed_indices.add(index)
         if manually_edited:
             self.manually_edited_indices.add(index)
         self.save_status = SaveStatus.UNSAVED
@@ -290,6 +297,7 @@ class TranslationProject:
             else:
                 self.translated_lines[idx] = translated
                 self.failed_indices.discard(idx)
+                self.completed_indices.add(idx)
         self.save_status = SaveStatus.UNSAVED
 
     def mark_manually_edited(self, index: int, translated: str) -> None:
@@ -299,6 +307,7 @@ class TranslationProject:
     def mark_failed(self, index: int, error: str | None = None) -> None:
         """标记某行翻译失败"""
         self.failed_indices.add(index)
+        self.completed_indices.discard(index)
         self.retry_counts[index] = self.retry_counts.get(index, 0) + 1
         if error:
             self.last_error = error
@@ -358,7 +367,7 @@ class TranslationProject:
     def to_dict(self) -> Dict[str, object]:
         """序列化为可 JSON 持久化的字典"""
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "project_id": self.project_id,
             "source_path": self.source_path,
             "source_fingerprint": self.source_fingerprint,
@@ -368,6 +377,7 @@ class TranslationProject:
             "translated_lines": list(self.translated_lines),
             "manually_edited_indices": sorted(self.manually_edited_indices),
             "failed_indices": sorted(self.failed_indices),
+            "completed_indices": sorted(self.completed_indices),
             "status": self.status.value,
             "last_operation_status": self.last_operation_status.value,
             "last_error": self.last_error,
@@ -405,6 +415,15 @@ class TranslationProject:
 
         last_error_raw = data.get("last_error")
         model_snap_raw = data.get("model_snapshot")
+        translated_lines = list(data.get("translated_lines", []))  # type: ignore[arg-type]
+        completed_raw = data.get("completed_indices")
+        if isinstance(completed_raw, (list, tuple, set)):
+            completed_indices = {int(index) for index in completed_raw}
+        else:
+            completed_indices = set(data.get("manually_edited_indices", []) or [])
+            completed_indices.update(
+                index for index, value in enumerate(translated_lines) if value and value.strip()
+            )
         return cls(
             project_id=str(data.get("project_id", "")),
             source_path=str(data.get("source_path", "")),
@@ -412,9 +431,10 @@ class TranslationProject:
             file_type=str(data.get("file_type", "txt")),
             mapping_dir=str(data.get("mapping_dir", "")),
             original_lines=list(data.get("original_lines", [])),  # type: ignore[arg-type]
-            translated_lines=list(data.get("translated_lines", [])),  # type: ignore[arg-type]
+            translated_lines=translated_lines,
             manually_edited_indices=set(data.get("manually_edited_indices", []) or []),  # type: ignore[arg-type]
             failed_indices=set(data.get("failed_indices", []) or []),  # type: ignore[arg-type]
+            completed_indices=completed_indices,
             status=status,
             last_operation_status=op_status,
             last_error=str(last_error_raw) if last_error_raw else None,

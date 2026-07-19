@@ -3,6 +3,7 @@
 术语库管理窗口模块
 """
 
+import copy
 import json
 import tkinter as tk
 from pathlib import Path
@@ -18,6 +19,13 @@ class GlossaryWindow:
 
         # P1-7：搜索 debounce 的 after_id，避免每次按键都重建整个列表
         self._search_after_id = None
+        # P2-4：术语索引 + 分块渲染状态。
+        # _term_index 缓存 (source, target, category, source_lower, target_lower)，
+        # 避免每次搜索都对 5000 术语重复 lower() 字符串。
+        # _render_generation 用于取消过期的分块渲染任务（用户快速输入时）。
+        self._term_index: list[tuple[str, str, str, str, str]] = []
+        self._render_generation = 0
+        self._render_after_id = None
 
         # 创建术语库窗口
         self.window = tk.Toplevel(parent)
@@ -29,11 +37,32 @@ class GlossaryWindow:
         # 居中显示
         self.center_window()
 
-        # 加载术语库数据
-        self.glossary_data = config_manager.get_glossary()
+        # P1-7：使用 deepcopy 创建工作副本，避免用户编辑直接修改
+        # ConfigManager 的内部状态（get_glossary 仅浅拷贝，嵌套 terms/categories
+        # 仍是原始列表的引用）。所有修改操作在工作副本上进行，保存时原子提交。
+        self.glossary_data = copy.deepcopy(config_manager.get_glossary())
+        # P1-7：dirty 标记，关闭时据此弹 Save/Discard/Cancel
+        self._dirty = False
 
         self.setup_ui()
         self.load_terms()
+
+        # P1-7：拦截窗口关闭动作（Escape / WM_DELETE_WINDOW / 关闭按钮），
+        # 有未保存修改时弹 Save/Discard/Cancel 三选一。
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.window.bind("<Escape>", lambda _event: self._on_close())
+        self.window.bind("<Destroy>", self._on_destroy_restore_focus, add="+")
+
+    def _on_destroy_restore_focus(self, event: tk.Event) -> None:
+        """P2-1：窗口销毁后把焦点还给父窗口。"""
+        if event.widget is not self.window:
+            return
+        parent = self.parent
+        try:
+            if parent is not None and parent.winfo_exists():
+                parent.focus_set()
+        except tk.TclError:
+            pass
 
     def center_window(self):
         """窗口居中显示"""
@@ -171,26 +200,72 @@ class GlossaryWindow:
         ttk.Button(button_frame, text="保存", command=self.save_glossary).pack(
             side=tk.RIGHT, padx=(5, 0)
         )
-        ttk.Button(button_frame, text="关闭", command=self.window.destroy).pack(side=tk.RIGHT)
+        # P1-7：关闭按钮走 _on_close，检查 dirty 后再决定是否关闭
+        ttk.Button(button_frame, text="关闭", command=self._on_close).pack(side=tk.RIGHT)
 
     def load_terms(self):
-        """加载术语到列表"""
+        """加载术语到列表。
+
+        P2-4：构建 _term_index 一次性预计算 lowered 字符串，搜索时不再
+        对每个术语重复 lower()。同时触发一次全量渲染（分块）。
+        """
+        terms = self.glossary_data.get("terms", [])
+        self._term_index = [
+            (
+                term.get("source", ""),
+                term.get("target", ""),
+                term.get("category", "通用"),
+                term.get("source", "").lower(),
+                term.get("target", "").lower(),
+            )
+            for term in terms
+        ]
+        # 全量渲染（无筛选）
+        self._render_terms(self._term_index)
+
+    def _render_terms(self, rows):
+        """P2-4：分块渲染术语到 Treeview。
+
+        ``rows`` 是 [(source, target, category, source_lower, target_lower), ...]。
+        先清空 Treeview，再按 250 行/批插入，用 after(1) 让出主线程，
+        避免 5000 术语一次性阻塞 UI。
+        """
+        # 取消上一个未完成的渲染任务
+        if self._render_after_id is not None:
+            try:
+                self.window.after_cancel(self._render_after_id)
+            except Exception:
+                pass
+            self._render_after_id = None
+        self._render_generation += 1
+        generation = self._render_generation
+
         # 清空现有项目
         for item in self.term_tree.get_children():
             self.term_tree.delete(item)
 
-        # 添加术语
-        terms = self.glossary_data.get("terms", [])
-        for term in terms:
+        self._render_chunk(rows, 0, generation)
+
+    def _render_chunk(self, rows, start, generation):
+        """P2-4：分块插入术语行。generation 不匹配时立即中止。"""
+        if generation != self._render_generation or not self.window.winfo_exists():
+            self._render_after_id = None
+            return
+        chunk_size = 250
+        end = min(start + chunk_size, len(rows))
+        for i in range(start, end):
+            source, target, category, _src_lower, _tgt_lower = rows[i]
             self.term_tree.insert(
                 "",
                 tk.END,
-                values=(
-                    term.get("source", ""),
-                    term.get("target", ""),
-                    term.get("category", "通用"),
-                ),
+                values=(source, target, category),
             )
+        if end < len(rows):
+            self._render_after_id = self.window.after(
+                1, lambda: self._render_chunk(rows, end, generation)
+            )
+        else:
+            self._render_after_id = None
 
     def on_search(self, event=None):
         """搜索术语。
@@ -210,33 +285,28 @@ class GlossaryWindow:
         self._search_after_id = self.window.after(300, self._do_search)
 
     def _do_search(self):
-        """实际执行搜索（由 debounce 定时器调用）。"""
+        """实际执行搜索（由 debounce 定时器调用）。
+
+        P2-4：使用 _term_index 预计算的 lowered 字符串，搜索时只做
+        substring 检查，不再对 5000 术语重复 lower()。匹配结果交给
+        _render_terms 分块渲染。
+        """
         self._search_after_id = None
         search_text = self.search_var.get().lower()
         category = self.category_var.get()
 
-        # 清空现有项目
-        for item in self.term_tree.get_children():
-            self.term_tree.delete(item)
-
-        # 筛选并添加术语
-        terms = self.glossary_data.get("terms", [])
-        for term in terms:
-            source = term.get("source", "").lower()
-            target = term.get("target", "").lower()
-            term_category = term.get("category", "通用")
-
+        # 使用索引筛选
+        matched = []
+        for source, target, term_category, source_lower, target_lower in self._term_index:
             # 分类筛选
             if category != "全部" and term_category != category:
                 continue
-
             # 搜索筛选
-            if search_text and search_text not in source and search_text not in target:
+            if search_text and search_text not in source_lower and search_text not in target_lower:
                 continue
+            matched.append((source, target, term_category, source_lower, target_lower))
 
-            self.term_tree.insert(
-                "", tk.END, values=(term.get("source", ""), term.get("target", ""), term_category)
-            )
+        self._render_terms(matched)
 
     def on_category_change(self, event=None):
         """分类改变事件"""
@@ -273,6 +343,8 @@ class GlossaryWindow:
         new_term = {"source": source, "target": target, "category": category or "通用"}
 
         self.glossary_data["terms"].append(new_term)
+        # P1-7：标记工作副本有未保存修改
+        self._dirty = True
 
         # 刷新列表
         self.load_terms()
@@ -309,6 +381,8 @@ class GlossaryWindow:
                 term["source"] = source
                 term["target"] = target
                 term["category"] = category or "通用"
+                # P1-7：标记工作副本有未保存修改
+                self._dirty = True
                 break
 
         # 刷新列表
@@ -330,6 +404,8 @@ class GlossaryWindow:
             self.glossary_data["terms"] = [
                 term for term in self.glossary_data["terms"] if term["source"] != source_to_delete
             ]
+            # P1-7：标记工作副本有未保存修改
+            self._dirty = True
 
             # 刷新列表
             self.load_terms()
@@ -373,6 +449,9 @@ class GlossaryWindow:
                         ]
                         self.glossary_data["categories"].extend(new_categories)
 
+                    # P1-7：标记工作副本有未保存修改
+                    self._dirty = True
+
                     self.load_terms()
                     messagebox.showinfo("导入成功", f"成功导入 {len(new_terms)} 个术语")
                 else:
@@ -400,8 +479,46 @@ class GlossaryWindow:
                 messagebox.showerror("导出错误", f"导出失败: {str(e)}")
 
     def save_glossary(self):
-        """保存术语库"""
+        """保存术语库。
+
+        P1-7：ConfigManager.save_glossary 内部走 write_json_atomic 原子写入，
+        成功后将 self.glossary 替换为传入的工作副本——工作副本成为新的真相源，
+        dirty 标记重置为 False。
+        """
         if self.config_manager.save_glossary(self.glossary_data):
+            # P1-7：原子提交成功，工作副本与磁盘一致
+            self._dirty = False
             messagebox.showinfo("保存成功", "术语库已保存")
         else:
             messagebox.showerror("保存失败", "术语库保存失败")
+
+    def _on_close(self) -> None:
+        """P1-7：关闭窗口前的 dirty 检查。
+
+        - 无未保存修改：直接销毁窗口。
+        - 有未保存修改：弹三选一对话框
+            * 保存：原子提交，成功后销毁；失败则保留窗口。
+            * 不保存：丢弃修改，直接销毁。
+            * 取消：保留窗口（焦点回编辑区）。
+        """
+        if not self._dirty:
+            self.window.destroy()
+            return
+
+        choice = messagebox.askyesnocancel(
+            "未保存的修改",
+            "术语库有未保存的修改，是否保存？",
+        )
+        if choice is None:
+            # 用户取消，保留窗口
+            return
+        if choice:
+            # 保存
+            if self.config_manager.save_glossary(self.glossary_data):
+                self._dirty = False
+                self.window.destroy()
+            else:
+                messagebox.showerror("保存失败", "术语库保存失败，未关闭窗口")
+        else:
+            # 不保存，丢弃修改
+            self.window.destroy()

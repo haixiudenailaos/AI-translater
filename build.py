@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-轻小说翻译器V1.6 automated build script
+轻小说翻译器 V1.6 automated build script
 使用 PyInstaller 构建可执行文件，支持清理、构建、信息更新等功能
 """
 
@@ -13,6 +13,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# P1-12：构建版本来自单一版本源 src/_version.py，避免与 main.py/pyproject 不一致
+from src._version import __version__, display_version
+
 
 class BuildManager:
     """构建管理器"""
@@ -23,7 +26,9 @@ class BuildManager:
         self.dist_dir = self.project_root / "dist"
         self.spec_file = self.project_root / "translator.spec"
         self.build_info_file = self.dist_dir / "build_info.json"
-        self.version = "1.6"  # build script version
+        # P1-12：full 版本写入 build_info，短版本用于展示
+        self.version = __version__  # full semver
+        self.display_version = display_version()
 
     def print_status(self, message, status="INFO"):
         """打印状态信息"""
@@ -224,7 +229,10 @@ class BuildManager:
     def build(self, clean=True):
         """执行完整构建流程"""
         self.print_status("=" * 60)
-        self.print_status("LightNovelTranslator V1.6 - automated build", "INFO")
+        # P1-12：展示版本来自单一版本源
+        self.print_status(
+            f"LightNovelTranslator V{self.display_version} - automated build", "INFO"
+        )
         self.print_status("=" * 60)
 
         # 1. 清理构建目录（可选）

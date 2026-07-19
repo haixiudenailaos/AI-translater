@@ -93,6 +93,7 @@ class ImportFailure(str, Enum):
     TARGET_NOT_WRITABLE = "target_not_writable"
     MAPPING_FAILED = "mapping_failed"
     EPUB_PARSE_FAILED = "epub_parse_failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +138,16 @@ class ImportResult:
             failed_path=failed_path,
         )
 
+    @classmethod
+    def cancelled(cls) -> ImportResult:
+        """Create a non-error result for an import cancelled by the user."""
+        return cls(succeeded=False, failure_kind=ImportFailure.CANCELLED)
+
+    @property
+    def cancelled_by_user(self) -> bool:
+        """Whether this result represents an expected user cancellation."""
+        return self.failure_kind is ImportFailure.CANCELLED
+
     @property
     def user_message(self) -> str:
         """面向用户的错误消息。"""
@@ -148,6 +159,7 @@ class ImportResult:
             ImportFailure.TARGET_NOT_WRITABLE: "无法创建译文文件",
             ImportFailure.MAPPING_FAILED: "EPUB 映射保存失败",
             ImportFailure.EPUB_PARSE_FAILED: "EPUB 解析失败",
+            ImportFailure.CANCELLED: "已取消导入",
         }.get(self.failure_kind, "导入失败")
         path_info = f"：{self.failed_path}" if self.failed_path else ""
         detail = f"\n\n原因：{self.error_message}" if self.error_message else ""

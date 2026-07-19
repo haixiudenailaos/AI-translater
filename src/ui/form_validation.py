@@ -1,0 +1,221 @@
+"""P2-5：表单字段级校验工具。
+
+为 ``SettingsWindow`` 提供可复用的字段校验器：
+
+- ``clamp_int``：把越界值收敛到 ``[lo, hi]``。
+- ``validate_int_range`` / ``validate_required_string``：单字段校验，返回
+  ``None`` 或可读错误消息。
+- ``FormValidator``：聚合字段配置，``validate_all`` 返回
+  ``(errors, first_failed_widget)``，供调用方聚焦首错。
+
+设计目标：
+
+1. 即时反馈：``<FocusOut>`` 时单字段校验并修正，避免保存时才弹通用错误。
+2. 首错聚焦：跨字段校验失败时把焦点设到第一个出错字段。
+3. 不依赖 Tk：核心校验纯 Python，便于单元测试；widget 引用由调用方注入。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple, Union
+
+import tkinter as tk
+
+TkVar = Union[tk.IntVar, tk.DoubleVar, tk.StringVar, tk.BooleanVar]
+
+
+@dataclass
+class FieldSpec:
+    """单个字段的最小校验配置。
+
+    ``widget`` 可为 ``None``（如纯逻辑字段），此时不会进入首错聚焦候选。
+    """
+
+    name: str
+    label: str
+    var: TkVar
+    kind: str  # "int" | "string"
+    lo: Optional[int] = None
+    hi: Optional[int] = None
+    required: bool = False
+    widget: Optional[object] = None
+
+
+@dataclass
+class ValidationResult:
+    """``FormValidator.validate_all`` 的返回值。"""
+
+    ok: bool
+    errors: List[Tuple[str, str]]  # [(field_name, message), ...]
+    first_failed_widget: Optional[object] = None
+
+    @property
+    def first_message(self) -> Optional[str]:
+        if not self.errors:
+            return None
+        return self.errors[0][1]
+
+
+def clamp_int(value: object, lo: int, hi: int, default: int) -> int:
+    """把任意输入收敛到 ``[lo, hi]``，无法解析时返回 ``default``。"""
+    try:
+        v = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def validate_int_range(value: object, lo: int, hi: int, label: str) -> Optional[str]:
+    """整数范围校验。返回 ``None`` 表示通过，否则返回错误消息。"""
+    try:
+        v = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return f"{label}必须是整数"
+    if v < lo:
+        return f"{label}不能小于 {lo}"
+    if v > hi:
+        return f"{label}不能大于 {hi}"
+    return None
+
+
+def validate_required_string(value: object, label: str) -> Optional[str]:
+    """必填字符串校验。"""
+    if value is None:
+        return f"{label}不能为空"
+    text = str(value).strip()
+    if not text:
+        return f"{label}不能为空"
+    return None
+
+
+class FormValidator:
+    """聚合多个 ``FieldSpec``，提供整表校验。
+
+    用法::
+
+        validator = FormValidator()
+        validator.register_int("max_tokens", "最大令牌数", var, spin_widget, 1000, 32768)
+        result = validator.validate_all()
+        if not result.ok:
+            messagebox.showwarning("配置无效", result.first_message)
+            if result.first_failed_widget is not None:
+                result.first_failed_widget.focus_set()
+    """
+
+    def __init__(self) -> None:
+        self._fields: List[FieldSpec] = []
+
+    def register_int(
+        self,
+        name: str,
+        label: str,
+        var: TkVar,
+        lo: int,
+        hi: int,
+        widget: Optional[object] = None,
+    ) -> FieldSpec:
+        spec = FieldSpec(
+            name=name,
+            label=label,
+            var=var,
+            kind="int",
+            lo=lo,
+            hi=hi,
+            required=True,
+            widget=widget,
+        )
+        self._fields.append(spec)
+        return spec
+
+    def register_required_string(
+        self,
+        name: str,
+        label: str,
+        var: TkVar,
+        widget: Optional[object] = None,
+    ) -> FieldSpec:
+        spec = FieldSpec(
+            name=name,
+            label=label,
+            var=var,
+            kind="string",
+            required=True,
+            widget=widget,
+        )
+        self._fields.append(spec)
+        return spec
+
+    def validate_field(self, spec: FieldSpec) -> Optional[str]:
+        """单字段校验。"""
+        try:
+            value = spec.var.get()
+        except (tk.TclError, AttributeError):
+            return f"{spec.label}无效"
+        if spec.kind == "int":
+            assert spec.lo is not None and spec.hi is not None
+            return validate_int_range(value, spec.lo, spec.hi, spec.label)
+        if spec.required:
+            return validate_required_string(value, spec.label)
+        return None
+
+    def validate_all(self) -> ValidationResult:
+        errors: List[Tuple[str, str]] = []
+        first_failed_widget: Optional[object] = None
+        for spec in self._fields:
+            msg = self.validate_field(spec)
+            if msg is not None:
+                errors.append((spec.name, msg))
+                if first_failed_widget is None and spec.widget is not None:
+                    first_failed_widget = spec.widget
+        return ValidationResult(
+            ok=not errors,
+            errors=errors,
+            first_failed_widget=first_failed_widget,
+        )
+
+    def clamp_field(self, spec: FieldSpec) -> None:
+        """把字段值收敛到 ``[lo, hi]``，原地写回 ``var``。"""
+        if spec.kind != "int" or spec.lo is None or spec.hi is None:
+            return
+        try:
+            current = spec.var.get()
+        except (tk.TclError, AttributeError):
+            return
+        clamped = clamp_int(current, spec.lo, spec.hi, default=spec.lo)
+        try:
+            spec.var.set(clamped)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def attach_focus_out_clamp(self, spec: FieldSpec) -> None:
+        """为字段绑定 ``<FocusOut>`` 自动 clamp + 即时校验。
+
+        适用于 ``ttk.Spinbox``：用户离开字段时若输入非法文本，立即收敛到合法值，
+        避免保存时才暴露错误。
+        """
+        widget = spec.widget
+        if widget is None:
+            return
+
+        def _on_focus_out(_event: tk.Event) -> None:
+            self.clamp_field(spec)
+
+        try:
+            widget.bind("<FocusOut>", _on_focus_out, add="+")
+        except (tk.TclError, AttributeError):
+            pass
+
+
+__all__ = [
+    "FieldSpec",
+    "ValidationResult",
+    "FormValidator",
+    "clamp_int",
+    "validate_int_range",
+    "validate_required_string",
+]

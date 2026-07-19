@@ -18,9 +18,11 @@ EPUB 导出协调模块
 
 import hashlib
 import json
+import os
 import re
-from io import BytesIO
 from pathlib import Path
+from shutil import copyfileobj
+from tempfile import NamedTemporaryFile
 from typing import Dict
 from uuid import uuid4
 from xml.etree import ElementTree
@@ -28,7 +30,6 @@ from zipfile import ZipFile
 
 from ..domain.errors import EpubFingerprintMismatchError
 from ..utils.logger import get_logger
-from .atomic_file import write_bytes_atomic
 from .document_order import get_item_name, iter_spine_documents, normalize_chapter_id
 from .image_rewriter import (
     add_translated_images,
@@ -233,6 +234,7 @@ def export_epub(
     # 写出 EPUB
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_toc_link_ids(book, epub)
     epub.write_epub(str(out_path), book)
     _enforce_single_page_spine(out_path)
     return str(out_path)
@@ -269,34 +271,81 @@ def _configure_single_page_pagination(
 
 def _enforce_single_page_spine(epub_path: Path) -> None:
     """Add itemref overrides readers use when package spread metadata is ignored."""
-    with ZipFile(epub_path, "r") as archive:
-        entries = [(info, archive.read(info.filename)) for info in archive.infolist()]
-        comment = archive.comment
-        container_content = archive.read("META-INF/container.xml")
+    temporary_path: Path | None = None
+    try:
+        with ZipFile(epub_path, "r") as source:
+            container = ElementTree.fromstring(source.read("META-INF/container.xml"))
+            rootfile = container.find("{*}rootfiles/{*}rootfile")
+            if rootfile is None or not rootfile.get("full-path"):
+                raise ValueError("EPUB container.xml 缺少 rootfile")
+            package_path = str(rootfile.get("full-path"))
+            package_text = source.read(package_path).decode("utf-8")
+            updated_package = re.sub(
+                r"<itemref\b(?P<attrs>[^>]*?)(?P<slash>/?)>",
+                _add_itemref_pagination_properties,
+                package_text,
+            ).encode("utf-8")
 
-    container = ElementTree.fromstring(container_content)
-    rootfile = container.find("{*}rootfiles/{*}rootfile")
-    if rootfile is None or not rootfile.get("full-path"):
-        raise ValueError("EPUB container.xml 缺少 rootfile")
-    package_path = str(rootfile.get("full-path"))
-    package_content = dict((info.filename, content) for info, content in entries)[package_path]
-    package_text = package_content.decode("utf-8")
-    package_text = re.sub(
-        r"<itemref\b(?P<attrs>[^>]*?)(?P<slash>/?)>",
-        _add_itemref_pagination_properties,
-        package_text,
-    )
-    updated_package = package_text.encode("utf-8")
+            with NamedTemporaryFile(
+                mode="wb",
+                delete=False,
+                dir=epub_path.parent,
+                prefix=f".{epub_path.stem}.",
+                suffix=".tmp",
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
 
-    output = BytesIO()
-    with ZipFile(output, "w") as archive:
-        archive.comment = comment
-        for info, content in entries:
-            archive.writestr(
-                info,
-                updated_package if info.filename == package_path else content,
-            )
-    write_bytes_atomic(epub_path, output.getvalue())
+            with ZipFile(temporary_path, "w") as destination:
+                destination.comment = source.comment
+                for info in source.infolist():
+                    if info.filename == package_path:
+                        destination.writestr(info, updated_package)
+                        continue
+                    with source.open(info, "r") as source_entry:
+                        with destination.open(info, "w") as destination_entry:
+                            copyfileobj(source_entry, destination_entry, length=1024 * 1024)
+        os.replace(temporary_path, epub_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _ensure_toc_link_ids(book, epub_module) -> None:
+    """Give deserialized TOC links stable NCX identifiers before writing.
+
+    ebooklib reads a NAV document into ``Link`` objects without their NCX-only
+    ``uid`` field.  Its writer requires that field, so a read-modify-write
+    export otherwise fails while rebuilding the NCX table of contents.
+    """
+
+    used_ids: set[str] = set()
+
+    def visit(items, path: tuple[int, ...] = ()) -> None:
+        for index, item in enumerate(items):
+            item_path = (*path, index)
+            if isinstance(item, (tuple, list)):
+                if item:
+                    visit((item[0],), (*item_path, 0))
+                if len(item) > 1:
+                    visit(item[1], (*item_path, 1))
+                continue
+            if not isinstance(item, epub_module.Link):
+                continue
+            existing = getattr(item, "uid", None)
+            if isinstance(existing, str) and existing.strip() and existing not in used_ids:
+                used_ids.add(existing)
+                continue
+            fingerprint = f"{item.href}\n{item.title}\n{item_path}"
+            candidate = f"nav_{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:16]}"
+            suffix = 1
+            while candidate in used_ids:
+                suffix += 1
+                candidate = f"nav_{hashlib.sha256(f'{fingerprint}:{suffix}'.encode('utf-8')).hexdigest()[:16]}"
+            item.uid = candidate
+            used_ids.add(candidate)
+
+    visit(book.toc)
 
 
 def _add_itemref_pagination_properties(match) -> str:

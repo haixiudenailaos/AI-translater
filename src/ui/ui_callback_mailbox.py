@@ -44,6 +44,7 @@ class UICallbackMailbox:
 
     def __init__(self) -> None:
         self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self._keyed_callbacks: dict[str, Callable[[], None]] = {}
         self._closed = False
         self._lock = Lock()
         self._discarded_count = 0
@@ -61,6 +62,31 @@ class UICallbackMailbox:
                 return
             self._total_submitted += 1
         self._queue.put(callback)
+
+    def submit_keyed(self, key: str, callback: Callable[[], None]) -> None:
+        """Submit at most one pending callback for a coalescing key.
+
+        Progress producers can replace a stale pending render with their newest
+        state without growing the Tk backlog. Normal ``submit`` calls retain
+        strict FIFO behavior for terminal and user-visible callbacks.
+        """
+        with self._lock:
+            if self._closed:
+                self._discarded_count += 1
+                return
+            already_pending = key in self._keyed_callbacks
+            self._keyed_callbacks[key] = callback
+            self._total_submitted += 1
+        if already_pending:
+            return
+
+        def run_latest() -> None:
+            with self._lock:
+                latest = self._keyed_callbacks.pop(key, None)
+            if latest is not None:
+                latest()
+
+        self._queue.put(run_latest)
 
     def drain(self) -> List[Callable[[], None]]:
         """主线程排空邮箱，返回待执行回调列表（保持提交顺序）。
@@ -81,6 +107,7 @@ class UICallbackMailbox:
         """关闭邮箱，拒绝后续 ``submit``。幂等。"""
         with self._lock:
             self._closed = True
+            self._keyed_callbacks.clear()
 
     @property
     def is_closed(self) -> bool:

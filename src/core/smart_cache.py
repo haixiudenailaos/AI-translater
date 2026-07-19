@@ -8,20 +8,25 @@ import hashlib
 import json
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict
 
 
 class SmartCache:
     def __init__(
         self,
-        max_memory_size: int = 1000,
+        max_entries: int = 1000,
         ttl_hours: int = 24,
         **_kwargs,
     ):
-        self.max_memory_size = max_memory_size
+        # PERF-6b：原字段名 ``max_memory_size`` 实为条目数而非字节，
+        # 重命名为 ``max_entries`` 以消除语义歧义。
+        # ``OrderedDict`` 提供 O(1) LRU 淘汰：访问时 move_to_end，
+        # 超容量时 popitem(last=False) 移除最久未访问项。
+        self.max_entries = max_entries
         self.ttl_seconds = ttl_hours * 3600
 
-        self._store: Dict[str, Dict[str, Any]] = {}
+        self._store: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
@@ -49,36 +54,30 @@ class SmartCache:
                 del self._store[key]
                 self._misses += 1
                 return None
-            # PERF-009：LRU 淘汰策略，更新最近访问时间
-            item["last_access"] = time.time()
+            # PERF-6b：O(1) LRU——命中时移到末尾（最近使用）
+            self._store.move_to_end(key)
             self._hits += 1
             return item["value"]
 
     def set(self, text: str, value: str, context: Dict[str, Any] | None = None) -> None:
         key = self._make_key(text, context)
         with self._lock:
-            # PERF-009：LRU 容量控制，优先淘汰过期项，再淘汰最久未访问的项
-            if len(self._store) >= self.max_memory_size and key not in self._store:
-                try:
-                    # 优先淘汰过期的
-                    expired_keys = [k for k, v in self._store.items() if self._is_expired(v)]
-                    if expired_keys:
-                        for k in expired_keys:
-                            del self._store[k]
-                    # 仍超容量则淘汰最久未访问的
-                    if len(self._store) >= self.max_memory_size:
-                        lru_key = min(
-                            self._store, key=lambda k: self._store[k].get("last_access", 0)
-                        )
-                        del self._store[lru_key]
-                except Exception:
-                    pass
+            # PERF-6b：O(1) LRU 容量控制
+            if key not in self._store and len(self._store) >= self.max_entries:
+                # 优先淘汰过期的
+                expired_keys = [k for k, v in self._store.items() if self._is_expired(v)]
+                for k in expired_keys:
+                    del self._store[k]
+                # 仍超容量则淘汰最久未访问的（OrderedDict 首项）
+                while len(self._store) >= self.max_entries:
+                    self._store.popitem(last=False)
 
             self._store[key] = {
                 "value": value,
                 "expire_at": time.time() + self.ttl_seconds,
-                "last_access": time.time(),
             }
+            # 新写入的项移到末尾（最近使用）
+            self._store.move_to_end(key)
 
     def get_stats(self) -> Dict[str, Any]:
         with self._lock:
@@ -87,7 +86,7 @@ class SmartCache:
                 "hits": self._hits,
                 "misses": self._misses,
                 "ttl_seconds": self.ttl_seconds,
-                "capacity": self.max_memory_size,
+                "capacity": self.max_entries,
             }
 
     def clear_all(self) -> None:

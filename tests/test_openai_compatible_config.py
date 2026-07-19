@@ -17,6 +17,9 @@ from src.config.translation_profile import (
             "https://api.example.com/v1",
         ),
         ("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1"),
+        ("http://localhost:8080/v1", "http://localhost:8080/v1"),
+        ("http://[::1]:8080/v1", "http://[::1]:8080/v1"),
+        ("http://127.1.2.3/v1", "http://127.1.2.3/v1"),
     ],
 )
 def test_normalize_openai_base_url(value, expected):
@@ -30,6 +33,57 @@ def test_normalize_openai_base_url(value, expected):
 def test_normalize_openai_base_url_rejects_invalid_values(value):
     with pytest.raises(ValueError):
         normalize_openai_base_url(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "http://api.example.com/v1",
+        "http://10.0.0.1/v1",
+        "http://192.168.1.1/v1",
+        "http://169.254.1.1/v1",
+        "http://8.8.8.8/v1",
+        "http://intranet.corp/v1",
+    ],
+)
+def test_normalize_openai_base_url_rejects_remote_http(value):
+    """P1-1：远程明文 HTTP 端点必须被拒绝，避免 Bearer 密钥泄漏。"""
+    with pytest.raises(ValueError, match="HTTPS"):
+        normalize_openai_base_url(value)
+
+
+def test_save_api_config_rejects_remote_http_outside_settings_ui(tmp_config_manager):
+    """Endpoint policy must hold for programmatic/config-file callers too."""
+    from src.domain.secret import StorageStatus
+
+    config = tmp_config_manager.get_api_config()
+    config.update(
+        {
+            "provider": OPENAI_COMPATIBLE_PROVIDER,
+            "base_url": "http://10.0.0.8/v1",
+            "api_key": "sk-test",
+            "model_name": "chat",
+        }
+    )
+
+    result = tmp_config_manager.save_api_config(config)
+
+    assert result.failed
+    assert result.secret_status is StorageStatus.FAILED
+
+
+def test_base_api_rejects_remote_http_before_request():
+    from src.api.base_api import BaseAPI
+
+    with pytest.raises(ValueError, match="HTTPS"):
+        BaseAPI(
+            {
+                "base_url": "http://203.0.113.10/v1",
+                "api_key": "sk-test",
+                "enable_batch": False,
+                "enable_cache": False,
+            }
+        )
 
 
 def test_custom_provider_config_is_saved_without_plaintext_key(

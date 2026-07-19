@@ -34,12 +34,11 @@ a = Analysis(
     ],
     binaries=[],
     datas=[
+        ('build/edition_text.json', 'edition.json'),
         # PERF §11.3：仅保留真正的非 Python 资源；src 模块由 Analysis/PYZ 收集。
         # 配置文件目录（仅包含示例文件和基础配置）
         ('config/api_config_sample.json', 'config'),
         ('config/glossary_sample.json', 'config'),
-        ('config/app_config.json', 'config'),
-        ('config/glossary.json', 'config'),
     ]
     + _font_datas,
     hiddenimports=[
@@ -56,7 +55,6 @@ a = Analysis(
         'src.ui.tk_event_pump',
         'src.config.config_manager',
         'src.core.translator',
-        'src.core.batch_processor',
         'src.core.epub_processor',
         'src.core.smart_cache',
         'src.api.deepseek_api',
@@ -89,6 +87,7 @@ a = Analysis(
         'bs4',
         'lxml',
         'PIL',
+        'cairosvg',
         'chardet',
         'requests',
         'aiohttp',
@@ -174,6 +173,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    manifest=str(project_root / 'windows.manifest'),
     # 如果有图标文件，取消下面这行的注释
     # icon='assets/icon.ico',
 )

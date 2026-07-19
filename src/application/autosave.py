@@ -131,6 +131,10 @@ class AutosaveCoordinator:
         self._flush_event = threading.Event()
         self._flush_event.set()  # 初始无保存，无需等待
         self._closed = False
+        # P0-1：discard_pending 等待 SAVING 完成时置 True，
+        # 让 _handle_result / _drain_result_inline 完成后强制置 CLEAN
+        # 而非 DIRTY（即使 generation 落后），不再调度新保存
+        self._discard_after_save: bool = False
 
     @property
     def state(self) -> str:
@@ -221,12 +225,66 @@ class AutosaveCoordinator:
             self._poll_result()
         return self._state == CLEAN
 
+    def discard_pending(self, timeout: float = 5.0) -> bool:
+        """P0-1：放弃未保存的更改，不启动新保存。
+
+        用户在关闭守卫中选择"放弃更改"时调用。与 ``flush`` 相反，
+        本方法不触发任何新保存；但若已有磁盘写入正在执行，
+        仍会等待其完成（无法安全取消磁盘 I/O），完成后即使
+        generation 落后也置为 CLEAN，不再调度新保存。
+
+        返回是否在超时前进入 CLEAN 状态。超时返回 False，
+        调用方应明确告知用户保存未完成。
+        """
+        if self._closed:
+            return self._state == CLEAN
+
+        self._cancel_debounce()
+
+        # SAVING 中：等待当前保存完成，结果到达后强制置 CLEAN
+        if self._state == SAVING:
+            self._discard_after_save = True
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if self._state != SAVING:
+                    # _drain_result_inline 已根据 _discard_after_save 置 CLEAN
+                    return self._state == CLEAN
+                if self._drain_result_inline():
+                    if self._state != SAVING:
+                        return self._state == CLEAN
+                else:
+                    time.sleep(0.02)
+            # 超时：清除标记，保留 SAVING 状态由调用方处理
+            self._discard_after_save = False
+            logger.error("discard_pending 等待保存完成超时（%.1fs）", timeout)
+            return False
+
+        # 非 SAVING（DIRTY / SAVE_SCHEDULED / SAVE_FAILED / CLEAN）：
+        # 直接置 CLEAN，flush 不会再启动保存
+        self._state = CLEAN
+        self._flush_event.set()
+        return True
+
     def close(self) -> None:
         """关闭协调器，不再接受新的保存请求。"""
         self._closed = True
         self._cancel_debounce()
         # 唤醒任何等待 flush 的线程，避免 close 后死锁
         self._flush_event.set()
+
+    def mark_clean(self) -> None:
+        """P0-3：手动保存成功后标记为 CLEAN。
+
+        取消 debounce；若不在 SAVING 状态则置 state=CLEAN。
+        SAVING 中不修改状态，由 ``_handle_result`` 在保存完成时处理。
+        """
+        if self._closed:
+            return
+        self._cancel_debounce()
+        if self._state != SAVING:
+            self._state = CLEAN
+            # 唤醒可能等待 flush 的线程
+            self._flush_event.set()
 
     # ── 主线程：debounce 回调 ────────────────────────────
 
@@ -337,6 +395,20 @@ class AutosaveCoordinator:
         self._poll_after_id = None
         self._flush_event.set()
 
+        # P0-1：discard_pending 等待的保存完成：强制置 CLEAN，不调度新保存
+        if self._discard_after_save:
+            self._discard_after_save = False
+            self._state = CLEAN
+            logger.debug(
+                "discard_pending：保存完成 (generation=%d)，状态置为 CLEAN",
+                result.generation,
+            )
+            try:
+                self._on_result(result)
+            except Exception as exc:
+                logger.warning("保存结果回调异常: %s", exc)
+            return
+
         current_version = self._document.version
 
         if not result.succeeded:
@@ -381,6 +453,15 @@ class AutosaveCoordinator:
         except Exception:
             return False
         self._flush_event.set()
+        # P0-1：discard_pending 等待的保存完成：强制置 CLEAN，不调度新保存
+        if self._discard_after_save:
+            self._discard_after_save = False
+            self._state = CLEAN
+            logger.debug(
+                "discard_pending：保存完成 (generation=%d)，状态置为 CLEAN",
+                result.generation,
+            )
+            return True
         current_version = self._document.version
         if not result.succeeded:
             self._state = SAVE_FAILED

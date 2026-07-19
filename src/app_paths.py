@@ -30,6 +30,15 @@ logger = logging.getLogger(__name__)
 APP_NAME = "LightNovelTranslator"
 
 
+class AppPathsInitError(RuntimeError):
+    """AppPaths 初始化失败（必要目录无法创建）。
+
+    P2-7：必要目录失败必须抛出结构化错误，调用方在组合根中决定如何降级，
+    不再静默返回指向不存在路径的无效对象，避免后续写入全部失败时
+    错误现场被掩盖。
+    """
+
+
 def _is_frozen() -> bool:
     """是否运行在 PyInstaller 打包环境中"""
     return getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
@@ -53,6 +62,18 @@ def _user_data_dir() -> Path:
     else:
         base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
         return Path(base) / APP_NAME
+
+
+def _env_path(var_name: str) -> Path | None:
+    """P2-7：读取 AI_TRANSLATOR_* 环境变量并返回 Path。
+
+    测试组合根通过环境变量注入临时目录，避免触碰真实用户目录；
+    生产入口不设置这些变量，行为与之前一致。
+    """
+    value = os.environ.get(var_name)
+    if not value:
+        return None
+    return Path(value)
 
 
 @dataclass(frozen=True)
@@ -84,25 +105,46 @@ class AppPaths:
     ) -> "AppPaths":
         """创建 AppPaths，允许测试环境注入临时目录。
 
+        解析优先级（P2-7）：
+        1. 显式参数（最高，组合根测试使用）
+        2. ``AI_TRANSLATOR_*`` 环境变量（隔离用户目录的测试 fixture 使用）
+        3. 平台默认用户数据目录（生产路径）
+
+        必要目录（data/config/workspace/logs）创建失败时抛出
+        :class:`AppPathsInitError`，不再返回指向无效路径的对象。
+
         Args:
             data_dir: 显式指定用户数据目录（测试用）
             config_dir: 显式指定配置目录（测试用）
             workspace_dir: 显式指定工作区目录（测试用）
             log_dir: 显式指定日志目录（测试用）
+
+        Raises:
+            AppPathsInitError: 必要目录无法创建时抛出。
         """
         resource = _resource_dir()
-        base_data = Path(data_dir) if data_dir else _user_data_dir()
+        base_data = Path(data_dir) if data_dir else (_env_path("AI_TRANSLATOR_DATA_DIR") or _user_data_dir())
 
-        cfg = Path(config_dir) if config_dir else (base_data / "config")
-        ws = Path(workspace_dir) if workspace_dir else (base_data / "workspace")
-        lg = Path(log_dir) if log_dir else (base_data / "logs")
+        cfg = Path(config_dir) if config_dir else (_env_path("AI_TRANSLATOR_CONFIG_DIR") or (base_data / "config"))
+        ws = (
+            Path(workspace_dir)
+            if workspace_dir
+            else (_env_path("AI_TRANSLATOR_WORKSPACE_DIR") or (base_data / "workspace"))
+        )
+        lg = Path(log_dir) if log_dir else (_env_path("AI_TRANSLATOR_LOG_DIR") or (base_data / "logs"))
 
-        # 确保可写目录存在
+        # P2-7：必要目录创建失败抛出结构化错误，避免后续在无效路径上反复失败
+        failed: list[tuple[Path, str]] = []
         for d in (base_data, cfg, ws, lg):
             try:
                 d.mkdir(parents=True, exist_ok=True)
-            except Exception as exc:
+            except OSError as exc:
                 logger.warning("创建目录失败 %s: %s", d, exc)
+                failed.append((d, str(exc)))
+
+        if failed:
+            details = "; ".join(f"{p}: {msg}" for p, msg in failed)
+            raise AppPathsInitError(f"AppPaths 必要目录创建失败: {details}")
 
         return cls(
             resource_dir=resource,

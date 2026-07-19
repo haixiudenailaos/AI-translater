@@ -18,13 +18,19 @@ from ..application.autosave import (
     AutosaveCoordinator,
     SaveResult,
 )
+from ..application.preflight import PreflightSeverity, build_preflight_report
+from ..application.quality_review import inspect_quality
 from ..application.translation_document import TranslationDocument
+from ..application.usage import UsageStatistics
+from ..domain.project import TranslationProject
+from ..domain.translation import TranslationOptions
 from ..utils.logger import get_logger
 from .file_importer import FileImporter
 from .image_translation_handler import ImageTranslationHandler
 from .lazy_service import LazyService
 from .onboarding import OnboardingController, OnboardingPanel
 from .table_editor import TableCellEditor
+from .theme import COLORS, accent_button_options, apply_theme
 from .translation_controller import TranslationController
 from .translation_table_adapter import TranslationTableAdapter
 
@@ -32,10 +38,12 @@ logger = get_logger(__name__)
 
 
 class MainWindow:
-    def __init__(self, root, config_manager, app_paths=None):
+    def __init__(self, root, config_manager, app_paths=None, edition_capabilities=None):
         self.root = root
         self.config_manager = config_manager
         self.app_paths = app_paths
+        # P0-2：版本能力契约。``None`` 时由 ImageTranslationHandler 自动检测。
+        self.edition_capabilities = edition_capabilities
         from ..core.queue_provider import ProviderLimiterRegistry
 
         # 应用级文本请求额度：主编辑器和后台队列通过同一注册表取槽。
@@ -58,6 +66,10 @@ class MainWindow:
         self._manually_edited_items = set()
         self._hidden_items = set()
         self._all_items = []
+        # P2-4：缓存每行的 (source, target) 文本，避免 apply_review_filter
+        # 对 10,000 行逐行调用 ``table.item(item, "values")``——每次 Tk 调用
+        # 都要走 Tcl 解释器，5000+ 行会引入 200ms+ 卡顿。
+        self._row_values_cache: dict[str, tuple[str, str]] = {}
         self._table_load_after_id = None
         self._table_load_generation = 0
         self._table_loading = False
@@ -65,11 +77,16 @@ class MainWindow:
         self._api_status_queue = queue.SimpleQueue()
         self._api_status_thread = None
         self._api_status_after_id = None
+        self._queue_status_after_id = None
         self._closed = False
         self._image_translation_busy = False
         # P0-5：独立于 autosave 的未保存编辑标记
         self._unsaved_edits = False
         self._review_filter_var = tk.StringVar(value="全部")
+        self._quality_issue_items: set[str] | None = None
+        self._last_preflight_report = None
+        self._usage_statistics = UsageStatistics()
+        self._last_usage_snapshot: dict[str, int | float] = {}
         self._search_var = tk.StringVar()
         self._search_case_var = tk.BooleanVar(value=False)
         self._search_regex_var = tk.BooleanVar(value=False)
@@ -82,6 +99,9 @@ class MainWindow:
         # _document 在 Tk 主线程修改，后台保存只接收不可变快照。
         self._document = TranslationDocument()
         self._table_adapter = TranslationTableAdapter(self.translation_table)
+        # P2-4：把行值缓存注入适配器，翻译热路径更新译文时同步写缓存，
+        # apply_review_filter 直接读缓存，避免逐行 Tcl 调用。
+        self._table_adapter.set_row_values_cache(self._row_values_cache)
 
         # ── 初始化控制器 ────────────────────────────
         self.file_importer = FileImporter(
@@ -92,7 +112,13 @@ class MainWindow:
             table_loader=self.load_data_to_table,
             status_updater=self.update_status,
             image_translation_starter=None,  # 延迟绑定，见下方
+            confirm_replace_session=self.confirm_save_before_replace,
+            confirm_stop_active_translation=self.confirm_stop_translation_before_replace,
+            document=self._document,
+            edition_capabilities=self.edition_capabilities,
         )
+        # P0-3：FileImporter 通过该回调读取当前 dirty 状态。
+        self.file_importer.is_dirty_callback = lambda: self.has_unsaved_changes
 
         self.image_handler = ImageTranslationHandler(
             root=self.root,
@@ -103,6 +129,7 @@ class MainWindow:
             open_settings=self.open_settings,
             busy_state_updater=self._set_image_translation_busy,
             app_paths=getattr(self, "app_paths", None),
+            edition_capabilities=self.edition_capabilities,
         )
 
         # 延迟绑定：file_importer 需要 image_handler，走 Manga 默认模块
@@ -130,6 +157,12 @@ class MainWindow:
             get_mapping_dir=lambda: self.file_importer.current_mapping_dir,
             document=self._document,
             table_adapter=self._table_adapter,
+            # P0-3：保存语义修复——Ctrl+S 直接写当前 target，无目标时 Save As 并写回 session。
+            get_target_path=lambda: self.file_importer.current_target_path,
+            update_target_path=lambda p: self.file_importer.update_session_target_path(p),
+            on_save_success=self._mark_clean_after_save,
+            preflight_callback=self._run_preflight,
+            on_run_terminal=self._record_translation_usage,
         )
 
         # PERF §8：自动保存协调器（generation 状态机 + 单飞 + debounce）。
@@ -217,15 +250,12 @@ class MainWindow:
             left_frame,
             text="批量翻译队列",
             command=self.open_concurrent,
-            background="#0D9488",
-            foreground="white",
-            activebackground="#0F766E",
-            activeforeground="white",
             borderwidth=0,
             cursor="hand2",
             font=("TkDefaultFont", 10, "bold"),
             padx=12,
             pady=5,
+            **accent_button_options(),
         )
         self.queue_translate_btn.pack(side=tk.LEFT, padx=(7, 0))
 
@@ -283,6 +313,10 @@ class MainWindow:
         menu_bar.add_cascade(label="编辑", menu=edit_menu)
 
         self.project_menu = tk.Menu(menu_bar, tearoff=0)
+        # P1-10：主命令收敛——工具栏的 translate_btn 是单一上下文主动作
+        # （refresh_action_state 按 文档/API/待翻译 状态动态切换文案与命令）。
+        # 菜单里的 F5/F6 是该主动作两个子分支（开始新翻译 / 继续暂停后翻译）
+        # 的显式入口，复用同一组 controller 方法，避免新增平行命令。
         self.project_menu.add_command(
             label="翻译未完成行", accelerator="F5", command=self._run_primary_action
         )
@@ -404,6 +438,19 @@ class MainWindow:
         self.translation_table.bind("<Double-Button-1>", self._cell_editor.on_double_click)
         self.translation_table.bind("<F2>", lambda _event: self.open_context_editor())
 
+        # P2-1：补齐键盘等价路径，避免操作只能依赖双击和右键
+        # Enter：打开上下文编辑器（与 F2 等价，符合桌面列表交互直觉）
+        self.translation_table.bind("<Return>", lambda _event: self.open_context_editor())
+        # Shift+F10 与 Menu 键：等价于右键，弹出上下文菜单
+        self.translation_table.bind(
+            "<Shift-F10>", self._show_context_menu_from_keyboard
+        )
+        self.translation_table.bind(
+            "<App>", self._show_context_menu_from_keyboard
+        )
+        # Delete：清空选中行译文（多选时弹确认，避免误删）
+        self.translation_table.bind("<Delete>", lambda _event: self.clear_selected_translations())
+
         # 右键菜单（由 TranslationController 管理）
         self.translation_table.bind(
             "<Button-3>", lambda e: self.translation_controller.show_context_menu(e)
@@ -412,24 +459,16 @@ class MainWindow:
         self.setup_table_styles()
 
     def setup_table_styles(self):
+        """P2-2：通过 theme.apply_theme 统一应用 token、named font 和对比度。
+
+        “界面字号”不再只更新 Treeview：``apply_theme`` 会把 named font
+        ``AppFont`` 注册到 ttk.Style 默认 widget，后续 ``update_font_size``
+        通过 nametofont 即可全局生效。
+        """
         style = ttk.Style()
         font_family = self.config_manager.get_app_config().get("ui_font_family", "TkDefaultFont")
         font_size = self.config_manager.get_app_config().get("ui_font_size", 10)
-        style.configure(
-            "Treeview",
-            font=(font_family, font_size),
-            rowheight=max(28, font_size * 3),
-            background="white",
-        )
-        style.configure(
-            "Treeview.Heading",
-            font=(font_family, font_size, "bold"),
-            background="#e0e0e0",
-            foreground="#333",
-        )
-        style.map(
-            "Treeview", background=[("selected", "#0078D7")], foreground=[("selected", "white")]
-        )
+        apply_theme(style, font_family=font_family, font_size=font_size)
 
     def create_control_panel(self, parent):
         control_frame = ttk.Frame(parent)
@@ -530,12 +569,18 @@ class MainWindow:
     def setup_bindings(self):
         self.root.bind("<F5>", lambda e: self._run_primary_action())
         self.root.bind("<F6>", lambda e: self._continue_translation())
-        self.root.bind("<Control-o>", lambda e: self.file_importer.import_file())
-        self.root.bind("<Control-s>", lambda e: self.translation_controller.save_translation())
-        self.root.bind("<Control-f>", lambda e: self.focus_search())
-        self.root.bind("<Control-z>", lambda e: self.undo())
-        self.root.bind("<Control-y>", lambda e: self.redo())
-        self.root.bind("<FocusOut>", lambda e: self._schedule_save_to_target(0))
+        shortcuts = {
+            "o": lambda: self.file_importer.import_file(),
+            "s": lambda: self.translation_controller.save_translation(),
+            "f": self.focus_search,
+            "z": self.undo,
+            "y": self.redo,
+        }
+        for key, command in shortcuts.items():
+            self.root.bind(f"<Control-{key}>", lambda _event, action=command: action())
+            self.root.bind(f"<Command-{key}>", lambda _event, action=command: action())
+        # macOS convention for redo; Windows/Linux keep Ctrl+Y above.
+        self.root.bind("<Command-Shift-Z>", lambda _event: self.redo())
 
     def _on_cell_edited(self, item_id, col_idx, old_value, new_value):
         """P0-2：人工编辑写回唯一模型。
@@ -570,6 +615,15 @@ class MainWindow:
         self._redo_stack.clear()
         self._manually_edited_items.clear()
         self._hidden_items.clear()
+        self._quality_issue_items = None
+        self._usage_statistics = UsageStatistics()
+        self._last_usage_snapshot = {}
+        # P2-4：行值缓存随表格清空一起重置。
+        # getattr 兜底——部分测试用 MainWindow.__new__ 跳过 __init__，
+        # 此时 _row_values_cache 未初始化（load_data_to_table 是它们的入口）。
+        cache = getattr(self, "_row_values_cache", None)
+        if cache is not None:
+            cache.clear()
         self._all_items.clear()
         # PERF §7.5 步骤2：同步重置表格适配器（item ID 映射）。
         self._table_adapter.reset()
@@ -590,7 +644,26 @@ class MainWindow:
 
         # PERF §7.5 步骤2：导入时同时填充模型（唯一真相来源）。
         # Treeview 分块加载在 _load_table_chunk 中追加 item ID 到适配器。
-        self._document.replace(source_lines, target_lines)
+        # FileImporter 已将导入内容写入共享文档模型；直接调用此方法的旧
+        # 调用方仍需更新模型，但相同内容不重复递增 version。
+        if (
+            self._document.source_lines() != source_lines
+            or self._document.target_lines() != target_lines
+        ):
+            self._document.replace(source_lines, target_lines)
+
+        # A successful import starts a clean session. Clear UI/autosave dirty
+        # flags left by the previous document after the replacement is ready.
+        self._unsaved_edits = False
+        autosave = getattr(self, "_autosave", None)
+        if autosave is not None:
+            try:
+                autosave.mark_clean()
+            except Exception as exc:
+                logger.debug("重置导入前的自动保存状态失败: %s", exc)
+        session = getattr(getattr(self, "file_importer", None), "session", None)
+        if session is not None:
+            session.mark_clean()
 
         # 新手指导：确认非空内容后通知导入完成事件。空内容不完成本步骤。
         onboarding = getattr(self, "onboarding", None)
@@ -621,6 +694,8 @@ class MainWindow:
                 tags=("evenrow" if i % 2 == 0 else "oddrow",),
             )
             self._all_items.append(item)
+            # P2-4：填充行值缓存，apply_review_filter 直接读缓存
+            self._row_values_cache[item] = (source, target)
             # PERF §7.5 步骤2：同步维护适配器的行号→item ID 映射。
             self._table_adapter.append_item(item)
 
@@ -636,8 +711,8 @@ class MainWindow:
 
         self._table_load_after_id = None
         self._table_loading = False
-        self.translation_table.tag_configure("evenrow", background="#f9f9f9")
-        self.translation_table.tag_configure("oddrow", background="white")
+        self.translation_table.tag_configure("evenrow", background=COLORS["row_even"])
+        self.translation_table.tag_configure("oddrow", background=COLORS["row_odd"])
         self.project_label.config(
             text=source_path.name if source_path else f"临时文本 ({len(source_lines)} 行)"
         )
@@ -667,6 +742,19 @@ class MainWindow:
             return
         values[col_idx] = value
         self.translation_table.item(item_id, values=values)
+        # P2-4：同步更新行值缓存，保持 apply_review_filter 读到最新值
+        if col_idx in (1, 2):
+            cached = self._row_values_cache.get(item_id)
+            if cached is None:
+                source = values[1] if len(values) > 1 else ""
+                target = values[2] if len(values) > 2 else ""
+                self._row_values_cache[item_id] = (str(source), str(target))
+            else:
+                source, target = cached
+                if col_idx == 1:
+                    self._row_values_cache[item_id] = (str(value), target)
+                else:
+                    self._row_values_cache[item_id] = (source, str(value))
         # PERF §7.4/§7.5 步骤5：人工编辑同时更新文档模型，
         # 保持模型与 Treeview 一致。撤销/重做也走此路径。
         row_index = self._row_index_of(item_id)
@@ -678,6 +766,13 @@ class MainWindow:
         if record:
             self._record_edit(item_id, col_idx, old_value, value)
         self._manually_edited_items.add(item_id)
+        # P0-3：dirty 状态独立于 target_path 与 autosave。
+        # 剪贴板会话没有 target_path，但人工编辑仍需进入关闭保护，
+        # 因此这里无条件标记未保存，再让 _schedule_save_to_target 决定是否触发后台写入。
+        self._unsaved_edits = True
+        session = getattr(getattr(self, "file_importer", None), "session", None)
+        if session is not None:
+            session.mark_dirty()
         self._schedule_save_to_target()
         self.refresh_action_state()
 
@@ -746,31 +841,104 @@ class MainWindow:
 
     def apply_review_filter(self):
         mode = self._review_filter_var.get()
+        # P1-6：按 _all_items 原始顺序重建 treeview，确保筛选恢复后行序正确。
+        # 旧实现只 reattach 刚恢复可见的行到 "end"，导致它们追加到已显示行
+        # 的末尾——例如 _all_items=[A,B,C,D,E]，先隐藏 B 和 D 再恢复全部，
+        # 结果变成 [A,C,E,B,D] 而非 [A,B,C,D,E]。
+        # 新实现清空 _hidden_items 后逐项按 _all_items 顺序 reattach/detach，
+        # 每个可见项 reattach 到 "end" 时自然按原始顺序追加。
+        # P2-4：用 _row_values_cache 替代逐行 table.item()——后者每次都要
+        # 走 Tcl 解释器，5000+ 行的文档筛选会引入 200ms+ 卡顿。
+        # 缓存在 _load_table_chunk 填充、_apply_cell_value 同步更新。
+        # PERF-6c：只对可见性发生变化的行调用 reattach/detach，避免对
+        # 已经处于正确可见状态的行发起冗余 Tcl 调用。
+        previously_hidden = set(self._hidden_items)
+        self._hidden_items.clear()
+        # P2-4：getattr 兜底——测试用 __new__ 跳过 __init__ 时不设此属性。
+        cache = getattr(self, "_row_values_cache", None) or {}
+        # 当筛选模式与上次不同时，所有行的可见性都可能变化，需要全量
+        # reattach 以保证顺序正确；模式相同时可跳过未变化的行。
+        mode_changed = getattr(self, "_last_review_filter_mode", None) != mode
+        self._last_review_filter_mode = mode
         for item in self._all_items:
-            values = self.translation_table.item(item, "values")
-            source, target = str(values[1]).strip(), str(values[2]).strip()
+            cached = cache.get(item)
+            if cached is None:
+                # 兜底：缓存未命中（理论上不应发生），回退到 Tk 调用
+                values = self.translation_table.item(item, "values")
+                source, target = str(values[1]).strip(), str(values[2]).strip()
+            else:
+                source, target = cached[0].strip(), cached[1].strip()
             visible = mode == "全部"
             if mode == "未翻译":
                 visible = bool(source and not target)
             elif mode == "手工修改":
                 visible = item in self._manually_edited_items
             elif mode == "质检问题":
-                visible = bool(source and (not target or source == target))
-            if visible and item in self._hidden_items:
-                self.translation_table.reattach(item, "", "end")
-                self._hidden_items.discard(item)
-            elif not visible and item not in self._hidden_items:
-                self.translation_table.detach(item)
+                quality_items = getattr(self, "_quality_issue_items", None)
+                visible = (
+                    item in quality_items
+                    if quality_items is not None
+                    else bool(source and (not target or source == target))
+                )
+            was_hidden = item in previously_hidden
+            if visible:
+                # PERF-6c：模式未变且原本可见时跳过冗余 reattach
+                if mode_changed or was_hidden:
+                    self.translation_table.reattach(item, "", "end")
+            else:
                 self._hidden_items.add(item)
+                # PERF-6c：原本已隐藏且模式未变时跳过冗余 detach
+                if mode_changed or not was_hidden:
+                    self.translation_table.detach(item)
 
     def clear_selected_translations(self):
         selected = self.translation_table.selection()
         if not selected:
             self.update_status("请先选择需要清空的行")
             return
+        # P2-1：多选清空属于破坏性操作，必须显式确认；
+        # 单选直接清空（属于常规编辑，可由 Ctrl+Z 撤销）。
+        if len(selected) > 1:
+            confirmed = messagebox.askyesno(
+                "确认清空",
+                f"将清空 {len(selected)} 行译文，确定继续吗？",
+                default="no",
+            )
+            if not confirmed:
+                return
         for item in selected:
             self._apply_cell_value(item, 2, "")
         self.update_status(f"已清空 {len(selected)} 行译文")
+
+    def _show_context_menu_from_keyboard(self, event: tk.Event) -> None:
+        """P2-1：Shift+F10 / Menu 键触发右键菜单的键盘等价路径。
+
+        在选中行可见区域的中央位置弹出菜单，避免依赖鼠标坐标。
+        """
+        table = self.translation_table
+        selected = table.selection()
+        if not selected:
+            return
+        try:
+            bbox = table.bbox(selected[0])
+        except KeyError:
+            return
+        if not bbox:
+            return
+        # bbox = (x, y, width, height) 相对于 table widget
+        x = bbox[0] + max(0, bbox[2] // 2)
+        y = bbox[1] + max(0, bbox[3] // 2)
+        try:
+            root_x = table.winfo_rootx() + x
+            root_y = table.winfo_rooty() + y
+        except tk.TclError:
+            return
+        # 构造一个轻量事件对象复用 show_context_menu
+        try:
+            # tk_popup 接受屏幕坐标
+            self.translation_controller.context_menu.tk_popup(root_x, root_y)
+        finally:
+            self.translation_controller.context_menu.grab_release()
 
     def open_context_editor(self):
         selected = self.translation_table.selection()
@@ -815,23 +983,27 @@ class MainWindow:
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill=tk.X, pady=(10, 0))
-        ttk.Button(buttons, text="保存", command=save_and_close).pack(side=tk.RIGHT)
-        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 5))
+        save_btn = ttk.Button(buttons, text="保存", command=save_and_close)
+        save_btn.pack(side=tk.RIGHT)
+        cancel_btn = ttk.Button(buttons, text="取消", command=dialog.destroy)
+        cancel_btn.pack(side=tk.RIGHT, padx=(0, 5))
         target.focus_set()
+        # P2-1：模态窗口补 Escape 关闭、Ctrl+S 保存、焦点恢复
+        # 不绑定 Return：target 是多行 Text，Enter 用于换行；
+        # Ctrl+S 已提供键盘保存路径，符合桌面校对工具惯例。
         dialog.bind("<Control-s>", lambda _event: save_and_close())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.bind("<Destroy>", lambda _event: self.translation_table.focus_set(), add="+")
 
     def run_quality_check(self):
-        # PERF §7：从文档模型查找问题行，再映射回 item ID。
+        project = self._build_runtime_project()
+        report = inspect_quality(project, glossary_terms=self._glossary_pairs())
         issues = []
-        source_lines = self._document.source_lines()
-        target_lines = self._document.target_lines()
-        for index, (source, target) in enumerate(zip(source_lines, target_lines, strict=True)):
-            src = source.strip()
-            tgt = target.strip()
-            if src and (not tgt or source == target):
-                item = self._table_adapter.item_id(index)
-                if item is not None:
-                    issues.append(item)
+        for issue in report.issues:
+            item = self._table_adapter.item_id(issue.line_index)
+            if item is not None:
+                issues.append(item)
+        self._quality_issue_items = set(issues)
         # 新手指导：通知质检已接触，不自动把总状态改为 completed
         onboarding = getattr(self, "onboarding", None)
         if onboarding is not None:
@@ -841,11 +1013,109 @@ class MainWindow:
             self.apply_review_filter()
             self.translation_table.selection_set(issues[0])
             self.translation_table.see(issues[0])
-            self.update_status(f"质检发现 {len(issues)} 行待处理内容")
+            self.update_status(
+                f"质检发现 {len(issues)} 行问题（错误 {report.error_count}，可在筛选中查看）"
+            )
         else:
-            self.update_status("质检完成，未发现空译文或未翻译行")
+            self.update_status("质检完成，未发现需要处理的问题")
+
+    def _build_runtime_project(self) -> TranslationProject:
+        source_lines = self._document.source_lines()
+        target_lines = self._document.target_lines()
+        source_path = getattr(getattr(self, "file_importer", None), "current_source_path", None)
+        mapping_dir = getattr(getattr(self, "file_importer", None), "current_mapping_dir", None)
+        completed_indices = {
+            index for index, target in enumerate(target_lines) if target and target.strip()
+        }
+        manually_edited_indices = {
+            index
+            for index in range(self._document.row_count)
+            if self._document.is_manually_edited(index)
+        }
+        completed_indices.update(manually_edited_indices)
+        return TranslationProject(
+            project_id="active-session",
+            source_path=str(source_path or ""),
+            source_fingerprint="",
+            file_type="epub" if mapping_dir else "txt",
+            mapping_dir=str(mapping_dir or ""),
+            original_lines=source_lines,
+            translated_lines=target_lines,
+            manually_edited_indices=manually_edited_indices,
+            completed_indices=completed_indices,
+        )
+
+    def _glossary_pairs(self) -> tuple[tuple[str, str], ...]:
+        terms = self.config_manager.get_glossary().get("terms", [])
+        if not isinstance(terms, list):
+            return ()
+        return tuple(
+            (str(term.get("source", "")), str(term.get("target", "")))
+            for term in terms
+            if isinstance(term, dict)
+        )
+
+    def _run_preflight(self, action: str) -> bool:
+        project = self._build_runtime_project()
+        app_config = self.config_manager.get_app_config()
+        api_config = self.config_manager.get_api_config(load_secret=False)
+        options = TranslationOptions(
+            target_language=str(app_config.get("target_language", "")),
+            model_name=str(api_config.get("model_name", "")),
+            batch_size=int(app_config.get("batch_lines", 20)),
+            temperature=float(api_config.get("temperature", 0.3)),
+            max_tokens=int(api_config.get("max_tokens", 2048)),
+        )
+        report = build_preflight_report(
+            project,
+            options,
+            action=action,
+            provider=str(api_config.get("provider", "")),
+            glossary_terms=self._glossary_pairs(),
+            input_price_per_million=api_config.get("input_price_per_million"),
+            output_price_per_million=api_config.get("output_price_per_million"),
+        )
+        self._last_preflight_report = report
+        errors = [issue.message for issue in report.issues if issue.severity is PreflightSeverity.ERROR]
+        if errors:
+            messagebox.showerror("翻译预检", "\n".join(errors), parent=self.root)
+            return False
+        warnings = [issue.message for issue in report.issues if issue.severity is PreflightSeverity.WARNING]
+        if warnings and app_config.get("preflight_confirm_warnings", True):
+            approved = messagebox.askyesno(
+                "翻译预检",
+                "\n".join(warnings)
+                + f"\n\n待翻译 {report.pending_lines} 行，预计输入 {report.estimated_input_tokens} token。\n是否继续？",
+                parent=self.root,
+            )
+            if not approved:
+                return False
+        self.update_status(
+            f"预检通过：待翻译 {report.pending_lines} 行，预计输入 {report.estimated_input_tokens} token"
+        )
+        return True
+
+    def _record_translation_usage(self, _result, _mode: str) -> None:
+        get_snapshot = getattr(self.translator, "call_if_initialized", None)
+        if not callable(get_snapshot):
+            return
+        snapshot = get_snapshot("get_usage_snapshot")
+        if not isinstance(snapshot, dict):
+            return
+        self._usage_statistics.record_metrics_delta(snapshot, self._last_usage_snapshot)
+        self._last_usage_snapshot = dict(snapshot)
 
     def _run_primary_action(self):
+        """P1-10：单一上下文主动作。
+
+        工具栏的 ``translate_btn`` 是面向用户的主入口，``refresh_action_state``
+        根据当前文档/API/待翻译状态动态切换其文案（导入文件 / 配置 API /
+        翻译未完成行 / 重试失败行 / 运行质检）与命令。本方法是其中
+        「翻译/导入/配置」分支的统一派发器；F5 菜单与按钮共用同一 command。
+
+        「继续翻译」（F6）是暂停后恢复的显式子分支，保留为独立入口但
+        复用同一 controller，避免平行命令分裂。
+        """
         if self._table_loading:
             self.update_status("内容仍在加载，请稍候")
             return
@@ -949,24 +1219,41 @@ class MainWindow:
                 self.export_epub_btn.config(state=menu_state)
             self.more_actions_menu.entryconfigure(self._epub_action_index, state=menu_state)
             image_state = tk.DISABLED if self._image_translation_busy else menu_state
-            self.more_actions_menu.entryconfigure(self._local_image_action_index, state=image_state)
+            # P0-2：Text Edition 下禁用本地 Manga 入口。
+            manga_state = image_state if self._manga_enabled() else tk.DISABLED
+            self.more_actions_menu.entryconfigure(
+                self._local_image_action_index, state=manga_state
+            )
             self.more_actions_menu.entryconfigure(self._ai_image_action_index, state=image_state)
         if hasattr(self, "local_image_translate_btn"):
             image_state = tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
-            self.local_image_translate_btn.config(state=image_state)
+            # P0-2：Text Edition 下禁用本地 Manga 入口。
+            manga_state = image_state if self._manga_enabled() else tk.DISABLED
+            self.local_image_translate_btn.config(state=manga_state)
             self.ai_image_translate_btn.config(state=image_state)
         if hasattr(self, "project_menu"):
             project_image_state = (
                 tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
             )
+            # P0-2：Text Edition 下禁用本地 Manga 入口。
+            project_manga_state = (
+                project_image_state if self._manga_enabled() else tk.DISABLED
+            )
             self.project_menu.entryconfigure(
-                self._project_local_image_action_index, state=project_image_state
+                self._project_local_image_action_index, state=project_manga_state
             )
             self.project_menu.entryconfigure(
                 self._project_ai_image_action_index, state=project_image_state
             )
         if hasattr(self, "task_summary_label"):
             self.task_summary_label.config(text=f"待翻译 {pending} · 已完成 {completed}")
+
+    def _manga_enabled(self) -> bool:
+        """P0-2：当前版本是否启用本地 Manga 图片翻译。"""
+        handler = getattr(self, "image_handler", None)
+        if handler is None:
+            return True  # UI 初始化早期：保守允许，后续 refresh 会校正
+        return handler.manga_enabled
 
     def _set_save_status(self, status):
         if hasattr(self, "save_status_label"):
@@ -988,22 +1275,33 @@ class MainWindow:
         - delay_ms=0 表示立即保存（窗口关闭、停止翻译等关键事件），
           映射到 ``source="flush"`` 跳过 debounce 直接启动。
         - 保存期间的新编辑只增加 document.version，不启动并行写入（单飞）。
-        - P0-5：auto_save=False 时仍跟踪 dirty 状态，只是不自动触发保存。
+        - P0-3/P0-5：dirty 状态独立于 target_path 与 autosave。
+          剪贴板会话没有 target_path，但仍需显示"有未保存更改"并进入关闭保护。
+        - 只有文档模型实际发生变更时才进入 dirty；拒绝或同值更新不保存。
         """
         if self._table_loading:
+            return
+        if not self._document.dirty_indices:
             return
         app_config = self.config_manager.get_app_config()
         auto_save_enabled = app_config.get("auto_save", True)
         if getattr(self, "_disable_auto_save", False):
             auto_save_enabled = False
         tgt_path = getattr(self.file_importer, "current_target_path", None)
+
+        # P0-3：所有来源的文档更新（人工编辑、机器翻译、撤销/重做）
+        # 都在这里进入会话 dirty 状态。dirty 与 target_path/autosave 开关
+        # 无关；否则剪贴板会话的机器翻译结果无法触发关闭保护。
+        self._unsaved_edits = True
+        session = getattr(getattr(self, "file_importer", None), "session", None)
+        if session is not None:
+            session.mark_dirty()
+        if delay_ms != 0:
+            self._set_save_status("有未保存更改" if tgt_path else "有未保存更改（未指定文件）")
+
+        # 无 target_path 时只跟踪 dirty 状态，不触发后台写入。
         if not tgt_path:
             return
-
-        # P0-5：无论自动保存是否开启，编辑都标记会话为脏
-        if delay_ms != 0:
-            self._set_save_status("有未保存更改")
-            self._unsaved_edits = True
 
         # auto_save=False 时只跟踪 dirty 状态，不触发后台写入
         if not auto_save_enabled:
@@ -1032,6 +1330,10 @@ class MainWindow:
             self._set_save_status("已保存")
             # P0-5：保存成功时清除未保存标记
             self._unsaved_edits = False
+            self._document.clear_dirty()
+            session = getattr(getattr(self, "file_importer", None), "session", None)
+            if session is not None:
+                session.mark_clean()
         elif state == SAVING:
             self._set_save_status("正在保存")
         elif state == SAVE_FAILED:
@@ -1051,6 +1353,9 @@ class MainWindow:
         dirty 独立于 autosave：自动保存关闭时仍能检测未保存状态；
         保存失败时也视为有未保存更改。
         """
+        session = getattr(getattr(self, "file_importer", None), "session", None)
+        if session is not None and session.dirty:
+            return True
         if self._unsaved_edits:
             return True
         state = self._autosave.state
@@ -1092,25 +1397,84 @@ class MainWindow:
             return "save"
         return "discard"
 
+    def confirm_save_before_replace(self) -> str:
+        """Run the Save/Discard/Cancel guard before replacing the session.
+
+        Closing is handled by ``main.py`` and performs the save after asking.
+        Imports need a callback that completes the save before returning, so a
+        successful ``save`` choice can safely proceed with session replacement.
+        """
+        choice = self.confirm_save_before_close()
+        if choice != "save":
+            return choice
+        return "proceed" if self.save_and_flush() else "cancel"
+
+    def confirm_stop_translation_before_replace(self) -> bool:
+        """Stop an active translation before replacing the document session.
+
+        A new document must never merely invalidate an active run: the old
+        request could continue consuming API quota and its missing terminal
+        event would keep the UI in a busy state.  The controller performs the
+        cancellation and atomically retires the old run before import commits.
+        """
+        controller = getattr(self, "translation_controller", None)
+        if controller is None or not controller.is_translating:
+            return True
+        should_stop = messagebox.askyesno(
+            "翻译正在进行",
+            "当前翻译仍在运行。是否停止当前翻译并切换到新文档？\n\n"
+            "已完成的译文会保留并触发保存。",
+            icon=messagebox.WARNING,
+            parent=self.root,
+        )
+        if not should_stop:
+            return False
+        return controller.cancel_for_session_replacement()
+
     def save_and_flush(self) -> bool:
         """P0-5：执行同步保存并等待完成。返回是否成功。"""
         tgt_path = getattr(self.file_importer, "current_target_path", None)
         if not tgt_path:
-            # 无目标路径，无法保存
-            messagebox.showwarning("保存失败", "没有可用的保存路径，请先导入文件。")
-            return False
+            # 剪贴板会话没有目标路径时，关闭/切换会话必须允许 Save As，
+            # 否则 Save/Discard/Cancel 守卫中的“保存”分支永远失败。
+            saved = self.translation_controller.save_translation(synchronous=True)
+            return saved and not self.has_unsaved_changes
         self._autosave.set_save_paths(
             tgt_path,
             getattr(self.file_importer, "current_mapping_dir", None),
         )
         self._autosave.mark_dirty(source="flush")
         ok = self.flush_pending_save(timeout=10.0)
+        if ok:
+            self._mark_clean_after_save()
         if not ok:
             messagebox.showwarning(
                 "保存失败",
                 "保存超时或失败，请检查文件权限或磁盘空间。",
             )
         return ok
+
+    def _mark_clean_after_save(self) -> None:
+        """P0-3：Ctrl+S 保存成功后清除未保存状态。
+
+        - 重置 ``_unsaved_edits`` 让关闭/切项目守卫不再拦截。
+        - 调用 ``AutosaveCoordinator.clear_dirty`` 标记模型行为已保存，
+          避免下一次 flush 重复写入。
+        - 更新保存状态标签为"已保存"。
+        """
+        self._unsaved_edits = False
+        session = getattr(getattr(self, "file_importer", None), "session", None)
+        if session is not None:
+            session.mark_clean()
+        try:
+            self._document.clear_dirty()
+        except Exception as exc:
+            logger.warning("清除 document dirty 标记失败: %s", exc)
+        try:
+            self._autosave.mark_clean()
+        except Exception as exc:
+            logger.warning("清除 autosave dirty 状态失败: %s", exc)
+        self._set_save_status("已保存")
 
     def _debounce(self, key, delay_ms, callback):
         attr = f"_debounce_{key}"
@@ -1124,7 +1488,12 @@ class MainWindow:
     def open_settings(self):
         from .settings_window import SettingsWindow
 
-        SettingsWindow(self.root, self.config_manager, self._on_settings_updated)
+        SettingsWindow(
+            self.root,
+            self.config_manager,
+            self._on_settings_updated,
+            edition_capabilities=self.edition_capabilities,
+        )
 
     def open_onboarding(self):
         """帮助 > 新手指导：手动重新打开引导，忽略自动展示条件。"""
@@ -1165,7 +1534,41 @@ class MainWindow:
             self.config_manager,
             app_paths=self.app_paths,
             manager=self._queue_manager,
+            edition_capabilities=self.edition_capabilities,
         )
+        self._schedule_queue_background_status()
+
+    def _schedule_queue_background_status(self) -> None:
+        """Keep background queue work visible after its dedicated window closes."""
+        if getattr(self, "_closed", False):
+            return
+        manager = getattr(self, "_queue_manager", None)
+        label = getattr(self, "task_summary_label", None)
+        if manager is not None and label is not None:
+            try:
+                snapshot = manager.get_snapshot()
+                if snapshot is not None:
+                    active = sum(
+                        task.state.value
+                        in {
+                            "pending",
+                            "preparing",
+                            "ready",
+                            "running",
+                            "pause_requested",
+                            "finalizing",
+                        }
+                        for task in snapshot.tasks
+                    )
+                    if active:
+                        completed = sum(task.state.value == "completed" for task in snapshot.tasks)
+                        label.config(text=f"后台队列 {active} 个进行中 · 已完成 {completed}")
+                    elif not snapshot.tasks:
+                        label.config(text="")
+            except Exception as exc:
+                logger.debug("读取后台队列状态失败: %s", exc)
+        if hasattr(self.root, "after"):
+            self._queue_status_after_id = self.root.after(500, self._schedule_queue_background_status)
 
     def open_support_dialog(self):
         win = tk.Toplevel(self.root)
@@ -1193,6 +1596,48 @@ class MainWindow:
         ttk.Frame(container).pack(pady=(8, 0))
         ttk.Button(container, text="关闭", command=win.destroy).pack()
 
+    # ── P1-UX-2：TXT 队列跨重启恢复 ────────────────────
+
+    def _show_fingerprint_mismatch_dialog(self, info: dict) -> str:
+        """P1-UX-2：源文件指纹变化时让用户选择恢复策略。
+
+        回调在 ``ConcurrentTranslationManager.add_task`` 路径同步调用
+        （Tk 主线程），可安全弹出对话框。
+
+        Args:
+            info: 包含 file_path / old_fingerprint / new_fingerprint /
+                old_total_lines / new_total_lines 的字典。
+
+        Returns:
+            ``"new"`` / ``"map"`` / ``"discard"`` 之一。
+        """
+        from tkinter import messagebox as _msgbox
+        from pathlib import Path
+
+        file_name = Path(str(info.get("file_path", ""))).name
+        old_lines = info.get("old_total_lines", "?")
+        new_lines = info.get("new_total_lines", "?")
+        message = (
+            f"文件 {file_name} 的内容已变化：\n\n"
+            f"- 旧版本行数：{old_lines}\n"
+            f"- 新版本行数：{new_lines}\n\n"
+            "选择恢复策略：\n"
+            "- 是：尝试映射旧进度（行数相同时复用译文，行数不同会退化为新建）\n"
+            "- 否：新建任务（不恢复任何旧进度）\n"
+            "- 取消：放弃旧进度并删除旧项目文件"
+        )
+        choice = _msgbox.askyesnocancel(
+            "源文件已变化",
+            message,
+            icon=_msgbox.WARNING,
+            parent=self.root,
+        )
+        if choice is None:
+            return "discard"
+        if choice:
+            return "map"
+        return "new"
+
     # ── 状态更新 ──────────────────────────────────────
 
     def _on_settings_updated(self, refresh_engine=True):
@@ -1204,6 +1649,9 @@ class MainWindow:
             self._start_api_status_load()
             return
 
+        # P2-2：设置保存后同步刷新 named font，让“界面字号”全局生效，
+        # 不再只更新 Treeview。
+        self.setup_table_styles()
         configured = self.config_manager.is_api_configured()
         self._apply_api_status(configured)
         self.translator.call_if_initialized("refresh_api")
@@ -1275,8 +1723,16 @@ class MainWindow:
     def update_status(self, message):
         self.status_label.config(text=message)
 
-    def close(self):
-        """BUG-005：主窗口关闭时停止翻译、关闭所有引擎，释放 API 资源。"""
+    def close(self, decision: str = "proceed"):
+        """BUG-005：主窗口关闭时停止翻译、关闭所有引擎，释放 API 资源。
+
+        P0-1：``decision`` 来自关闭守卫的 Save/Discard/Cancel/Proceed 选择。
+        - ``"save"`` / ``"proceed"``：等待后台保存完成（flush 语义）。
+        - ``"discard"``：放弃未保存的更改，不启动新保存；若已有 SAVING 在执行，
+          仍等待其完成（无法安全取消磁盘写入），完成后置 CLEAN 而不调度新保存。
+        - ``"cancel"``：理论上不会到达此方法（调用方已 return），保留参数
+          仅用于完整性，按 ``"proceed"`` 处理。
+        """
         self._closed = True
         if self._api_status_after_id is not None:
             try:
@@ -1284,6 +1740,12 @@ class MainWindow:
             except Exception:
                 pass
             self._api_status_after_id = None
+        if self._queue_status_after_id is not None:
+            try:
+                self.root.after_cancel(self._queue_status_after_id)
+            except Exception:
+                pass
+            self._queue_status_after_id = None
 
         if self._table_load_after_id is not None:
             try:
@@ -1357,11 +1819,23 @@ class MainWindow:
             logger.warning("关闭文件导入 UI 事件泵失败: %s", e)
 
         # PERF §8：等待后台保存完成（generation 状态机 flush），避免关闭时丢失数据。
-        # 先 flush 再 close，确保未完成的保存有机会写入；close 只阻止新保存请求。
-        try:
-            self.flush_pending_save(timeout=5.0)
-        except Exception as e:
-            logger.warning("等待后台保存完成失败: %s", e)
+        # P0-1：根据用户在关闭守卫中的选择分支：
+        # - discard：放弃未保存的更改，不启动新保存；仅等待已在途的 SAVING 完成。
+        # - save/proceed：等待后台保存完成（包括按需启动新一轮保存）。
+        if decision == "discard":
+            try:
+                ok = self._autosave.discard_pending(timeout=5.0)
+            except Exception as e:
+                logger.warning("放弃未保存更改失败: %s", e)
+                ok = False
+            if not ok:
+                logger.error("放弃更改时仍有未完成的保存，可能残留写入")
+                self.update_status("⚠ 仍有保存未完成，部分更改可能已写入")
+        else:
+            try:
+                self.flush_pending_save(timeout=5.0)
+            except Exception as e:
+                logger.warning("等待后台保存完成失败: %s", e)
         try:
             self._autosave.close()
         except Exception as e:

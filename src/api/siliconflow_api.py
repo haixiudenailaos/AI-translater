@@ -11,7 +11,7 @@ from typing import Any, Dict
 import httpx
 
 from ..utils.logger import get_logger
-from .base_api import BaseAPI
+from .base_api import BaseAPI, _summarize_response_body
 
 logger = get_logger(__name__)
 
@@ -40,14 +40,9 @@ class SiliconFlowAPI(BaseAPI):
         if self._heartbeat_enabled:
             self._start_heartbeat()
 
-    def _recreate_client(self):
-        """重建 HTTP 客户端：启用 HTTP/2 和 keepalive_expiry。"""
+    def _build_client(self) -> httpx.Client:
+        """Build an HTTP/2 client without publishing it to other threads."""
         try:
-            if self._current_client:
-                try:
-                    self._current_client.close()
-                except Exception as exc:
-                    logger.warning("关闭旧 HTTP 客户端失败: %s", exc)
             expiry = getattr(self, "_keepalive_expiry", 300.0)
             limits = httpx.Limits(
                 max_keepalive_connections=self._max_keepalive,
@@ -56,7 +51,7 @@ class SiliconFlowAPI(BaseAPI):
             )
             # 重试由 BaseAPI 统一处理，transport 不再隐式重复请求。
             transport = httpx.HTTPTransport(retries=0, limits=limits, http2=True)
-            self._current_client = httpx.Client(
+            return httpx.Client(
                 timeout=self._http_timeout, transport=transport, http2=True
             )
         except Exception as e:
@@ -65,7 +60,7 @@ class SiliconFlowAPI(BaseAPI):
                 max_keepalive_connections=self._max_keepalive,
                 max_connections=self._max_connections,
             )
-            self._current_client = httpx.Client(timeout=self._http_timeout, limits=limits)
+            return httpx.Client(timeout=self._http_timeout, limits=limits)
 
     # ── 心跳保活 ────────────────────────────────────────
 
@@ -177,7 +172,8 @@ class SiliconFlowAPI(BaseAPI):
                     logger.error(
                         "[vision_query] 视觉查询失败: status=%s, text=%s",
                         resp.status_code,
-                        resp.text,
+                        # P1-5：响应正文走有界摘要
+                        _summarize_response_body(resp.text),
                     )
 
         except Exception as e:

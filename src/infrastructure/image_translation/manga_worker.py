@@ -39,7 +39,10 @@ class _WorkerConfigManager:
         return dict(self.api_config)
 
 
-def _send(payload: dict) -> None:
+def _send(payload: dict, *, request_id: str | None = None) -> None:
+    # P1-3：回传 request_id，让父进程能配对响应、丢弃迟到事件。
+    if request_id is not None and "request_id" not in payload:
+        payload = {**payload, "request_id": request_id}
     _OUTPUT.write(json.dumps(payload, ensure_ascii=False) + "\n")
     _OUTPUT.flush()
 
@@ -98,18 +101,23 @@ def run_worker(args: argparse.Namespace) -> int:
         while True:
             command = commands.get()
             operation = command.get("op")
+            # P1-3：从命令中读取 request_id，回写到所有相关响应/进度/错误
+            request_id = command.get("request_id")
             if operation == "close":
-                _send({"type": "response", "ok": True})
+                _send({"type": "response", "ok": True}, request_id=request_id)
                 return 0
 
             config_manager.api_config = dict(command.get("api_config") or {})
             if operation == "health":
                 errors = provider.validate(_request_from_payload(command["request"]))
-                _send({"type": "response", "errors": errors})
+                _send({"type": "response", "errors": errors}, request_id=request_id)
                 continue
 
             if operation != "translate":
-                _send({"type": "error", "message": f"未知 worker 操作: {operation}"})
+                _send(
+                    {"type": "error", "message": f"未知 worker 操作: {operation}"},
+                    request_id=request_id,
+                )
                 continue
 
             request = _request_from_payload(command["request"])
@@ -122,7 +130,8 @@ def run_worker(args: argparse.Namespace) -> int:
                         "current": progress.current,
                         "total": progress.total,
                         "image_path": progress.image_path,
-                    }
+                    },
+                    request_id=request_id,
                 )
 
             with active_lock:
@@ -132,9 +141,15 @@ def run_worker(args: argparse.Namespace) -> int:
                 # JSON protocol remains parseable by the parent process.
                 with contextlib.redirect_stdout(sys.stderr):
                     result = provider.translate(request, on_progress)
-                _send({"type": "response", "result": _result_payload(result)})
+                _send(
+                    {"type": "response", "result": _result_payload(result)},
+                    request_id=request_id,
+                )
             except Exception as exc:
-                _send({"type": "error", "message": provider._sanitize_error(str(exc))})
+                _send(
+                    {"type": "error", "message": provider._sanitize_error(str(exc))},
+                    request_id=request_id,
+                )
             finally:
                 with active_lock:
                     active["provider"] = None

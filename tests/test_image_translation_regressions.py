@@ -110,6 +110,54 @@ class ImageTranslationRegressionTests(unittest.TestCase):
         self.assertEqual(captured["env"]["PYTHONIOENCODING"], "utf-8")
         self.assertEqual(captured["env"]["PYTHONUTF8"], "1")
 
+    def test_drop_process_waits_and_kills_stuck_worker(self):
+        class _Stream:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class _StuckProcess:
+            def __init__(self):
+                self.stdin = _Stream()
+                self.stdout = _Stream()
+                self.stderr = _Stream()
+                self.terminated = False
+                self.killed = False
+                self.wait_calls = 0
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise client_module.subprocess.TimeoutExpired("worker", timeout)
+                return 0
+
+        import src.infrastructure.image_translation.manga_worker_client as client_module
+
+        client = MangaWorkerClient(SimpleNamespace(get_api_config=lambda: {}))
+        process = _StuckProcess()
+        client._process = process
+
+        client._drop_process(process)
+
+        self.assertIsNone(client._process)
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.killed)
+        self.assertEqual(process.wait_calls, 2)
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
     def test_manga_runtime_error_tells_user_to_use_ai(self):
         class FailingService:
             def make_request(self, **kwargs):

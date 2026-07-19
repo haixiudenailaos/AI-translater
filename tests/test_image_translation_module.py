@@ -507,6 +507,12 @@ class TestConfigMigration:
         config = tmp_config_manager.get_image_translation_config()
         assert config["default_provider"] == "manga"
 
+    def test_default_volc_api_config_is_available(self, tmp_config_manager):
+        config = tmp_config_manager.get_image_translation_config()["ai_volcengine"]
+
+        assert config["base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
+        assert config["model"] == "doubao-seedream-5-0-pro-260628"
+
     def test_missing_section_auto_fill(self, tmp_config_manager):
         """配置缺少 image_translation 时自动补齐"""
         # 写入一个没有 image_translation 段的配置
@@ -667,6 +673,7 @@ class _StubConfigManager:
 
 def _build_handler(mapping_dir, *, volc_key="", api_configured=True):
     """绕过 __init__ 构造一个 ImageTranslationHandler，避免创建 Tk。"""
+    from src.domain.edition import EditionCapabilities
     from src.ui.image_translation_handler import ImageTranslationHandler
 
     handler = ImageTranslationHandler.__new__(ImageTranslationHandler)
@@ -679,6 +686,9 @@ def _build_handler(mapping_dir, *, volc_key="", api_configured=True):
     handler._font_path = None
     handler._service = None
     handler._worker_thread = None
+    # P0-2：绕过 __init__ 的测试替身需手动注入 Full edition 能力，
+    # 否则 start_image_translation 会因属性缺失而抛 AttributeError。
+    handler._edition_capabilities = EditionCapabilities.full()
     # _safe_after 直接执行回调，避免依赖 Tk after
     handler._safe_after = lambda func: func()
     handler.root = type(
@@ -840,12 +850,14 @@ class TestConcurrentWindowQueueWiring:
 
     def test_translate_all_images_requires_api_config_not_volc_key(self, tmp_path, monkeypatch):
         """队列图片翻译入口只检查 API 配置（Manga external_llm 用），不检查火山 Key。"""
+        from src.domain.edition import EditionCapabilities
         from src.ui.concurrent_window import ConcurrentWindow
 
         # 绕过 __init__
         win = ConcurrentWindow.__new__(ConcurrentWindow)
         win.config_manager = _StubConfigManager(volc_key="", api_configured=True)
         win.app_paths = None
+        win.edition_capabilities = EditionCapabilities.full()
 
         # manager.get_all_tasks() 返回空列表 → 进入「没有已完成的EPUB任务」分支
         win.manager = type(
@@ -861,6 +873,9 @@ class TestConcurrentWindowQueueWiring:
                 "title": lambda self, _t: None,
             },
         )()
+        # P1-8：新增的图片翻译 worker 状态机属性（绕过 __init__ 时需手动设置）
+        win._image_translate_busy = False
+        win._image_translate_run_id = 0
 
         # 捕获 message：期望「没有已完成的EPUB任务」（API 已配置 + 无火山 Key 也能进入）
         shown = []

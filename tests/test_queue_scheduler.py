@@ -494,6 +494,60 @@ class TestCoordinatorLifecycle:
 class TestCoordinatorStateTransitions:
     """状态机：PENDING -> READY -> RUNNING -> COMPLETED/CANCELLED/ERROR。"""
 
+    def test_engine_preparation_releases_global_state_lock(self, tmp_config_manager, monkeypatch):
+        """Provider initialization must not block queue commands behind ``_lock``."""
+        entered = threading.Event()
+        release = threading.Event()
+        lock_was_available: list[bool] = []
+
+        class _BlockingInitEngine(MockEngine):
+            def _ensure_api(self):
+                acquired = coordinator._lock.acquire(blocking=False)
+                lock_was_available.append(acquired)
+                if acquired:
+                    coordinator._lock.release()
+                entered.set()
+                assert release.wait(3.0)
+
+        monkeypatch.setattr(
+            "src.core.queue_scheduler.TranslatorEngine", lambda _config: _BlockingInitEngine()
+        )
+        coordinator = QueueTranslationCoordinator(
+            tmp_config_manager,
+            _make_policy(),
+            file_handler=_MockFileHandler(),
+            epub_processor=_MockEpubProcessor(),
+        )
+        coordinator.start()
+        try:
+            assert coordinator.add_task(
+                "prepare-lock",
+                "/tmp/prepare-lock.txt",
+                "prepare-lock.txt",
+                "txt",
+                None,
+                ["line"],
+                [""],
+            )
+            coordinator.submit_command("start", "prepare-lock")
+            assert entered.wait(3.0)
+            assert lock_was_available == [True]
+
+            # This call would block if _ensure_api still held the coordinator lock.
+            coordinator.submit_command("cancel", "prepare-lock")
+            release.set()
+
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                task = coordinator.get_task_data("prepare-lock")
+                if task is not None and task["status"] == "cancelled":
+                    break
+                time.sleep(0.01)
+            assert coordinator.get_task_data("prepare-lock")["status"] == "cancelled"
+        finally:
+            release.set()
+            coordinator.close()
+
     def test_cancel_bumps_attempt_id(self, tmp_config_manager):
         """取消后 attempt_id 改变，旧 Outcome 被丢弃（§9.3 隔离语义）。
 

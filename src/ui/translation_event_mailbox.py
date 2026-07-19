@@ -42,34 +42,40 @@ class TranslationEventMailbox:
         """发布事件。工作线程调用，线程安全。
 
         - STREAM 事件覆盖同批次之前的流式快照。
-        - 终结事件（BATCH_COMPLETED/RUN_*）追加到 FIFO 队列，
-          并清除同批次的残留流式状态。
+        - ``BATCH_COMPLETED`` 追加到 FIFO 队列，并清除同批次流式状态。
+        - ``RUN_*`` 终态会清除该 run 的全部流式状态，避免其他批次的
+          半成品预览在失败/取消后继续渲染。
         """
         key: _StreamKey = (event.run_id, event.batch_start)
         with self._lock:
             if event.kind is TranslationEventKind.STREAM:
                 self._latest_stream[key] = event
                 return
-            # 终结事件（含 BATCH_COMPLETED）发布时清除同批次流式状态，
-            # 避免终结事件处理后又被残留流式快照覆盖。
-            self._latest_stream.pop(key, None)
+            if event.kind.is_terminal:
+                self._latest_stream = {
+                    stream_key: value
+                    for stream_key, value in self._latest_stream.items()
+                    if stream_key[0] != event.run_id
+                }
+            else:
+                # BATCH_COMPLETED 清除同批次流式状态，避免终态处理后又
+                # 被残留流式快照覆盖。
+                self._latest_stream.pop(key, None)
             self._terminal.append(event)
 
-    def drain(
-        self,
-    ) -> Tuple[
+    def drain(self) -> Tuple[
         Tuple[TranslationProgressEvent, ...],
         Tuple[TranslationProgressEvent, ...],
     ]:
         """排空邮箱，返回 (终结事件, 流式事件)。
 
-        只由 Tk 主线程调用。排空后邮箱为空。
+        只由 Tk 主线程调用。
         终结事件先于本轮残留流式事件返回，确保终结状态不被中间快照覆盖。
         """
         with self._lock:
             terminal = tuple(self._terminal)
-            stream = tuple(self._latest_stream.values())
             self._terminal.clear()
+            stream = tuple(self._latest_stream.values())
             self._latest_stream.clear()
         return terminal, stream
 

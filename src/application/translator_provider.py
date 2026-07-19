@@ -65,9 +65,9 @@ class TranslatorEngineAdapter(TranslationProvider):
             TranslationResult
         """
         content = "\n".join(lines)
-        result_holder: dict = {}
+        result_holder: dict[str, object] = {}
 
-        def progress_callback(progress: float, batch_data: dict):
+        def progress_callback(progress: float, batch_data: dict[str, object] | None):
             if on_progress is None:
                 return
             # 将旧式字典回调转换为 TranslationProgress

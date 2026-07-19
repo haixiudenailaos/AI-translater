@@ -11,6 +11,7 @@ import json
 import logging
 import threading
 import time
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 from typing import Callable, Dict
 from urllib.parse import urlparse
@@ -25,10 +26,18 @@ from openai import (
     OpenAI,
 )
 
+from ..config.volcengine_image import (
+    VOLCENGINE_IMAGE_DEFAULT_BASE_URL,
+    VOLCENGINE_IMAGE_DEFAULT_MODEL,
+    VOLCENGINE_IMAGE_MODEL_ECONOMY,
+    VOLCENGINE_IMAGE_MODEL_HIGH_QUALITY,
+)
 from ..domain.errors import ImageTranslationCancelled
-from ..infrastructure.image_asset_store import load_image_base64
+from ..infrastructure.image_asset_store import load_image_base64, load_image_bytes
 
-logging.basicConfig(level=logging.DEBUG, format="[DEBUG] %(message)s")
+# P2-7：移除模块导入期 logging.basicConfig() 副作用。
+# 全局日志配置应由 src.utils.logger.setup_logging 在组合根中显式完成，
+# 模块级 basicConfig 会抢先把 root logger 钉死在 DEBUG，污染所有调用方。
 logger = logging.getLogger(__name__)
 
 _IMAGE_API_TIMEOUT = httpx.Timeout(
@@ -98,10 +107,41 @@ _ALLOWED_DOWNLOAD_CONTENT_TYPES = {
 
 # 下载最大字节数（50MB，足够覆盖 4K 图片）
 _DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024
+_SVG_BLOCKED_ELEMENTS = {"script", "foreignobject"}
+_SVG_HREF_ATTRIBUTES = {"href", "{http://www.w3.org/1999/xlink}href"}
 
 
 class ImageDownloadError(Exception):
     """P1-9：图片下载信任边界校验失败。"""
+
+
+def _rasterize_safe_svg(data: bytes) -> bytes:
+    """Reject active SVG constructs and rasterize the remaining static image."""
+    if b"<!doctype" in data.lower() or b"<!entity" in data.lower():
+        raise ImageDownloadError("SVG 不允许声明外部实体")
+    try:
+        root = ElementTree.fromstring(data)
+    except ElementTree.ParseError as exc:
+        raise ImageDownloadError("SVG XML 格式无效") from exc
+    if root.tag.rsplit("}", 1)[-1].lower() != "svg":
+        raise ImageDownloadError("下载内容不是 SVG 根元素")
+    for element in root.iter():
+        local_name = element.tag.rsplit("}", 1)[-1].lower()
+        if local_name in _SVG_BLOCKED_ELEMENTS:
+            raise ImageDownloadError("SVG 包含不允许的主动内容")
+        for attribute, value in element.attrib.items():
+            if attribute.rsplit("}", 1)[-1].lower().startswith("on"):
+                raise ImageDownloadError("SVG 包含不允许的事件属性")
+            if attribute in _SVG_HREF_ATTRIBUTES and value and not value.startswith("#"):
+                raise ImageDownloadError("SVG 不允许外部资源引用")
+    try:
+        import cairosvg
+
+        return cairosvg.svg2png(bytestring=ElementTree.tostring(root), unsafe=False)
+    except ImageDownloadError:
+        raise
+    except Exception as exc:
+        raise ImageDownloadError("SVG 安全栅格化失败") from exc
 
 
 # P1-9：严格的魔数白名单，用于下载内容验证。
@@ -195,37 +235,43 @@ def _safe_download_image(url: str, *, timeout: int = 60) -> bytes:
     """
     _validate_download_url(url)
 
-    # 禁止自动重定向，手动验证 Location
-    response = requests.get(
-        url,
-        timeout=timeout,
-        stream=True,
-        allow_redirects=False,
-    )
-    if response.status_code in (301, 302, 303, 307, 308):
-        location = response.headers.get("Location", "")
-        # 递归校验重定向目标（限制深度由 requests 重试机制兜底）
-        _validate_download_url(location)
-        # 校验通过后跟随重定向（不再允许二次重定向）
+    # P1-3：所有 HTTP 状态/MIME/重定向/超限分支都必须关闭 response，
+    # 避免连接泄漏。旧实现只在流式读取完成后 close，HTTP 错误和 MIME
+    # 拒绝路径直接 raise，response 句柄丢失到 GC。
+    response = None
+    try:
+        # 禁止自动重定向，手动验证 Location
         response = requests.get(
-            location,
+            url,
             timeout=timeout,
             stream=True,
             allow_redirects=False,
         )
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location", "")
+            # 递归校验重定向目标（限制深度由 requests 重试机制兜底）
+            _validate_download_url(location)
+            # 校验通过后跟随重定向（不再允许二次重定向）
+            # P1-3：先关闭旧 response，再发起新请求
+            response.close()
+            response = requests.get(
+                location,
+                timeout=timeout,
+                stream=True,
+                allow_redirects=False,
+            )
 
-    if response.status_code != 200:
-        raise ImageDownloadError(f"下载失败: HTTP {response.status_code}")
+        if response.status_code != 200:
+            raise ImageDownloadError(f"下载失败: HTTP {response.status_code}")
 
-    # Content-Type 校验
-    content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    if content_type and content_type not in _ALLOWED_DOWNLOAD_CONTENT_TYPES:
-        raise ImageDownloadError(f"下载 Content-Type 不允许: {content_type}")
+        # Content-Type 校验
+        content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type and content_type not in _ALLOWED_DOWNLOAD_CONTENT_TYPES:
+            raise ImageDownloadError(f"下载 Content-Type 不允许: {content_type}")
 
-    # 流式读取，限制最大字节数
-    chunks: list[bytes] = []
-    total = 0
-    try:
+        # 流式读取，限制最大字节数
+        chunks: list[bytes] = []
+        total = 0
         for chunk in response.iter_content(chunk_size=8192):
             if not chunk:
                 continue
@@ -233,13 +279,18 @@ def _safe_download_image(url: str, *, timeout: int = 60) -> bytes:
             if total > _DOWNLOAD_MAX_BYTES:
                 raise ImageDownloadError(f"下载超出最大字节数限制 ({_DOWNLOAD_MAX_BYTES} bytes)")
             chunks.append(chunk)
-    finally:
-        response.close()
 
-    data = b"".join(chunks)
+        data = b"".join(chunks)
+    finally:
+        # P1-3：所有分支统一在 finally 中关闭 response
+        if response is not None:
+            response.close()
 
     # P1-9：严格魔数验证（不盲信 Content-Type，不依赖默认返回值）
-    _validate_image_magic_bytes(data)
+    image_format = _validate_image_magic_bytes(data)
+    if image_format == "svg+xml":
+        data = _rasterize_safe_svg(data)
+        _validate_image_magic_bytes(data)
 
     return data
 
@@ -287,19 +338,18 @@ _FORMAT_TO_MIME = {
 
 
 class ImageTranslator:
-    # 可选模型：高质量（Pro，较贵）和经济版（较便宜）
-    MODEL_HIGH_QUALITY = "doubao-seedream-5-0-pro-260628"
-    MODEL_ECONOMY = "doubao-seedream-5-0-260128"
-    _VALID_MODELS = {MODEL_HIGH_QUALITY, MODEL_ECONOMY}
-    DEFAULT_MODEL = MODEL_HIGH_QUALITY
+    DEFAULT_BASE_URL = VOLCENGINE_IMAGE_DEFAULT_BASE_URL
+    # 常用模型保留为设置页候选项，用户也可以填写其他模型 ID。
+    MODEL_HIGH_QUALITY = VOLCENGINE_IMAGE_MODEL_HIGH_QUALITY
+    MODEL_ECONOMY = VOLCENGINE_IMAGE_MODEL_ECONOMY
+    DEFAULT_MODEL = VOLCENGINE_IMAGE_DEFAULT_MODEL
 
     def __init__(self, config_manager):
         self.config_manager = config_manager
         self.max_retries = 3
 
         # 火山引擎配置
-        self.volc_base_url = "https://ark.cn-beijing.volces.com/api/v3"
-        self.volc_model = self._load_model_from_config()
+        self.volc_base_url, self.volc_model = self._load_api_config()
 
         # PERF-005：复用 OpenAI 客户端，仅在 API Key 变化时重建
         self._client: OpenAI | None = None
@@ -309,20 +359,26 @@ class ImageTranslator:
     def _get_api_key(self) -> str:
         return self.config_manager.get_volc_key()
 
-    def _load_model_from_config(self) -> str:
-        """从应用配置读取图片翻译模型，无效时回退到默认（高质量）。"""
+    def _load_api_config(self) -> tuple[str, str]:
+        """读取用户配置的火山方舟 API 地址和图片翻译模型。"""
         try:
             app_config = self.config_manager.get_app_config()
-            model = (
-                app_config.get("image_translation", {})
-                .get("ai_volcengine", {})
-                .get("model", self.DEFAULT_MODEL)
+            if not isinstance(app_config, dict):
+                raise TypeError("应用配置必须是字典")
+            image_config = app_config.get("image_translation", {})
+            if not isinstance(image_config, dict):
+                raise TypeError("图片翻译配置必须是字典")
+            config = image_config.get("ai_volcengine", {})
+            if not isinstance(config, dict):
+                raise TypeError("火山引擎配置必须是字典")
+            base_url = str(config.get("base_url", "")).strip().rstrip("/")
+            model = str(config.get("model", "")).strip()
+            return (
+                base_url or self.DEFAULT_BASE_URL,
+                model or self.DEFAULT_MODEL,
             )
-            if model in self._VALID_MODELS:
-                return model
         except Exception:
-            pass
-        return self.DEFAULT_MODEL
+            return self.DEFAULT_BASE_URL, self.DEFAULT_MODEL
 
     def _get_client(self) -> OpenAI | None:
         """PERF-005：获取复用的 OpenAI 客户端，API Key 变化时才重建。"""
@@ -497,38 +553,34 @@ class ImageTranslator:
                 name,
             )
             original_path = info.get("original_path")
-            # PERF-004：按需从二进制资源创建 data URI，兼容旧映射格式。
-            base64_data = load_image_base64(mapping_path, info)
+            # PERF-6d：内部管道统一传 bytes，避免 load→encode→decode→convert→encode
+            # 的冗余 base64 编解码循环。只在 HTTP JSON 边界编码一次。
+            raw_bytes = load_image_bytes(mapping_path, info)
             logger.debug(
-                "[translate_images] 图片信息: original_path=%s, base64长度=%d",
+                "[translate_images] 图片信息: original_path=%s, raw_bytes=%d",
                 original_path,
-                len(base64_data),
+                len(raw_bytes) if raw_bytes else 0,
             )
 
-            if not original_path or not base64_data:
+            if not original_path or not raw_bytes:
                 logger.warning(
-                    "[translate_images] 缺少必要信息，跳过: original_path=%s, base64_data=%s",
+                    "[translate_images] 缺少必要信息，跳过: original_path=%s, raw_bytes=%s",
                     bool(original_path),
-                    bool(base64_data),
+                    bool(raw_bytes),
                 )
                 continue
 
-            if "," in base64_data:
-                b64_str = base64_data.split(",", 1)[1]
-                logger.debug("[translate_images] 移除data:前缀，长度=%d", len(b64_str))
-            else:
-                b64_str = base64_data
-
             mime_type = info.get("mime_type", "image/png")
-            from .image_utils import convert_to_png
+            from .image_utils import convert_to_png_bytes
 
             logger.debug("[translate_images] 开始格式转换，mime_type=%s", mime_type)
-            converted_b64, converted_mime = convert_to_png(b64_str, mime_type)
-            if converted_b64 is None:
+            converted_bytes, converted_mime = convert_to_png_bytes(raw_bytes, mime_type)
+            if converted_bytes is None:
                 logger.warning("[translate_images] 格式转换失败，跳过: %s (%s)", name, mime_type)
                 print(f"[插图翻译] 跳过不支持的图片格式: {name} ({mime_type})")
                 continue
-            b64_str = converted_b64
+            # PERF-6d：只在进入 HTTP JSON 边界前编码一次 base64
+            b64_str = base64.b64encode(converted_bytes).decode("ascii")
             logger.debug(
                 "[translate_images] 格式转换成功，mime_type=%s, base64长度=%d",
                 converted_mime,

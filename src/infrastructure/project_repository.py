@@ -30,11 +30,22 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 # 项目状态文件格式版本
-PROJECT_SCHEMA_VERSION = 1
+PROJECT_SCHEMA_VERSION = 2
 # 保留的最大检查点数量
 MAX_CHECKPOINTS = 5
 # 最近项目列表文件名
 RECENT_PROJECTS_FILE = "recent_projects.json"
+
+
+class ProjectCorruptError(RuntimeError):
+    """A persisted project could not be parsed and was isolated for recovery."""
+
+    def __init__(self, project_id: str, original_path: Path, quarantined_path: Path | None):
+        self.project_id = project_id
+        self.original_path = original_path
+        self.quarantined_path = quarantined_path
+        location = str(quarantined_path or original_path)
+        super().__init__(f"项目恢复文件已损坏，已隔离到: {location}")
 
 
 def compute_project_id(source_path: str, fingerprint: str) -> str:
@@ -130,7 +141,7 @@ class ProjectRepository:
         return project
 
     def load(self, project_id: str) -> TranslationProject | None:
-        """按项目 ID 加载项目，不存在返回 None。"""
+        """Load a project, distinguishing absent and corrupted files."""
         path = self._project_file(project_id)
         if not path.exists():
             return None
@@ -139,9 +150,48 @@ class ProjectRepository:
             project = TranslationProject.from_dict(data)
             project.last_opened_at = _now_iso()
             return project
-        except Exception as e:
-            logger.error("加载项目 %s 失败: %s", project_id, e)
+        except Exception as exc:
+            quarantined_path = self._quarantine_corrupt_project(path)
+            logger.error(
+                "加载项目 %s 失败，已隔离损坏文件 %s: %s",
+                project_id,
+                quarantined_path or path,
+                exc,
+            )
+            raise ProjectCorruptError(project_id, path, quarantined_path) from exc
+
+    def _quarantine_corrupt_project(self, path: Path) -> Path | None:
+        """Move an unreadable project aside before any caller can recreate it."""
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        quarantined_path = path.with_name(f"{path.stem}.corrupt-{timestamp}{path.suffix}")
+        try:
+            path.replace(quarantined_path)
+            return quarantined_path
+        except OSError as exc:
+            logger.error("隔离损坏项目文件 %s 失败: %s", path, exc)
             return None
+
+    def find_by_source_path(self, source_path: str) -> TranslationProject | None:
+        """P1-UX-2：按源文件路径查找最近的项目（用于指纹变化检测）。
+
+        遍历最近项目列表，找到 source_path 匹配的项目并加载。
+        找不到返回 None。同一路径下可能存在多个历史项目（指纹不同），
+        返回最近打开的那个，由调用方比较指纹决定是否复用。
+        """
+        try:
+            recent = self.list_recent(limit=50)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查找同路径项目时读取最近列表失败: %s", exc)
+            return None
+        for entry in recent:
+            if str(entry.get("source_path", "")) == source_path:
+                pid = str(entry.get("project_id", ""))
+                if not pid:
+                    continue
+                project = self.load(pid)
+                if project is not None:
+                    return project
+        return None
 
     def save(self, project: TranslationProject) -> None:
         """原子保存项目状态（UXF-003：失败抛异常，不静默吞掉）。

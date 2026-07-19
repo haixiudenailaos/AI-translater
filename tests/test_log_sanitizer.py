@@ -11,6 +11,8 @@
 - 幂等性
 """
 
+import logging
+
 from src.utils.log_sanitizer import (
     is_safe_to_log,
     mask_value,
@@ -18,6 +20,7 @@ from src.utils.log_sanitizer import (
     sanitize_error_message,
     sanitize_for_log,
 )
+from src.utils.logger import _SanitizingFormatter
 
 # ── mask_value ─────────────────────────────
 
@@ -145,3 +148,25 @@ class TestIsSafeToLog:
 
     def test_bearer_unsafe(self):
         assert is_safe_to_log("Authorization: Bearer token123") is False
+
+
+def test_formatter_sanitizes_exception_traceback():
+    """ENG-3：异常 traceback 不能绕过 handler 的消息 Filter。"""
+    formatter = _SanitizingFormatter("%(levelname)s %(message)s")
+    try:
+        raise RuntimeError("request failed: Authorization: Bearer trace-secret-token")
+    except RuntimeError:
+        record = logging.LogRecord(
+            "test",
+            logging.ERROR,
+            __file__,
+            1,
+            "translation failed",
+            (),
+            exc_info=__import__("sys").exc_info(),
+        )
+
+    rendered = formatter.format(record)
+
+    assert "trace-secret-token" not in rendered
+    assert "Bearer ***" in rendered

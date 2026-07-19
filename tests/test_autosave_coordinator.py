@@ -568,3 +568,320 @@ def test_closed_coordinator_rejects_debounce_callbacks():
     # close 后不应启动任何保存
     assert coordinator.state != SAVING
     assert len(file_handler.writes) == 0
+
+
+# ── P0-3: mark_clean 公共方法 ─────────────────────────────
+
+
+def test_mark_clean_clears_dirty_state():
+    """P0-3：mark_clean 在 DIRTY 状态下置为 CLEAN，并取消 debounce。"""
+    coordinator, root, *_ = _make_coordinator()
+    document = coordinator._document
+    _populate(document, 3)
+
+    # 编辑产生 dirty + 调度 debounce
+    document.update_target(0, "译A")
+    coordinator.mark_dirty(source="edit")
+    assert coordinator.state == DIRTY
+    assert len(root.scheduled) >= 1
+    scheduled_ids = [aid for aid, *_rest in root.scheduled]
+
+    # mark_clean 应清除状态并取消 debounce
+    coordinator.mark_clean()
+
+    assert coordinator.state == CLEAN
+    # 所有已调度的 debounce/max_delay 都应被取消
+    assert all(aid in root.cancelled for aid in scheduled_ids)
+    # 残余回调即使被触发也不会改回 DIRTY
+    while root.scheduled:
+        root.trigger_oldest()
+    assert coordinator.state == CLEAN
+
+
+def test_mark_clean_does_not_interrupt_saving():
+    """P0-3：SAVING 中调用 mark_clean 不修改状态，由 _handle_result 接管。"""
+    coordinator, root, file_handler, *_ = _make_coordinator()
+    document = coordinator._document
+    _populate(document, 3)
+
+    # 阻塞 worker 保持 SAVING
+    file_handler.block_event.clear()
+
+    document.update_target(0, "译A")
+    coordinator.mark_dirty(source="flush")
+    assert coordinator.is_saving is True
+
+    # 在 SAVING 中调用 mark_clean：状态保持 SAVING
+    coordinator.mark_clean()
+    assert coordinator.is_saving is True
+
+    # 释放 worker 并完成
+    file_handler.block_event.set()
+    for _ in range(50):
+        coordinator._poll_result()
+        if coordinator.state != SAVING:
+            break
+        time.sleep(0.02)
+
+    assert coordinator.state == CLEAN
+
+
+def test_mark_clean_after_close_is_noop():
+    """P0-3：close 后调用 mark_clean 应被守卫拦截，不修改状态。"""
+    coordinator, *_ = _make_coordinator()
+    coordinator.close()
+    assert coordinator.state == CLEAN
+
+    # close 后不应抛异常也不应改状态
+    coordinator.mark_clean()
+    assert coordinator.state == CLEAN
+
+
+# ── P0-1: discard_pending 放弃未保存更改 ──────────────────────
+
+
+def test_discard_pending_dirty_state_does_not_save():
+    """P0-1：DIRTY 状态下 discard_pending 不启动保存，直接置 CLEAN。
+
+    覆盖审查文档 P0-1 的核心契约：用户选择"放弃更改"后，
+    保存函数调用次数为 0，磁盘保持旧内容。
+    """
+    coordinator, root, file_handler, *_ = _make_coordinator()
+    document = coordinator._document
+    _populate(document, 3)
+
+    # 编辑产生 dirty + 调度 debounce
+    document.update_target(0, "未保存的译文")
+    coordinator.mark_dirty(source="edit")
+    assert coordinator.state == DIRTY
+    scheduled_ids = [aid for aid, *_rest in root.scheduled]
+    assert scheduled_ids, "mark_dirty 应调度 debounce"
+
+    # discard_pending：取消 debounce，置 CLEAN，不启动保存
+    ok = coordinator.discard_pending(timeout=1.0)
+
+    assert ok is True
+    assert coordinator.state == CLEAN
+    # 没有任何写入发生
+    assert file_handler.writes == []
+    # 所有已调度的 debounce/max_delay 应被取消
+    assert all(aid in root.cancelled for aid in scheduled_ids), (
+        "discard_pending 必须取消所有已调度的 after 回调"
+    )
+
+
+def test_discard_pending_save_failed_state_clears_without_save():
+    """P0-1：SAVE_FAILED 状态下 discard_pending 置 CLEAN，不重试保存。"""
+    coordinator, root, file_handler, *_ = _make_coordinator()
+    document = coordinator._document
+    _populate(document, 2)
+
+    # 制造一次保存失败
+    file_handler.fail_next = True
+    coordinator.mark_dirty(source="flush")
+    for _ in range(50):
+        coordinator._poll_result()
+        if coordinator.state != SAVING:
+            break
+        time.sleep(0.02)
+    assert coordinator.state == SAVE_FAILED
+
+    # discard_pending：不再重试，直接置 CLEAN
+    file_handler.fail_next = False  # 确保即使重试也会成功，以验证没有重试
+    ok = coordinator.discard_pending(timeout=1.0)
+
+    assert ok is True
+    assert coordinator.state == CLEAN
+    # 仍只有失败那一次写入尝试（无新增）
+    assert len(file_handler.writes) == 0
+
+
+def test_discard_pending_save_scheduled_cancels_after_and_skips_save():
+    """P0-1：SAVE_SCHEDULED（debounce 已调度未到期）状态下 discard_pending
+    取消 after 且不启动 worker。"""
+    from src.application.autosave import SAVE_SCHEDULED
+
+    coordinator, root, file_handler, *_ = _make_coordinator()
+    document = coordinator._document
+    _populate(document, 2)
+
+    document.update_target(0, "未保存")
+    coordinator.mark_dirty(source="edit")
+    # 状态机中 mark_dirty 在 CLEAN 时置 DIRTY 并调度 debounce，
+    # 这里直接断言调度存在，不再模拟 SAVE_SCHEDULED 中间态（实现细节）。
+    assert coordinator.state == DIRTY
+    debounce_ids = [aid for aid, d, _cb in root.scheduled if d == 1000]
+    assert len(debounce_ids) == 1
+
+    ok = coordinator.discard_pending(timeout=0.5)
+
+    assert ok is True
+    assert coordinator.state == CLEAN
+    # debounce after_id 必须被取消，worker 不应启动
+    assert debounce_ids[0] in root.cancelled
+    assert file_handler.writes == []
+    # 标记为 SAVE_SCHEDULED 仅用于类型提示，避免未使用导入告警
+    _ = SAVE_SCHEDULED
+
+
+def test_discard_pending_saving_waits_and_clears_without_new_save():
+    """P0-1：SAVING 中调用 discard_pending：等待当前保存完成，
+    完成后即使 generation 落后也置 CLEAN，不再调度新保存。
+
+    覆盖审查文档 P0-1 第 4 点：若询问期间已有保存正在写盘，
+    先完成该保存；discard_pending 不得假装可取消运行中的写入，
+    但完成后不得再启动新保存。
+    """
+    coordinator, root, file_handler, *_ = _make_coordinator()
+    document = coordinator._document
+    _populate(document, 3)
+
+    # 阻塞 worker，使其停留在 SAVING 状态
+    file_handler.block_event.clear()
+    coordinator.mark_dirty(source="flush")
+    assert coordinator.is_saving is True
+    save_gen = coordinator._save_generation
+
+    # 保存期间产生新版本：正常 flush 会再次启动保存
+    document.update_target(1, "新版本译文")
+    assert document.version > save_gen
+
+    # 在另一线程调用 discard_pending（主线程模拟需轮询）
+    result_holder = {}
+
+    def _discard():
+        result_holder["ok"] = coordinator.discard_pending(timeout=5.0)
+
+    discard_thread = threading.Thread(target=_discard)
+    discard_thread.start()
+
+    # 短暂等待，确保 discard_pending 已进入轮询
+    time.sleep(0.05)
+
+    # 释放 worker，让其完成
+    file_handler.block_event.set()
+
+    discard_thread.join(timeout=5.0)
+
+    assert result_holder.get("ok") is True
+    assert coordinator.state == CLEAN
+    # 只发生一次保存（SAVING 完成那次），不再因 generation 落后启动新保存
+    assert len(file_handler.writes) == 1
+
+
+def test_discard_pending_saving_timeout_returns_false():
+    """P0-1：SAVING 中 discard_pending 超时返回 False，
+    状态保持 SAVING（未假装已放弃）。"""
+    coordinator, root, file_handler, *_ = _make_coordinator()
+    document = coordinator._document
+    _populate(document, 2)
+
+    # 阻塞 worker，使其无法在超时内完成
+    file_handler.block_event.clear()
+    coordinator.mark_dirty(source="flush")
+    assert coordinator.is_saving is True
+
+    ok = coordinator.discard_pending(timeout=0.1)
+
+    # 超时返回 False，状态仍为 SAVING
+    assert ok is False
+    assert coordinator.is_saving is True
+    # discard_after_save 标记应被清除
+    assert coordinator._discard_after_save is False
+
+    # 清理：释放 worker
+    file_handler.block_event.set()
+    for _ in range(50):
+        coordinator._poll_result()
+        if coordinator.state != SAVING:
+            break
+        time.sleep(0.02)
+
+
+def test_discard_pending_after_close_returns_clean_state():
+    """P0-1：close 后 discard_pending 不抛异常，按 CLEAN 返回。"""
+    coordinator, *_ = _make_coordinator()
+    coordinator.close()
+    assert coordinator.state == CLEAN
+
+    ok = coordinator.discard_pending(timeout=0.1)
+    assert ok is True
+    assert coordinator.state == CLEAN
+
+
+def test_discard_pending_clean_state_is_noop():
+    """P0-1：CLEAN 状态下 discard_pending 无副作用，返回 True。"""
+    coordinator, root, file_handler, *_ = _make_coordinator()
+    assert coordinator.state == CLEAN
+
+    ok = coordinator.discard_pending(timeout=0.1)
+
+    assert ok is True
+    assert coordinator.state == CLEAN
+    assert file_handler.writes == []
+
+
+def test_handle_result_with_discard_flag_forces_clean():
+    """P0-1：_discard_after_save=True 时 _handle_result 强制置 CLEAN，
+    不因 generation 落后而置 DIRTY。"""
+    coordinator, root, file_handler, *_ = _make_coordinator()
+    document = coordinator._document
+    _populate(document, 2)
+
+    # 启动保存
+    file_handler.block_event.clear()
+    coordinator.mark_dirty(source="flush")
+    save_gen = coordinator._save_generation
+
+    # 保存期间产生新版本
+    document.update_target(0, "新版本")
+
+    # 设置 discard 标记（模拟 discard_pending 在 SAVING 中的路径）
+    coordinator._discard_after_save = True
+
+    # 释放 worker
+    file_handler.block_event.set()
+    # 触发结果处理（主线程内联）
+    for _ in range(50):
+        if coordinator._drain_result_inline():
+            break
+        time.sleep(0.02)
+
+    # discard 标记应被清除，状态为 CLEAN（而非 DIRTY）
+    assert coordinator._discard_after_save is False
+    assert coordinator.state == CLEAN
+
+
+def test_drain_result_inline_with_discard_flag_forces_clean():
+    """P0-1：_drain_result_inline 在 _discard_after_save=True 时
+    直接置 CLEAN，不调度新保存（不调用 _schedule）。"""
+    coordinator, root, *_ = _make_coordinator()
+    document = coordinator._document
+    _populate(document, 2)
+
+    # 模拟一个已完成的保存结果（generation 落后于 document.version）
+    coordinator.mark_dirty(source="flush")
+    save_gen = coordinator._save_generation
+    document.update_target(0, "新版本")  # version 提升
+
+    # 手动放入结果队列
+    old_result = SaveResult(
+        generation=save_gen,
+        succeeded=True,
+        elapsed_seconds=0.01,
+        bytes_written=10,
+    )
+    coordinator._result_queue.put(old_result)
+
+    # 设置 discard 标记
+    coordinator._discard_after_save = True
+    scheduled_before = list(root.scheduled)
+
+    # 内联抽取：应置 CLEAN 而非 DIRTY
+    drained = coordinator._drain_result_inline()
+
+    assert drained is True
+    assert coordinator.state == CLEAN
+    # 不应调度新的 after 回调（不启动新保存）
+    assert root.scheduled == scheduled_before
+

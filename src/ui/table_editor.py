@@ -62,9 +62,40 @@ class TableCellEditor:
         if not bbox:
             return
 
+        self._begin_edit(item, col_idx, bbox)
+
+    def start_edit_selected(self, column: int | None = None) -> bool:
+        """UX-6：键盘触发编辑（F2/Enter）。
+
+        对当前选中行的指定列启动内联编辑；``column`` 为 None 时选择
+        ``editable_columns`` 中最小的可编辑列。返回是否成功启动编辑。
+        """
+        if self.edit_entry:
+            # 已在编辑中，保留焦点
+            self.edit_entry.focus_set()
+            return True
+        sel = self.tree.selection()
+        if not sel:
+            return False
+        item = sel[0]
+        col_idx = column if column is not None else min(self.editable_columns)
+        if col_idx not in self.editable_columns:
+            return False
+        values = self.tree.item(item)["values"]
+        if not values or col_idx >= len(values):
+            return False
+        bbox = self.tree.bbox(item, f"#{col_idx + 1}")
+        if not bbox:
+            return False
+        self._begin_edit(item, col_idx, bbox)
+        return True
+
+    def _begin_edit(self, item: str, col_idx: int, bbox: tuple) -> None:
+        """在指定位置启动 Entry 编辑。"""
         self.editing_item = item
         self.editing_column = col_idx
 
+        values = self.tree.item(item)["values"]
         self.edit_entry = tk.Entry(self.tree, font=self.font, relief=tk.SOLID, borderwidth=1)
         self.edit_entry.insert(0, values[col_idx])
         self.edit_entry.select_range(0, tk.END)

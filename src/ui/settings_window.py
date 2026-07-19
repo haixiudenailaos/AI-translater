@@ -3,10 +3,9 @@
 设置窗口模块
 """
 
-import hmac
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 from ..config.translation_profile import (
     DEEPSEEK_V4_FLASH_MODEL,
@@ -38,6 +37,14 @@ from ..config.translation_profile import (
     default_base_url_for_provider,
     normalize_openai_base_url,
 )
+from ..config.volcengine_image import (
+    VOLCENGINE_IMAGE_DEFAULT_BASE_URL,
+    VOLCENGINE_IMAGE_DEFAULT_MODEL,
+    VOLCENGINE_IMAGE_MODEL_SUGGESTIONS,
+)
+from ..domain.edition import EditionCapabilities, detect_edition_capabilities
+from .form_validation import FormValidator, clamp_int
+from .theme import COLORS, status_color
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 
 
@@ -46,10 +53,26 @@ class SettingsWindow:
     WINDOW_HEIGHT = 560
     SCREEN_MARGIN = 32
 
-    def __init__(self, parent, config_manager, callback=None):
+    def __init__(
+        self,
+        parent,
+        config_manager,
+        callback=None,
+        edition_capabilities: EditionCapabilities | None = None,
+    ):
         self.parent = parent
         self.config_manager = config_manager
         self.callback = callback
+        self.edition_capabilities = (
+            edition_capabilities
+            if edition_capabilities is not None
+            else detect_edition_capabilities()
+        )
+        # P2-5：表单字段级校验器 + testing busy 状态（防止连接测试/模块检测
+        # 重复启动，避免用户在测试中误触发多次付费请求）。
+        self._form_validator = FormValidator()
+        self._test_in_progress = False
+        self._test_buttons: list = []
 
         self.provider_display_map = {
             "siliconflow": "SiliconFlow",
@@ -78,7 +101,7 @@ class SettingsWindow:
         self.window.title("设置")
         # P1-7：允许缩放，配合各 tab 的页内滚动避免高 DPI/小屏裁切
         self.window.resizable(True, True)
-        self.window.minsize(self.WINDOW_WIDTH, self.WINDOW_HEIGHT)
+        # P2-3：minsize 在 center_window 中按工作区收敛，不在 __init__ 提前钉死。
         self.window.transient(parent)
         self.window.grab_set()
 
@@ -100,6 +123,21 @@ class SettingsWindow:
 
         self.setup_ui()
 
+        # P2-1：模态窗口补 Escape 关闭，关闭后焦点回到父窗口
+        self.window.bind("<Escape>", lambda _event: self.window.destroy())
+        self.window.bind("<Destroy>", self._on_window_destroy_restore_focus, add="+")
+
+    def _on_window_destroy_restore_focus(self, event: tk.Event) -> None:
+        """P2-1：窗口销毁后把焦点还给父窗口，便于键盘用户继续操作。"""
+        if event.widget is not self.window:
+            return
+        parent = self.parent
+        try:
+            if parent is not None and parent.winfo_exists():
+                parent.focus_set()
+        except tk.TclError:
+            pass
+
     def _on_window_destroy(self, event):
         """P1-1：窗口销毁时关闭 UI 回调事件泵。幂等。"""
         if event.widget is self.window:
@@ -112,13 +150,81 @@ class SettingsWindow:
             pump.close()
             self._ui_pump = None
 
+    # ── P2-5：表单校验与 testing busy 状态 ──────────────────────
+
+    def _register_spin(
+        self,
+        spin: ttk.Widget,
+        var: tk.IntVar,
+        lo: int,
+        hi: int,
+        name: str,
+        label: str,
+    ) -> None:
+        """注册一个整数 Spinbox 字段到表单校验器，并绑定 ``<FocusOut>`` 自动收敛。
+
+        P2-5：``ttk.Spinbox`` 允许用户输入任意文本，原实现只在 ``save_settings``
+        时统一弹通用错误。改为字段级校验：用户离开字段时立即把非法值收敛到
+        ``[lo, hi]``，并在保存前再次统一校验，聚焦首个错误字段。
+        """
+        spec = self._form_validator.register_int(name, label, var, lo, hi, widget=spin)
+        self._form_validator.attach_focus_out_clamp(spec)
+
+    def _validate_form(self) -> tuple[bool, str, object | None]:
+        """P2-5：整表校验。返回 ``(ok, first_message, first_failed_widget)``。"""
+        result = self._form_validator.validate_all()
+        return result.ok, result.first_message or "", result.first_failed_widget
+
+    def _set_testing_busy(self, busy: bool) -> None:
+        """P2-5：testing busy 状态。testing 期间禁用所有测试按钮，避免重复启动。
+
+        连接测试、模块检测和火山测试都可能触发网络请求或付费调用；并发
+        启动会让用户难以判断哪次结果对应哪次点击，也可能造成多次扣费。
+        """
+        self._test_in_progress = busy
+        state = "disabled" if busy else "normal"
+        for btn in self._test_buttons:
+            try:
+                btn.configure(state=state)
+            except (tk.TclError, AttributeError):
+                pass
+
+    def _begin_test(self) -> bool:
+        """P2-5：尝试开始一次测试。若已有测试在进行，弹提示并返回 False。"""
+        if self._test_in_progress:
+            try:
+                messagebox.showinfo(
+                    "测试进行中",
+                    "上一次测试尚未结束，请稍候再试。",
+                    parent=self.window,
+                )
+            except tk.TclError:
+                pass
+            return False
+        self._set_testing_busy(True)
+        return True
+
+    def _end_test(self) -> None:
+        """P2-5：测试结束，恢复测试按钮可用状态。"""
+        self._set_testing_busy(False)
+
     def center_window(self):
-        """窗口居中显示"""
+        """窗口居中显示。
+
+        P2-3：``minsize`` 必须服从可用工作区。在 800x600、高 DPI 缩放或小屏
+        环境下，硬编码 ``minsize(600,560)`` 可能超过屏幕可视区域，导致窗口
+        管理器强制裁切并把确认按钮挤出可视范围。这里把 minsize 收敛到
+        “屏幕尺寸 - 边距”与默认尺寸的较小值。
+        """
         self.window.update_idletasks()
         screen_width = self.window.winfo_screenwidth()
         screen_height = self.window.winfo_screenheight()
-        width = min(self.WINDOW_WIDTH, max(1, screen_width - self.SCREEN_MARGIN * 2))
-        height = min(self.WINDOW_HEIGHT, max(1, screen_height - self.SCREEN_MARGIN * 2))
+        avail_width = max(320, screen_width - self.SCREEN_MARGIN * 2)
+        avail_height = max(240, screen_height - self.SCREEN_MARGIN * 2)
+        width = min(self.WINDOW_WIDTH, avail_width)
+        height = min(self.WINDOW_HEIGHT, avail_height)
+        # minsize 服从工作区，避免在小屏 / 高 DPI 下超出可视范围
+        self.window.minsize(min(self.WINDOW_WIDTH, avail_width), min(self.WINDOW_HEIGHT, avail_height))
         x = max(0, (screen_width - width) // 2)
         y = max(0, (screen_height - height) // 2)
         self.window.geometry(f"{width}x{height}+{x}+{y}")
@@ -133,11 +239,22 @@ class SettingsWindow:
 
     def setup_ui(self):
         """设置界面"""
+        # P2-5：兼容 ``SettingsWindow.__new__`` 跳过 ``__init__`` 的测试路径，
+        # 确保 testing busy 状态相关属性存在。
+        if not hasattr(self, "_test_buttons"):
+            self._test_buttons = []
+            self._test_in_progress = False
+            self._form_validator = FormValidator()
         # 先预留底部操作区，避免高 DPI 或较小屏幕把确认按钮挤出窗口。
         button_frame = ttk.Frame(self.window)
         button_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 12))
 
-        ttk.Button(button_frame, text="测试连接", command=self.test_connection).pack(side=tk.LEFT)
+        # P2-5：测试连接按钮纳入 busy 列表，testing 期间禁用避免重复启动。
+        self.test_connection_btn = ttk.Button(
+            button_frame, text="测试连接", command=self.test_connection
+        )
+        self.test_connection_btn.pack(side=tk.LEFT)
+        self._test_buttons.append(self.test_connection_btn)
         self.confirm_button = ttk.Button(button_frame, text="确定", command=self.save_settings)
         self.confirm_button.pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Button(button_frame, text="取消", command=self.window.destroy).pack(side=tk.RIGHT)
@@ -158,7 +275,13 @@ class SettingsWindow:
         self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
 
     def _create_scrollable_tab(self, notebook, title):
-        """创建固定视口的设置页，内容过长时仅在页内滚动。"""
+        """创建固定视口的设置页，内容过长时仅在页内滚动。
+
+        P2-3：补齐滚轮、PageUp/PageDown 和 FocusIn 自动滚入视区，避免只能
+        拖动滚动条。鼠标悬停在 canvas 上时滚轮生效；键盘 PageUp/PageDown
+        在 canvas 获得焦点时生效；Tab 遍历到的 Entry/Spinbox 若被遮挡，
+        通过 ``see`` 把对应 widget 滚入可视区。
+        """
         tab = ttk.Frame(notebook)
         notebook.add(tab, text=title)
 
@@ -173,19 +296,114 @@ class SettingsWindow:
         content = ttk.Frame(canvas)
         content_window = canvas.create_window((0, 0), window=content, anchor=tk.NW)
 
-        content.bind(
-            "<Configure>",
-            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.bind(
-            "<Configure>",
-            lambda event: canvas.itemconfigure(content_window, width=event.width),
-        )
+        resize_after_id = None
+        pending_width = None
+
+        def _refresh_canvas_layout() -> None:
+            nonlocal resize_after_id
+            resize_after_id = None
+            try:
+                if pending_width is not None:
+                    canvas.itemconfigure(content_window, width=pending_width)
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        def _schedule_canvas_layout(width=None) -> None:
+            nonlocal pending_width, resize_after_id
+            if width is not None:
+                pending_width = width
+            if resize_after_id is not None:
+                try:
+                    canvas.after_cancel(resize_after_id)
+                except tk.TclError:
+                    pass
+            resize_after_id = canvas.after(45, _refresh_canvas_layout)
+
+        content.bind("<Configure>", lambda _event: _schedule_canvas_layout())
+        canvas.bind("<Configure>", lambda event: _schedule_canvas_layout(event.width))
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._bind_scrollable_canvas_events(canvas, content)
         return content
+
+    def _bind_scrollable_canvas_events(self, canvas: tk.Canvas, content: ttk.Frame) -> None:
+        """P2-3：为可滚动 canvas 绑定滚轮、键盘翻页和 FocusIn 自动定位。"""
+
+        def _scroll_by(delta: int) -> None:
+            """按像素增量滚动；delta 正向下、负向上。"""
+            try:
+                canvas.yview_scroll(int(delta), "units")
+            except tk.TclError:
+                pass
+
+        def _on_mouse_wheel(event: tk.Event) -> None:
+            # Windows: event.delta 是 120 的倍数；macOS: 也是 120 倍数但符号相反
+            step = -1 * (event.delta // 120)
+            _scroll_by(step)
+
+        def _on_linux_wheel_up(_event: tk.Event) -> str:
+            _scroll_by(-1)
+            return "break"
+
+        def _on_linux_wheel_down(_event: tk.Event) -> str:
+            _scroll_by(1)
+            return "break"
+
+        def _on_key_page_up(_event: tk.Event) -> None:
+            _scroll_by(-2)
+
+        def _on_key_page_down(_event: tk.Event) -> None:
+            _scroll_by(2)
+
+        def _on_focus_in(event: tk.Event) -> None:
+            """聚焦的 widget 若被遮挡，滚动使其可见。"""
+            widget = event.widget
+            try:
+                bbox = canvas.bbox("all")
+                if not bbox:
+                    return
+                widget_y = widget.winfo_y()
+                widget_h = widget.winfo_height()
+                canvas_h = canvas.winfo_height()
+                yview = canvas.yview()
+                top = yview[0]
+                bottom = yview[1]
+                content_h = bbox[3]
+                if content_h <= canvas_h:
+                    return
+                # widget 在 content 中的相对位置 (0..1)
+                widget_top_ratio = widget_y / max(1, content_h)
+                widget_bottom_ratio = (widget_y + widget_h) / max(1, content_h)
+                if widget_top_ratio < top:
+                    canvas.yview_moveto(widget_top_ratio)
+                elif widget_bottom_ratio > bottom:
+                    # 让 widget 底部刚好出现在 canvas 底部
+                    new_top = max(0.0, widget_bottom_ratio - (canvas_h / max(1, content_h)))
+                    canvas.yview_moveto(new_top)
+            except (tk.TclError, AttributeError, ZeroDivisionError):
+                pass
+
+        # 滚轮：绑定到 canvas 和所有子 widget，使鼠标悬停时即可滚动
+        for widget in (canvas, content):
+            widget.bind("<MouseWheel>", _on_mouse_wheel, add="+")
+            widget.bind("<Shift-MouseWheel>", _on_mouse_wheel, add="+")
+            widget.bind("<Button-4>", _on_linux_wheel_up, add="+")
+            widget.bind("<Button-5>", _on_linux_wheel_down, add="+")
+
+        # 键盘翻页：canvas 需可获得焦点
+        try:
+            canvas.configure(takefocus=True)
+        except tk.TclError:
+            pass
+        canvas.bind("<Prior>", _on_key_page_up, add="+")
+        canvas.bind("<Next>", _on_key_page_down, add="+")
+
+        # FocusIn：Tab 遍历到被遮挡的 Entry/Spinbox 时自动滚入视区
+        content.bind("<FocusIn>", _on_focus_in, add="+")
 
     def create_api_tab(self, notebook):
         """创建API配置页面"""
@@ -288,6 +506,8 @@ class SettingsWindow:
             api_frame, from_=1000, to=32768, textvariable=self.max_tokens_var, width=33
         )
         max_tokens_spin.grid(row=4, column=1, padx=10, pady=10)
+        # P2-5：字段级校验 + FocusOut 自动收敛
+        self._register_spin(max_tokens_spin, self.max_tokens_var, 1000, 32768, "max_tokens", "最大令牌数")
 
         # 温度参数
         ttk.Label(api_frame, text="温度参数:").grid(row=5, column=0, sticky=tk.W, padx=10, pady=10)
@@ -349,12 +569,16 @@ class SettingsWindow:
             width=33,
         )
         batch_spin.grid(row=2, column=1, padx=10, pady=10)
+        self._register_spin(
+            batch_spin, self.batch_lines_var, 1, MAX_STABLE_TRANSLATION_BATCH_LINES,
+            "batch_lines", "批次翻译行数",
+        )
 
         # 批次行数提示
         batch_tip = ttk.Label(
             trans_frame,
             text="同时受下方 token 预算限制",
-            foreground="#666",
+            foreground=COLORS["muted"],
             font=("TkDefaultFont", 8),
         )
         batch_tip.grid(row=3, column=1, sticky=tk.W, padx=10, pady=(0, 10))
@@ -365,14 +589,20 @@ class SettingsWindow:
         self.batch_token_budget_var = tk.IntVar(
             value=self.app_config.get("batch_max_input_tokens", DEFAULT_TRANSLATION_INPUT_TOKENS)
         )
-        ttk.Spinbox(
+        batch_token_spin = ttk.Spinbox(
             trans_frame,
             from_=1000,
             to=MAX_STABLE_TRANSLATION_INPUT_TOKENS,
             increment=500,
             textvariable=self.batch_token_budget_var,
             width=33,
-        ).grid(row=4, column=1, padx=10, pady=8)
+        )
+        batch_token_spin.grid(row=4, column=1, padx=10, pady=8)
+        self._register_spin(
+            batch_token_spin, self.batch_token_budget_var,
+            1000, MAX_STABLE_TRANSLATION_INPUT_TOKENS,
+            "batch_token_budget", "批次输入预算",
+        )
 
         ttk.Label(trans_frame, text="主界面局部并发:").grid(
             row=5, column=0, sticky=tk.W, padx=10, pady=8
@@ -380,13 +610,18 @@ class SettingsWindow:
         self.translation_concurrency_var = tk.IntVar(
             value=self.app_config.get("translation_concurrency", DEFAULT_TRANSLATION_CONCURRENCY)
         )
-        ttk.Spinbox(
+        concurrency_spin = ttk.Spinbox(
             trans_frame,
             from_=1,
             to=8,
             textvariable=self.translation_concurrency_var,
             width=33,
-        ).grid(row=5, column=1, padx=10, pady=8)
+        )
+        concurrency_spin.grid(row=5, column=1, padx=10, pady=8)
+        self._register_spin(
+            concurrency_spin, self.translation_concurrency_var, 1, 8,
+            "translation_concurrency", "主界面局部并发",
+        )
 
         # 自动保存
         self.auto_save_var = tk.BooleanVar(value=self.app_config.get("auto_save", True))
@@ -397,8 +632,13 @@ class SettingsWindow:
 
         ttk.Label(trans_frame, text="界面字号:").grid(row=7, column=0, sticky=tk.W, padx=10, pady=8)
         self.ui_font_size_var = tk.IntVar(value=self.app_config.get("ui_font_size", 10))
-        ttk.Spinbox(trans_frame, from_=8, to=18, textvariable=self.ui_font_size_var, width=33).grid(
-            row=7, column=1, padx=10, pady=8
+        font_size_spin = ttk.Spinbox(
+            trans_frame, from_=8, to=18, textvariable=self.ui_font_size_var, width=33
+        )
+        font_size_spin.grid(row=7, column=1, padx=10, pady=8)
+        self._register_spin(
+            font_size_spin, self.ui_font_size_var, 8, 18,
+            "ui_font_size", "界面字号",
         )
 
         # 翻译提示词
@@ -445,14 +685,20 @@ class SettingsWindow:
                 "queue_max_in_flight_requests", DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS
             )
         )
-        ttk.Spinbox(
+        q_max_in_flight_spin = ttk.Spinbox(
             trans_frame,
             from_=1,
             to=MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS,
             increment=1,
             textvariable=self.queue_max_in_flight_var,
             width=33,
-        ).grid(row=12, column=1, padx=10, pady=4)
+        )
+        q_max_in_flight_spin.grid(row=12, column=1, padx=10, pady=4)
+        self._register_spin(
+            q_max_in_flight_spin, self.queue_max_in_flight_var,
+            1, MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS,
+            "queue_max_in_flight", "全局最大在途请求",
+        )
 
         # 硬上限（ThreadPoolExecutor max_workers）
         ttk.Label(trans_frame, text="硬并发上限:").grid(
@@ -461,14 +707,20 @@ class SettingsWindow:
         self.queue_hard_cap_var = tk.IntVar(
             value=self.app_config.get("queue_hard_request_cap", DEFAULT_QUEUE_HARD_REQUEST_CAP)
         )
-        ttk.Spinbox(
+        q_hard_cap_spin = ttk.Spinbox(
             trans_frame,
             from_=1,
             to=MAX_QUEUE_HARD_REQUEST_CAP,
             increment=1,
             textvariable=self.queue_hard_cap_var,
             width=33,
-        ).grid(row=13, column=1, padx=10, pady=4)
+        )
+        q_hard_cap_spin.grid(row=13, column=1, padx=10, pady=4)
+        self._register_spin(
+            q_hard_cap_spin, self.queue_hard_cap_var,
+            1, MAX_QUEUE_HARD_REQUEST_CAP,
+            "queue_hard_cap", "硬并发上限",
+        )
 
         # 最大活跃任务数
         ttk.Label(trans_frame, text="最大活跃任务:").grid(
@@ -477,14 +729,20 @@ class SettingsWindow:
         self.queue_max_active_var = tk.IntVar(
             value=self.app_config.get("queue_max_active_tasks", DEFAULT_QUEUE_MAX_ACTIVE_TASKS)
         )
-        ttk.Spinbox(
+        q_max_active_spin = ttk.Spinbox(
             trans_frame,
             from_=1,
             to=MAX_QUEUE_MAX_ACTIVE_TASKS,
             increment=1,
             textvariable=self.queue_max_active_var,
             width=33,
-        ).grid(row=14, column=1, padx=10, pady=4)
+        )
+        q_max_active_spin.grid(row=14, column=1, padx=10, pady=4)
+        self._register_spin(
+            q_max_active_spin, self.queue_max_active_var,
+            1, MAX_QUEUE_MAX_ACTIVE_TASKS,
+            "queue_max_active", "最大活跃任务",
+        )
 
         # 每任务软上限（round-robin 第一轮）
         ttk.Label(trans_frame, text="每任务软上限:").grid(
@@ -495,14 +753,20 @@ class SettingsWindow:
                 "queue_per_task_soft_limit", DEFAULT_QUEUE_PER_TASK_SOFT_LIMIT
             )
         )
-        ttk.Spinbox(
+        q_per_task_spin = ttk.Spinbox(
             trans_frame,
             from_=1,
             to=MAX_QUEUE_PER_TASK_SOFT_LIMIT,
             increment=1,
             textvariable=self.queue_per_task_soft_var,
             width=33,
-        ).grid(row=15, column=1, padx=10, pady=4)
+        )
+        q_per_task_spin.grid(row=15, column=1, padx=10, pady=4)
+        self._register_spin(
+            q_per_task_spin, self.queue_per_task_soft_var,
+            1, MAX_QUEUE_PER_TASK_SOFT_LIMIT,
+            "queue_per_task_soft", "每任务软上限",
+        )
 
         # 队列批次行数
         ttk.Label(trans_frame, text="队列批次行数:").grid(
@@ -511,14 +775,20 @@ class SettingsWindow:
         self.queue_batch_lines_var = tk.IntVar(
             value=self.app_config.get("queue_batch_lines", DEFAULT_QUEUE_TRANSLATION_BATCH_LINES)
         )
-        ttk.Spinbox(
+        q_batch_lines_spin = ttk.Spinbox(
             trans_frame,
             from_=1,
             to=MAX_QUEUE_TRANSLATION_BATCH_LINES,
             increment=1,
             textvariable=self.queue_batch_lines_var,
             width=33,
-        ).grid(row=16, column=1, padx=10, pady=4)
+        )
+        q_batch_lines_spin.grid(row=16, column=1, padx=10, pady=4)
+        self._register_spin(
+            q_batch_lines_spin, self.queue_batch_lines_var,
+            1, MAX_QUEUE_TRANSLATION_BATCH_LINES,
+            "queue_batch_lines", "队列批次行数",
+        )
 
         # 队列批次输入预算
         ttk.Label(trans_frame, text="队列批次输入预算:").grid(
@@ -529,14 +799,20 @@ class SettingsWindow:
                 "queue_batch_max_input_tokens", DEFAULT_QUEUE_TRANSLATION_INPUT_TOKENS
             )
         )
-        ttk.Spinbox(
+        q_batch_tokens_spin = ttk.Spinbox(
             trans_frame,
             from_=512,
             to=MAX_QUEUE_TRANSLATION_INPUT_TOKENS,
             increment=500,
             textvariable=self.queue_batch_tokens_var,
             width=33,
-        ).grid(row=17, column=1, padx=10, pady=4)
+        )
+        q_batch_tokens_spin.grid(row=17, column=1, padx=10, pady=4)
+        self._register_spin(
+            q_batch_tokens_spin, self.queue_batch_tokens_var,
+            512, MAX_QUEUE_TRANSLATION_INPUT_TOKENS,
+            "queue_batch_tokens", "队列批次输入预算",
+        )
 
         # RPM 限制
         ttk.Label(trans_frame, text="RPM 限制 (0=不限):").grid(
@@ -545,14 +821,20 @@ class SettingsWindow:
         self.queue_rpm_var = tk.IntVar(
             value=self.app_config.get("queue_rpm_limit", DEFAULT_QUEUE_RPM_LIMIT)
         )
-        ttk.Spinbox(
+        q_rpm_spin = ttk.Spinbox(
             trans_frame,
             from_=0,
             to=MAX_QUEUE_RPM_LIMIT,
             increment=10,
             textvariable=self.queue_rpm_var,
             width=33,
-        ).grid(row=18, column=1, padx=10, pady=4)
+        )
+        q_rpm_spin.grid(row=18, column=1, padx=10, pady=4)
+        self._register_spin(
+            q_rpm_spin, self.queue_rpm_var,
+            0, MAX_QUEUE_RPM_LIMIT,
+            "queue_rpm", "RPM 限制",
+        )
 
         # TPM 限制
         ttk.Label(trans_frame, text="TPM 限制 (0=不限):").grid(
@@ -561,14 +843,20 @@ class SettingsWindow:
         self.queue_tpm_var = tk.IntVar(
             value=self.app_config.get("queue_tpm_limit", DEFAULT_QUEUE_TPM_LIMIT)
         )
-        ttk.Spinbox(
+        q_tpm_spin = ttk.Spinbox(
             trans_frame,
             from_=0,
             to=MAX_QUEUE_TPM_LIMIT,
             increment=1000,
             textvariable=self.queue_tpm_var,
             width=33,
-        ).grid(row=19, column=1, padx=10, pady=4)
+        )
+        q_tpm_spin.grid(row=19, column=1, padx=10, pady=4)
+        self._register_spin(
+            q_tpm_spin, self.queue_tpm_var,
+            0, MAX_QUEUE_TPM_LIMIT,
+            "queue_tpm", "TPM 限制",
+        )
 
         # 自适应并发（AIMD）
         self.queue_adaptive_var = tk.BooleanVar(
@@ -609,7 +897,7 @@ class SettingsWindow:
             text="使用 manga-image-translator 流水线（检测/OCR/翻译/擦除/渲染）。\n"
             "翻译图片文字复用上方 API 配置，无需单独配置火山 Key。",
             wraplength=480,
-            foreground="#666",
+            foreground=COLORS["muted"],
             justify=tk.LEFT,
         )
         manga_desc.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 8), sticky=tk.W)
@@ -645,19 +933,35 @@ class SettingsWindow:
         # 模型目录
         ttk.Label(volc_frame, text="模型目录:").grid(row=5, column=0, sticky=tk.W, padx=10, pady=6)
         self.manga_model_dir_var = tk.StringVar(value=manga_cfg.get("model_dir", ""))
-        model_dir_entry = ttk.Entry(volc_frame, textvariable=self.manga_model_dir_var, width=32)
+        model_dir_entry = ttk.Entry(
+            volc_frame,
+            textvariable=self.manga_model_dir_var,
+            width=32,
+            state="normal",
+        )
         model_dir_entry.grid(row=5, column=1, padx=10, pady=6, sticky=tk.W)
-        ttk.Button(volc_frame, text="浏览...", command=self._browse_manga_model_dir).grid(
+        ttk.Button(
+            volc_frame,
+            text="浏览...",
+            command=self._browse_manga_model_dir,
+            state="normal",
+        ).grid(
             row=5, column=2, padx=(0, 10), pady=6, sticky=tk.W
         )
 
         # 模型状态
         ttk.Label(volc_frame, text="模型状态:").grid(row=6, column=0, sticky=tk.W, padx=10, pady=6)
-        self.manga_status_label = ttk.Label(volc_frame, text="未检测", foreground="#666")
+        self.manga_status_label = ttk.Label(volc_frame, text="未检测", foreground=COLORS["muted"])
         self.manga_status_label.grid(row=6, column=1, padx=10, pady=6, sticky=tk.W)
-        ttk.Button(volc_frame, text="检测可用性", command=self._check_manga_status).grid(
-            row=6, column=2, padx=(0, 10), pady=6, sticky=tk.W
+        # P2-5：检测按钮纳入 busy 列表。
+        self.manga_check_btn = ttk.Button(
+            volc_frame,
+            text="检测可用性",
+            command=self._check_manga_status,
+            state="normal",
         )
+        self.manga_check_btn.grid(row=6, column=2, padx=(0, 10), pady=6, sticky=tk.W)
+        self._test_buttons.append(self.manga_check_btn)
 
         # 分隔线
         ttk.Separator(volc_frame, orient=tk.HORIZONTAL).grid(
@@ -667,7 +971,7 @@ class SettingsWindow:
         # ── AI 图片翻译（火山引擎）分区 ──────────────────────
         ai_header = ttk.Label(
             volc_frame,
-            text="AI 图片翻译（火山引擎 Doubao-SeeDream）",
+            text="AI 图片翻译（火山引擎）",
             font=("TkDefaultFont", 10, "bold"),
         )
         ai_header.grid(row=8, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(0, 4))
@@ -677,55 +981,70 @@ class SettingsWindow:
             text="AI 图片翻译为生成式图生图，会产生 API 费用并对图片做较大修改，"
             "仅由用户显式选择「AI 图片翻译...」时调用，不会作为默认模块。",
             wraplength=480,
-            foreground="#666",
+            foreground=COLORS["muted"],
             justify=tk.LEFT,
         )
         ai_desc.grid(row=9, column=0, columnspan=3, padx=10, pady=(0, 8), sticky=tk.W)
 
-        # 图片翻译模型选择（高质量 Pro 较贵 / 经济版较便宜）
-        from ..core.image_translator import ImageTranslator
-
-        self._volc_model_options = [
-            (ImageTranslator.MODEL_HIGH_QUALITY, "高质量 Pro（效果更好，费用较高）"),
-            (ImageTranslator.MODEL_ECONOMY, "经济版（效果一般，费用较低）"),
-        ]
-        self._volc_model_display_to_name = {disp: name for name, disp in self._volc_model_options}
-        self._volc_model_name_to_display = {name: disp for name, disp in self._volc_model_options}
-        current_volc_model = ai_volc_cfg.get("model", ImageTranslator.DEFAULT_MODEL)
-        self.volc_model_var = tk.StringVar(
-            value=self._volc_model_name_to_display.get(
-                current_volc_model,
-                self._volc_model_name_to_display[ImageTranslator.DEFAULT_MODEL],
-            )
+        # 火山方舟 API 地址和模型均可由用户自定义。
+        self.volc_base_url_var = tk.StringVar(
+            value=ai_volc_cfg.get("base_url", VOLCENGINE_IMAGE_DEFAULT_BASE_URL)
         )
-        ttk.Label(volc_frame, text="翻译模型:").grid(row=10, column=0, sticky=tk.W, padx=10, pady=6)
-        ttk.Combobox(
+        ttk.Label(volc_frame, text="API 地址:").grid(
+            row=10, column=0, sticky=tk.W, padx=10, pady=6
+        )
+        volc_base_url_entry = ttk.Entry(
+            volc_frame, textvariable=self.volc_base_url_var, width=42
+        )
+        volc_base_url_entry.grid(
+            row=10, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W
+        )
+        self._form_validator.register_required_string(
+            "volc_base_url", "火山引擎 API 地址", self.volc_base_url_var, volc_base_url_entry
+        )
+
+        self._volc_model_options = list(VOLCENGINE_IMAGE_MODEL_SUGGESTIONS)
+        current_volc_model = ai_volc_cfg.get("model", VOLCENGINE_IMAGE_DEFAULT_MODEL)
+        self.volc_model_var = tk.StringVar(value=current_volc_model)
+        ttk.Label(volc_frame, text="翻译模型 ID:").grid(
+            row=11, column=0, sticky=tk.W, padx=10, pady=6
+        )
+        volc_model_combo = ttk.Combobox(
             volc_frame,
             textvariable=self.volc_model_var,
-            values=[disp for _, disp in self._volc_model_options],
-            state="readonly",
-            width=32,
-        ).grid(row=10, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W)
+            values=self._volc_model_options,
+            state="normal",
+            width=39,
+        )
+        volc_model_combo.grid(
+            row=11, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W
+        )
+        self._form_validator.register_required_string(
+            "volc_model", "火山引擎翻译模型 ID", self.volc_model_var, volc_model_combo
+        )
 
         # 火山引擎 API Key
         ttk.Label(volc_frame, text="火山引擎 API Key:").grid(
-            row=11, column=0, sticky=tk.W, padx=10, pady=6
+            row=12, column=0, sticky=tk.W, padx=10, pady=6
         )
         self.volc_key_var = tk.StringVar(value=self.config_manager.get_volc_key())
         volc_key_entry = ttk.Entry(volc_frame, textvariable=self.volc_key_var, show="*", width=32)
-        volc_key_entry.grid(row=11, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W)
+        volc_key_entry.grid(row=12, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W)
 
         # 测试按钮 + 费用提示
-        ttk.Button(volc_frame, text="测试 AI 图片翻译连接", command=self.test_volc_connection).grid(
-            row=12, column=1, padx=10, pady=6, sticky=tk.W
+        # P2-5：火山测试按钮纳入 busy 列表。
+        self.volc_test_btn = ttk.Button(
+            volc_frame, text="测试 AI 图片翻译连接", command=self.test_volc_connection
         )
+        self.volc_test_btn.grid(row=13, column=1, padx=10, pady=6, sticky=tk.W)
+        self._test_buttons.append(self.volc_test_btn)
         fee_tip = ttk.Label(
             volc_frame,
             text="费用提示：AI 图片翻译将调用火山图生图服务并可能产生 API 费用。",
             font=("TkDefaultFont", 8),
-            foreground="#a00",
+            foreground=COLORS["danger"],
         )
-        fee_tip.grid(row=13, column=0, columnspan=3, padx=10, pady=(0, 10), sticky=tk.W)
+        fee_tip.grid(row=14, column=0, columnspan=3, padx=10, pady=(0, 10), sticky=tk.W)
 
     def _browse_manga_model_dir(self):
         """选择 Manga 模型目录。"""
@@ -742,8 +1061,22 @@ class SettingsWindow:
         1. 引擎依赖（torch + manga_translator）是否可导入
         2. API 配置（base_url / api_key / model_name）
         3. 当前目标语言是否受 Manga 支持
+
+        P2-5：加入 testing busy 状态，避免重复点击触发多次检测。
         """
-        self.manga_status_label.config(text="正在检测...", foreground="#666")
+        capabilities = getattr(self, "edition_capabilities", None)
+        if capabilities is None:
+            capabilities = detect_edition_capabilities()
+        if not capabilities.manga_enabled:
+            self.manga_status_label.config(
+                text="Text Edition 不可用", foreground=COLORS["muted"]
+            )
+            return
+
+        # P2-5：避免重复启动
+        if not self._begin_test():
+            return
+        self.manga_status_label.config(text="正在检测...", foreground=COLORS["muted"])
 
         def worker():
             try:
@@ -778,50 +1111,87 @@ class SettingsWindow:
                 if errors:
                     msg = "; ".join(errors)
                     self._safe_after(
-                        lambda m=msg: self.manga_status_label.config(text=m, foreground="#a00")
+                        lambda m=msg: self.manga_status_label.config(
+                            text=f"配置不完整: {m}", foreground=status_color("error")
+                        )
                     )
                 else:
                     self._safe_after(
-                        lambda: self.manga_status_label.config(text="可用", foreground="#0a0")
+                        lambda: self.manga_status_label.config(
+                            text="可用", foreground=status_color("ok")
+                        )
                     )
             except Exception as exc:
                 error_message = str(exc)[:80]
                 self._safe_after(
                     lambda m=error_message: self.manga_status_label.config(
-                        text=f"检测失败: {m}", foreground="#a00"
+                        text=f"检测失败: {m}", foreground=status_color("error")
                     )
                 )
+            finally:
+                # P2-5：检测结束，恢复测试按钮可用状态
+                self._safe_after(self._end_test)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def test_volc_connection(self):
-        """测试插图翻译连接"""
+        """测试插图翻译连接。
+
+        P2-5：测试连接使用表单中输入的 Key 临时构造 ImageTranslator，**不再**
+        调用 ``config_manager.save_volc_key`` 持久化。只有用户点击"确定/保存"
+        时，``save_settings`` 才提交密钥。这避免用户在测试中发现 Key 错误后
+        撤销设置，但错误的 Key 已经写入密钥环。
+        """
         api_key = self.volc_key_var.get().strip()
         if not api_key:
             messagebox.showwarning("测试失败", "请先输入火山引擎 API Key")
             return
-        save_result = self.config_manager.save_volc_key(api_key)
-        if not save_result:
-            messagebox.showerror(
-                "保存失败",
-                save_result.error_message or "火山引擎 API Key 保存失败",
-            )
+        base_url = self.volc_base_url_var.get().strip()
+        model = self.volc_model_var.get().strip()
+        if not base_url or not model:
+            messagebox.showwarning("测试失败", "请先输入火山引擎 API 地址和翻译模型 ID")
             return
-        if not hmac.compare_digest(self.config_manager.get_volc_key(), api_key):
-            messagebox.showerror(
-                "保存失败",
-                "火山引擎 API Key 保存后回读不一致，请重新输入。",
-            )
+        # P2-5：避免重复启动
+        if not self._begin_test():
             return
+
+        # P2-5：构造一个轻量 stub config_manager，只暴露 ImageTranslator 需要
+        # 的两个方法（``get_volc_key`` 和 ``get_app_config``），用表单中的
+        # Key 直接返回，不触发任何持久化。
+        class _TemporaryVolcConfig:
+            """仅用于测试连接的临时 config_manager stub。"""
+
+            def __init__(self, real_config_manager, key: str, base_url: str, model: str):
+                self._real = real_config_manager
+                self._key = key
+                self._base_url = base_url
+                self._model = model
+
+            def get_volc_key(self) -> str:
+                return self._key
+
+            def get_app_config(self):
+                cfg = dict(self._real.get_app_config())
+                img = dict(cfg.get("image_translation", {}))
+                ai = dict(img.get("ai_volcengine", {}))
+                ai["base_url"] = self._base_url
+                ai["model"] = self._model
+                img["ai_volcengine"] = ai
+                cfg["image_translation"] = img
+                return cfg
+
+        temp_config = _TemporaryVolcConfig(
+            self.config_manager, api_key, base_url, model
+        )
 
         def worker():
-            from ..core.image_translator import ImageTranslator
-
-            translator = ImageTranslator(self.config_manager)
+            translator = None
             try:
+                from ..core.image_translator import ImageTranslator
+
+                translator = ImageTranslator(temp_config)
                 success = translator.test_connection()
                 error_detail = translator.last_error
-                translator.close()
 
                 if success:
                     self._safe_after(
@@ -840,6 +1210,14 @@ class SettingsWindow:
                 self._safe_after(
                     lambda msg=error_message: messagebox.showerror("测试错误", f"发生异常: {msg}")
                 )
+            finally:
+                if translator is not None:
+                    try:
+                        translator.close()
+                    except Exception:
+                        pass
+                # P2-5：测试结束，恢复测试按钮可用状态
+                self._safe_after(self._end_test)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -881,7 +1259,7 @@ class SettingsWindow:
         ttk.Label(
             content,
             text="例如：https://api.example.com/v1",
-            foreground="#666",
+            foreground=COLORS["muted"],
         ).grid(row=2, column=1, sticky=tk.W, pady=(0, 6))
 
         ttk.Label(content, text="LLM API Key:").grid(
@@ -975,6 +1353,13 @@ class SettingsWindow:
             side=tk.RIGHT, padx=(0, 8)
         )
         dialog.bind("<Return>", lambda _event: save_custom_service())
+        # P2-1：模态对话框补 Escape 关闭，关闭后焦点回父窗口
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.bind(
+            "<Destroy>",
+            lambda _event: self.window.focus_set() if self.window.winfo_exists() else None,
+            add="+",
+        )
         base_url_entry.focus_set()
 
     def on_provider_changed(self, event=None):
@@ -1032,7 +1417,12 @@ class SettingsWindow:
         }
 
     def test_connection(self):
-        """测试API连接"""
+        """测试API连接。
+
+        P2-5：加入 testing busy 状态，避免重复点击触发多次测试。
+        测试使用表单中的配置（``_current_api_form_config``），不调用
+        ``config_manager.save_api_config``，因此不会持久化任何变更。
+        """
         try:
             test_config = self._current_api_form_config()
         except (ValueError, tk.TclError) as exc:
@@ -1041,6 +1431,10 @@ class SettingsWindow:
 
         if not test_config["api_key"].strip():
             messagebox.showwarning("测试失败", "请先输入API密钥")
+            return
+
+        # P2-5：避免重复启动
+        if not self._begin_test():
             return
 
         # 在新线程中测试连接
@@ -1089,12 +1483,27 @@ class SettingsWindow:
                     api.close()
                 except Exception:
                     pass
+            # P2-5：测试结束，恢复测试按钮可用状态
+            self._safe_after(self._end_test)
 
     def save_settings(self):
-        """保存设置"""
-        try:
-            from ..core.image_translator import ImageTranslator
+        """保存设置。
 
+        P2-5：保存前先做整表校验。若有错误，弹提示并把焦点设到首个出错字段，
+        避免用户在多个字段都非法时只能看到一个通用错误、却不知道在哪。
+        """
+        # P2-5：表单级校验 + 首错聚焦
+        ok, first_message, first_widget = self._validate_form()
+        if not ok:
+            messagebox.showwarning("配置无效", first_message, parent=self.window)
+            if first_widget is not None:
+                try:
+                    first_widget.focus_set()
+                except (tk.TclError, AttributeError):
+                    pass
+            return
+
+        try:
             # 更新API配置
             new_api_config = apply_text_translation_profile(self._current_api_form_config())
 
@@ -1133,10 +1542,8 @@ class SettingsWindow:
                         },
                         "ai_volcengine": {
                             "provider": "volcengine",
-                            "model": self._volc_model_display_to_name.get(
-                                self.volc_model_var.get(),
-                                ImageTranslator.DEFAULT_MODEL,
-                            ),
+                            "base_url": self.volc_base_url_var.get().strip().rstrip("/"),
+                            "model": self.volc_model_var.get().strip(),
                         },
                     },
                 }
@@ -1187,24 +1594,52 @@ class SettingsWindow:
             messagebox.showerror("保存错误", f"保存设置时出错: {str(e)}")
 
     def save_api_preset(self):
-        """保存API预设"""
+        """保存API预设（ENG-2：使用 SecretSaveResult 区分三态）"""
         api_key = self.api_key_var.get().strip()
         display_model = self.model_var.get().strip()
         model_name = self.display_to_model_map.get(display_model, display_model)
 
         if not api_key or not model_name:
-            messagebox.showwarning("保存预设", "请先输入API密钥和模型名称")
+            messagebox.showwarning(
+                "保存预设",
+                "请先输入API密钥和模型名称",
+                parent=self.window,
+            )
             return
 
-        # 弹出对话框让用户输入预设名称
-        preset_name = tk.simpledialog.askstring("保存预设", "请输入预设名称:")
+        # ENG-2：显式使用 simpledialog.askstring 并设置 parent
+        # 不再依赖 filedialog 间接注册 simpledialog 的导入副作用
+        preset_name = simpledialog.askstring(
+            "保存预设",
+            "请输入预设名称:",
+            parent=self.window,
+        )
         if not preset_name:
             return
 
-        if self.config_manager.save_api_and_model_preset(preset_name, api_key, model_name):
-            messagebox.showinfo("保存成功", f"API预设 '{preset_name}' 已保存")
+        # ENG-2：返回 SecretSaveResult，按三态分支提示
+        result = self.config_manager.save_api_and_model_preset(
+            preset_name, api_key, model_name
+        )
+        if result.failed:
+            messagebox.showerror(
+                "保存失败",
+                result.user_message,
+                parent=self.window,
+            )
+        elif result.session_only:
+            # SESSION_ONLY 必须明确提示重启后失效，不能写成永久保存成功
+            messagebox.showinfo(
+                "保存提示",
+                f"API预设 '{preset_name}' 已保存，但密钥未持久化，重启后需重新输入",
+                parent=self.window,
+            )
         else:
-            messagebox.showerror("保存失败", "保存API预设失败")
+            messagebox.showinfo(
+                "保存成功",
+                f"API预设 '{preset_name}' 已保存",
+                parent=self.window,
+            )
 
     def load_api_preset(self):
         """加载API预设"""

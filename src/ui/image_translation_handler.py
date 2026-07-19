@@ -16,6 +16,7 @@ from pathlib import Path
 from tkinter import messagebox
 from typing import Callable
 
+from ..domain.edition import EditionCapabilities, detect_edition_capabilities
 from ..domain.errors import (
     ImageTranslationCancelled,
     ImageTranslationConfigError,
@@ -35,6 +36,10 @@ class ImageTranslationHandler:
     """处理图片翻译相关功能的控制器"""
 
     _MANGA_AI_GUIDANCE = "本地 Manga 图片翻译暂时不可用，请先使用「AI 图片翻译」。"
+    _MANGA_DISABLED_TEXT_MSG = (
+        "当前为 Text Edition，未打包本地 Manga 推理依赖。\n\n"
+        "如需使用本地模块图片翻译，请下载 Full Edition。"
+    )
 
     def __init__(
         self,
@@ -47,6 +52,7 @@ class ImageTranslationHandler:
         busy_state_updater: Callable[[bool], None] | None = None,
         app_paths=None,
         font_path: str | None = None,
+        edition_capabilities: EditionCapabilities | None = None,
     ):
         self.root = root
         self.config_manager = config_manager
@@ -59,6 +65,15 @@ class ImageTranslationHandler:
         self._font_path = font_path
         self._service = None  # 惰性创建 ImageTranslationService
         self._worker_thread: threading.Thread | None = None
+        self._closed = False
+
+        # P0-2：版本能力契约。Text 版本不导入 Manga 模块、不注册 Provider。
+        # ``None`` 时从运行时检测获取（manga_translator 是否可导入）。
+        self._edition_capabilities = (
+            edition_capabilities
+            if edition_capabilities is not None
+            else detect_edition_capabilities()
+        )
 
         # P1-1：UI 回调邮箱 + Tk 主线程事件泵
         # 工作线程只调用 ``_ui_mailbox.submit(func)``，不再直接调用 ``root.after()``。
@@ -69,10 +84,22 @@ class ImageTranslationHandler:
             self._ui_pump = TkUICallbackPump(root, self._ui_mailbox)
             self._ui_pump.start()
 
+    # ── 版本能力 ──────────────────────────────────
+
+    @property
+    def edition_capabilities(self) -> EditionCapabilities:
+        """当前版本能力契约（只读）。"""
+        return self._edition_capabilities
+
+    @property
+    def manga_enabled(self) -> bool:
+        """是否启用本地 Manga 图片翻译入口。"""
+        return self._edition_capabilities.manga_enabled
+
     # ── Service 构建（惰性） ──────────────────────────────────
 
     def _get_service(self):
-        """惰性创建并缓存 ImageTranslationService，注册 Manga 和 AI Provider。"""
+        """惰性创建并缓存 ImageTranslationService，按版本能力注册 Provider。"""
         if self._service is not None:
             return self._service
 
@@ -83,12 +110,17 @@ class ImageTranslationHandler:
 
         registry = ImageTranslationProviderRegistry()
 
-        # 注册 Manga 默认 Provider（惰性导入，未安装引擎时 validate 会报错）
-        manga_provider = self._create_manga_provider()
-        if manga_provider is not None:
-            registry.register(manga_provider)
+        # P0-2：仅在 Full 版本注册 Manga Provider。Text 版本禁止触碰 Manga 模块，
+        # 防止运行时 ImportError（spec excludes 已移除 manga_translator）。
+        if self._edition_capabilities.manga_enabled:
+            manga_provider = self._create_manga_provider()
+            if manga_provider is not None:
+                registry.register(manga_provider)
+        else:
+            registry.manga_provider_available = False
+            logger.info("Text Edition：跳过 Manga Provider 注册")
 
-        # 注册火山 AI Provider
+        # 注册火山 AI Provider（Text/Full 共用）
         from ..infrastructure.image_translation.volcengine_provider import (
             VolcengineImageTranslationProvider,
         )
@@ -131,6 +163,11 @@ class ImageTranslationHandler:
 
     def start_image_translation(self):
         """运行本地 Manga 图片翻译模块。"""
+        # P0-2：Text Edition 未打包 Manga 依赖，直接拒绝并提示。
+        if not self._edition_capabilities.manga_enabled:
+            messagebox.showwarning("图片翻译", self._MANGA_DISABLED_TEXT_MSG)
+            return
+
         current_mapping_dir = self.get_mapping_dir()
         if not current_mapping_dir:
             messagebox.showwarning("图片翻译", "请先导入EPUB文件")
@@ -357,6 +394,8 @@ class ImageTranslationHandler:
 
     def _safe_after(self, func):
         """P1-1：通过 UI 回调邮箱提交回调，不在工作线程调用 Tk API。"""
+        if getattr(self, "_closed", False):
+            return
         self._ui_mailbox.submit(func)
 
     # ── 兼容入口：file_importer 调用，走 Manga ──────────────────────────────────
@@ -370,6 +409,7 @@ class ImageTranslationHandler:
 
     def close(self) -> None:
         """取消当前任务并释放所有已初始化的图片翻译 Provider。"""
+        self._closed = True
         # P1-1：关闭 UI 回调事件泵
         pump = getattr(self, "_ui_pump", None)
         self._ui_pump = None

@@ -11,7 +11,7 @@
 """
 
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.core.queue_provider import (
     ProviderLimiter,
@@ -72,7 +72,7 @@ class TestParseRetryAfter:
 
     def test_http_date_future(self):
         # 构造一个未来 30 秒的 HTTP-date
-        target = datetime.now(UTC) + timedelta(seconds=30)
+        target = datetime.now(timezone.utc) + timedelta(seconds=30)
         from email.utils import format_datetime
 
         raw = format_datetime(target, usegmt=True)
@@ -82,7 +82,7 @@ class TestParseRetryAfter:
         assert 28.0 <= result <= 32.0
 
     def test_http_date_past_clamped_to_zero(self):
-        target = datetime.now(UTC) - timedelta(seconds=30)
+        target = datetime.now(timezone.utc) - timedelta(seconds=30)
         from email.utils import format_datetime
 
         raw = format_datetime(target, usegmt=True)

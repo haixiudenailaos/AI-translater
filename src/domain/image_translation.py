@@ -90,9 +90,9 @@ class ImageTranslationResult:
     """
 
     status: OperationStatus
-    result_map: dict = field(default_factory=dict)
-    skipped_images: list = field(default_factory=list)
-    failed_images: dict = field(default_factory=dict)
+    result_map: dict[str, str] = field(default_factory=dict)
+    skipped_images: list[str] = field(default_factory=list)
+    failed_images: dict[str, str] = field(default_factory=dict)
     provider_id: ImageTranslationProviderId = ImageTranslationProviderId.MANGA
     run_id: str = ""
 

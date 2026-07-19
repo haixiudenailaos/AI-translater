@@ -157,6 +157,39 @@ def test_terminal_event_clears_same_batch_stream_state():
     assert stream == ()
 
 
+def test_run_terminal_clears_streams_from_all_batches():
+    """UX-4：run 失败/完成不能留下其他批次的幽灵预览。"""
+    mailbox = TranslationEventMailbox()
+    for batch_start in (0, 10, 20):
+        mailbox.publish(
+            _make_event(
+                run_id="run-multi",
+                kind=TranslationEventKind.STREAM,
+                batch_start=batch_start,
+                stream_lines=(f"preview-{batch_start}",),
+            )
+        )
+    mailbox.publish(
+        _make_event(
+            run_id="other-run",
+            kind=TranslationEventKind.STREAM,
+            batch_start=0,
+        )
+    )
+    mailbox.publish(
+        _make_event(
+            run_id="run-multi",
+            kind=TranslationEventKind.RUN_FAILED,
+            batch_start=0,
+        )
+    )
+
+    terminal, stream = mailbox.drain()
+
+    assert [event.kind for event in terminal] == [TranslationEventKind.RUN_FAILED]
+    assert [event.run_id for event in stream] == ["other-run"]
+
+
 def test_multiple_terminal_events_preserve_order():
     """多个终结事件保持发布顺序。"""
     mailbox = TranslationEventMailbox()
@@ -186,6 +219,27 @@ def test_drain_clears_mailbox():
     terminal2, stream2 = mailbox.drain()
     assert terminal2 == ()
     assert stream2 == ()
+
+
+def test_drain_consumes_all_pending_work_in_one_poll():
+    """PERF-7：一帧只消费预算内事件，剩余事件按 FIFO 留到下一帧。"""
+    mailbox = TranslationEventMailbox()
+    for batch_start in range(5):
+        mailbox.publish(
+            _make_event(kind=TranslationEventKind.BATCH_COMPLETED, batch_start=batch_start)
+        )
+    mailbox.publish(_make_event(kind=TranslationEventKind.STREAM, batch_start=99))
+
+    terminal, stream = mailbox.drain()
+
+    assert [event.batch_start for event in terminal] == [0, 1, 2, 3, 4]
+    assert [event.batch_start for event in stream] == [99]
+    assert mailbox.pending_terminal_count() == 0
+    assert mailbox.pending_stream_count() == 0
+
+    terminal, stream = mailbox.drain()
+    assert terminal == ()
+    assert stream == ()
 
 
 # ── 邮箱：多线程并发 ────────────────────────────────────
@@ -293,7 +347,7 @@ def test_discard_run_only_clears_specified_run():
             batch_start=0,
         )
     )
-    # new-run 使用不同 batch_start，避免终结事件清除同批次流式
+    # RUN 终态会清理 new-run 的全部流式状态。
     mailbox.publish(
         _make_event(
             run_id="new-run",
@@ -316,7 +370,7 @@ def test_discard_run_only_clears_specified_run():
     assert all(e.run_id == "new-run" for e in terminal)
     assert all(e.run_id == "new-run" for e in stream)
     assert len(terminal) == 1
-    assert len(stream) == 1
+    assert len(stream) == 0
 
 
 def test_discard_run_with_no_matching_events_is_noop():
@@ -344,7 +398,7 @@ def test_event_is_frozen():
 def test_event_has_slots():
     """slots=True 减少对象开销，且不能添加新属性。"""
     event = _make_event()
-    with pytest.raises(AttributeError):
+    with pytest.raises((AttributeError, TypeError)):
         event.new_field = "value"  # type: ignore[attr-defined]
 
 
@@ -544,6 +598,29 @@ def test_pump_render_receives_events_in_drain_order():
     assert rendered[1].batch_start == 10
     assert rendered[2].kind is TranslationEventKind.STREAM
     assert rendered[2].batch_start == 20
+
+
+def test_pump_drains_all_events_and_keeps_fixed_interval():
+    root = ThreadCheckingRoot()
+    mailbox = TranslationEventMailbox()
+    rendered: List[TranslationProgressEvent] = []
+    pump = TkTranslationEventPump(
+        root,
+        mailbox,
+        rendered.append,
+        interval_ms=25,
+    )
+
+    pump.start()
+    for batch_start in range(3):
+        mailbox.publish(_make_event(kind=TranslationEventKind.BATCH_COMPLETED, batch_start=batch_start))
+
+    root.trigger_next()
+    assert [event.batch_start for event in rendered] == [0, 1, 2]
+    assert root.scheduled[0][1] == 25
+
+    root.trigger_next()
+    assert root.scheduled[0][1] == 25
 
 
 # ── 邮箱 + 事件泵端到端：并发场景 ────────────────────────

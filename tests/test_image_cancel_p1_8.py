@@ -626,6 +626,53 @@ class MangaWorkerClientCloseTests(unittest.TestCase):
         with self.assertRaises(ImageTranslationConfigError):
             client.translate(request)
 
+    def test_concurrent_requests_serialize_full_exchange(self):
+        """Concurrent callers must not consume each other's worker responses."""
+        client = MangaWorkerClient(SimpleNamespace(get_api_config=lambda: {}))
+        process = SimpleNamespace(poll=lambda: None)
+        client._ensure_process = lambda: process
+
+        active = 0
+        max_active = 0
+        state_lock = threading.Lock()
+
+        def send(_process, payload):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                # Keep the first exchange open long enough for a second caller
+                # to contend for the request lock.
+                time.sleep(0.05)
+                client._stdout_queue.put(
+                    {"type": "response", "request_id": payload["request_id"]}
+                )
+            finally:
+                with state_lock:
+                    active -= 1
+
+        client._send_to = send
+        results = []
+
+        def request(name):
+            results.append(
+                client._request(
+                    {"op": name},
+                    deadline_seconds=1.0,
+                )
+            )
+
+        threads = [threading.Thread(target=request, args=(f"op-{i}",)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(results), 2)
+        self.assertEqual(max_active, 1)
+
 
 # ── MangaWorkerClient stderr 读取器 ────────────────────────
 
@@ -755,6 +802,33 @@ class StderrReaderTests(unittest.TestCase):
         """stderr 最大行数常量合理。"""
         self.assertGreater(MangaWorkerClient._STDERR_MAX_LINES, 100)
         self.assertLessEqual(MangaWorkerClient._STDERR_MAX_LINES, 10000)
+
+    def test_stderr_reader_continues_draining_after_log_cap(self):
+        """P0-4：日志达到上限后仍必须读空管道，不能阻塞 worker。"""
+        client = MangaWorkerClient(SimpleNamespace(get_api_config=lambda: {}))
+
+        class _CountingStderr:
+            def __init__(self, line_count):
+                self.remaining = line_count
+                self.read_count = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.remaining == 0:
+                    raise StopIteration
+                self.remaining -= 1
+                self.read_count += 1
+                return "noisy worker output\n"
+
+        stderr = _CountingStderr(10_000)
+        client._start_stderr_reader(SimpleNamespace(stderr=stderr))
+        assert client._stderr_reader_thread is not None
+        client._stderr_reader_thread.join(timeout=2)
+
+        self.assertFalse(client._stderr_reader_thread.is_alive())
+        self.assertEqual(stderr.read_count, 10_000)
 
 
 if __name__ == "__main__":

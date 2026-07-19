@@ -34,6 +34,12 @@ _DEBOUNCE_SECONDS = 0.5
 # 关键保存（关闭/取消）的最大等待时长。
 _FINAL_SAVE_TIMEOUT_SECONDS = 5.0
 
+# P1-2：保存失败后的有界重试上限。超过后进入失败终态，
+# 避免无限重试占用线程并掩盖底层故障（磁盘满、只读路径等）。
+_MAX_SAVE_RETRIES = 5
+# P1-2：重试之间的指数退避基数（秒）。第 n 次重试等待 _RETRY_BACKOFF_BASE * 2^n。
+_RETRY_BACKOFF_BASE = 0.5
+
 
 @dataclass(frozen=True, slots=True)
 class CheckpointSnapshot:
@@ -57,20 +63,29 @@ class _TaskSaveState:
         "dirty",
         "latest_generation",
         "pending_snapshot",
+        "pending_snapshot_factory",
         "save_in_flight",
         "last_error",
         "wake_event",
         "closed",
+        "retry_count",
+        "failed_terminal",
+        "next_retry_at",
     )
 
     def __init__(self) -> None:
         self.dirty: bool = False
         self.latest_generation: int = 0
         self.pending_snapshot: CheckpointSnapshot | None = None
+        self.pending_snapshot_factory: Callable[[int], CheckpointSnapshot] | None = None
         self.save_in_flight: bool = False
         self.last_error: str | None = None
         self.wake_event = threading.Event()
         self.closed: bool = False
+        # P1-2：失败重试与终态
+        self.retry_count: int = 0
+        self.failed_terminal: bool = False
+        self.next_retry_at: float = 0.0
 
 
 class CheckpointCoordinator:
@@ -102,13 +117,49 @@ class CheckpointCoordinator:
 
         幂等可重入。若保存线程正在执行，仅提升 generation，
         保存完成后会自动补一次最新快照。
+
+        P1-2：新快照（generation 推进）会重置失败重试计数和失败终态，
+        让任务在故障恢复后能够继续保存。
         """
         with self._lock:
             if self._state.closed:
                 return
             self._state.dirty = True
+            # P1-2：generation 推进时清除失败终态，允许新快照重新尝试保存
+            if snapshot.generation > self._state.latest_generation:
+                self._state.retry_count = 0
+                self._state.failed_terminal = False
+                self._state.next_retry_at = 0.0
             self._state.latest_generation = snapshot.generation
             self._state.pending_snapshot = snapshot
+            self._state.pending_snapshot_factory = None
+            self._state.last_error = None
+            self._last_dirty_at = self._clock()
+            self._state.wake_event.set()
+            self._ensure_save_thread_locked()
+
+    def mark_dirty_lazy(
+        self,
+        generation: int,
+        snapshot_factory: Callable[[int], CheckpointSnapshot],
+    ) -> None:
+        """Mark dirty without building a full snapshot until debounce expires.
+
+        Queue batch completion only needs to advance a generation.  The factory
+        runs in the checkpoint thread after the debounce window, so repeated
+        fast batches coalesce before copying large translation buffers.
+        """
+        with self._lock:
+            if self._state.closed:
+                return
+            self._state.dirty = True
+            if generation > self._state.latest_generation:
+                self._state.retry_count = 0
+                self._state.failed_terminal = False
+                self._state.next_retry_at = 0.0
+            self._state.latest_generation = generation
+            self._state.pending_snapshot = None
+            self._state.pending_snapshot_factory = snapshot_factory
             self._state.last_error = None
             self._last_dirty_at = self._clock()
             self._state.wake_event.set()
@@ -151,8 +202,25 @@ class CheckpointCoordinator:
         with self._lock:
             return self._state.dirty
 
+    @property
+    def has_terminal_failure(self) -> bool:
+        """P1-2：是否进入失败终态（达到重试上限）。"""
+        with self._lock:
+            return self._state.failed_terminal
+
+    @property
+    def retry_count(self) -> int:
+        """P1-2：当前已重试次数（用于诊断和测试断言）。"""
+        with self._lock:
+            return self._state.retry_count
+
     def close(self) -> None:
-        """关闭协调器，触发最后一次关键保存并等待（带超时）。幂等。"""
+        """关闭协调器，触发最后一次关键保存并等待（带超时）。幂等。
+
+        P1-2：``close`` 必须确保保存线程退出，否则调用方可能在持有
+        协调器引用的情况下退出而留下僵尸线程。``_save_thread.join``
+        带超时，超时后记录 warning 但不再阻塞调用方。
+        """
         with self._lock:
             if self._state.closed:
                 return
@@ -162,6 +230,11 @@ class CheckpointCoordinator:
         # 等待保存线程结束。
         if self._save_thread is not None:
             self._save_thread.join(timeout=_FINAL_SAVE_TIMEOUT_SECONDS)
+            if self._save_thread.is_alive():
+                logger.warning(
+                    "任务 %s 检查点保存线程在 close 后仍未退出",
+                    self._task_id,
+                )
 
     # ── 保存线程 ────────────────────────────────────────
 
@@ -192,36 +265,91 @@ class CheckpointCoordinator:
                     return
 
     def _await_next_snapshot(self) -> CheckpointSnapshot | None:
-        """阻塞直到 debounce 到期或关闭，返回待保存快照。"""
+        """阻塞直到 debounce 到期或关闭，返回待保存快照。
+
+        P1-2：失败重试使用指数退避；达到 ``_MAX_SAVE_RETRIES`` 后进入
+        失败终态（``failed_terminal``），保存线程退出，避免无限重试。
+        新 ``mark_dirty`` 提交的更高 generation 快照会重置终态。
+        """
         while True:
+            snap: CheckpointSnapshot | None = None
+            snapshot_factory: Callable[[int], CheckpointSnapshot] | None = None
+            generation = 0
+            ready_to_build = False
             with self._lock:
+                # 失败终态：停止保存循环，等待新 mark_dirty 唤醒
+                if self._state.failed_terminal:
+                    return None
                 if self._state.closed and not self._state.dirty:
                     return None
-                if self._state.dirty and self._state.pending_snapshot is not None:
+                if self._state.dirty and (
+                    self._state.pending_snapshot is not None
+                    or self._state.pending_snapshot_factory is not None
+                ):
                     # debounce：自上次 dirty 起等待 _debounce 秒
                     wait_remaining = 0.0
                     if self._last_dirty_at > 0:
                         wait_remaining = self._last_dirty_at + self._debounce - self._clock()
+                    # P1-2：失败重试退避（pending_snapshot 来自失败重试时 next_retry_at 已设）
+                    if self._state.next_retry_at > 0:
+                        retry_wait = self._state.next_retry_at - self._clock()
+                        if retry_wait > wait_remaining:
+                            wait_remaining = retry_wait
                     if wait_remaining <= 0:
-                        # 取出快照，进入保存中
+                        # Take the builder under lock, then construct the
+                        # potentially large snapshot after releasing it.
                         snap = self._state.pending_snapshot
+                        snapshot_factory = self._state.pending_snapshot_factory
+                        generation = self._state.latest_generation
                         self._state.pending_snapshot = None
+                        self._state.pending_snapshot_factory = None
                         self._state.save_in_flight = True
-                        return snap
+                        ready_to_build = True
                 else:
                     wait_remaining = max(0.5, self._debounce)
+            if ready_to_build:
+                if snapshot_factory is not None:
+                    try:
+                        snap = snapshot_factory(generation)
+                    except Exception as exc:  # noqa: BLE001
+                        def _raise_snapshot_error(_generation: int, error=exc) -> None:
+                            raise error
+
+                        snap = CheckpointSnapshot(
+                            task_id=self._task_id,
+                            generation=generation,
+                            save_fn=_raise_snapshot_error,
+                        )
+                if snap is not None:
+                    return snap
+                # A caller must provide either a snapshot or a factory. Keep
+                # the coordinator live if a malformed request slips through.
+                with self._lock:
+                    self._state.save_in_flight = False
+                    self._state.dirty = False
+                    self._state.wake_event.set()
+                continue
             # 锁外等待唤醒
             self._state.wake_event.clear()
             # 二次检查避免丢失唤醒
             with self._lock:
-                if self._state.dirty and self._state.pending_snapshot is not None:
+                if self._state.failed_terminal:
+                    return None
+                if self._state.dirty and (
+                    self._state.pending_snapshot is not None
+                    or self._state.pending_snapshot_factory is not None
+                ):
                     continue  # 重新走 debounce 计算
                 if self._state.closed and not self._state.dirty:
                     return None
             self._state.wake_event.wait(timeout=max(wait_remaining, 0.05))
 
     def _execute_save(self, snapshot: CheckpointSnapshot) -> None:
-        """执行一次原子保存。失败保留 dirty 和错误状态。"""
+        """执行一次原子保存。
+
+        P1-2：失败时恢复 ``pending_snapshot``（避免 dirty=True/pending=None 死锁），
+        按指数退避安排重试；达到上限后进入失败终态并退出保存线程。
+        """
         try:
             snapshot.save_fn(snapshot.generation)
             # 保存成功：清除 dirty 标记（若 generation 仍是最新）。
@@ -230,14 +358,35 @@ class CheckpointCoordinator:
                 # 只有当没有更新的快照覆盖时才清除 dirty。
                 if self._state.latest_generation == snapshot.generation:
                     self._state.dirty = False
+                # P1-2：成功后重置重试计数
+                self._state.retry_count = 0
+                self._state.failed_terminal = False
+                self._state.next_retry_at = 0.0
                 self._state.last_error = None
                 self._state.wake_event.set()
         except Exception as exc:
             logger.error("任务 %s 检查点保存失败: %s", self._task_id, exc)
             with self._lock:
                 self._state.save_in_flight = False
-                # 保留 dirty，标记错误；不覆盖更新的 pending_snapshot。
+                # P1-2：恢复 pending_snapshot，避免 dirty=True/pending=None 死锁。
+                # 若期间有更新的 mark_dirty 到达，保留新快照不覆盖。
+                if self._state.pending_snapshot is None:
+                    self._state.pending_snapshot = snapshot
                 self._state.last_error = str(exc)
+                self._state.retry_count += 1
+                if self._state.retry_count >= _MAX_SAVE_RETRIES:
+                    # P1-2：进入失败终态。保留 dirty 与 last_error，
+                    # 保存线程退出；新 mark_dirty（generation 推进）才能恢复。
+                    self._state.failed_terminal = True
+                    logger.error(
+                        "任务 %s 检查点保存达到重试上限 %d，进入失败终态",
+                        self._task_id,
+                        _MAX_SAVE_RETRIES,
+                    )
+                else:
+                    # P1-2：指数退避，下次重试时间 = now + base * 2^(retry_count-1)
+                    backoff = _RETRY_BACKOFF_BASE * (2 ** (self._state.retry_count - 1))
+                    self._state.next_retry_at = self._clock() + backoff
                 self._state.wake_event.set()
 
 

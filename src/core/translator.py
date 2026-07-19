@@ -74,6 +74,7 @@ class TranslationRunContext:
     temperature: float = 0.3
     # PERF §9.5 D3：提示词/术语哈希一次计算，避免每批重算 SHA256
     prompt_version: str = ""
+    prompt_schema_version: int = 1
     glossary_version: str = ""
 
 
@@ -174,7 +175,9 @@ class TranslatorEngine:
                 target_language, base_prompt, glossary_prompt
             )
         run_temperature = float(api_config.get("temperature", 0.3))
-        run_prompt_version = hashlib.sha256(base_prompt.encode("utf-8")).hexdigest()[:16]
+        prompt_schema_version = int(app_config.get("prompt_schema_version", 1))
+        prompt_version_input = f"schema:{prompt_schema_version}\n{base_prompt}"
+        run_prompt_version = hashlib.sha256(prompt_version_input.encode("utf-8")).hexdigest()[:16]
         run_glossary_version = hashlib.sha256(glossary_prompt.encode("utf-8")).hexdigest()[:16]
         return TranslationRunContext(
             provider=api_config.get("provider", ""),
@@ -186,6 +189,7 @@ class TranslatorEngine:
             is_hunyuan=is_hunyuan,
             temperature=run_temperature,
             prompt_version=run_prompt_version,
+            prompt_schema_version=prompt_schema_version,
             glossary_version=run_glossary_version,
         )
 
@@ -232,6 +236,17 @@ class TranslatorEngine:
         BUG-005：先关闭旧实例，再创建新实例（_init_api 已内置关闭逻辑）。
         """
         self._init_api()
+
+    def get_usage_snapshot(self) -> dict[str, int | float]:
+        """Return cumulative provider counters without request text or credentials."""
+        if self.api is None:
+            return {}
+        metrics_getter = getattr(self.api, "get_performance_metrics", None)
+        cache_getter = getattr(self.api, "get_cache_stats", None)
+        metrics = dict(metrics_getter()) if callable(metrics_getter) else {}
+        cache_stats = dict(cache_getter()) if callable(cache_getter) else {}
+        metrics["cache_hits"] = int(cache_stats.get("hits", 0))
+        return metrics
 
     def close(self):
         """BUG-005：关闭翻译引擎持有的 API 资源，幂等可安全多次调用。"""
@@ -381,7 +396,9 @@ class TranslatorEngine:
         # 避免 _translate_batch 在每个批次的 cache_context 块重读 api_config
         # 并重算 SHA256（热路径哈希开销显著）。
         run_temperature = float(api_config.get("temperature", 0.3))
-        run_prompt_version = hashlib.sha256(base_prompt.encode("utf-8")).hexdigest()[:16]
+        prompt_schema_version = int(app_config.get("prompt_schema_version", 1))
+        prompt_version_input = f"schema:{prompt_schema_version}\n{base_prompt}"
+        run_prompt_version = hashlib.sha256(prompt_version_input.encode("utf-8")).hexdigest()[:16]
         run_glossary_version = hashlib.sha256(glossary_prompt.encode("utf-8")).hexdigest()[:16]
         run_context = TranslationRunContext(
             provider=api_config.get("provider", ""),
@@ -393,6 +410,7 @@ class TranslatorEngine:
             is_hunyuan=is_hunyuan,
             temperature=run_temperature,
             prompt_version=run_prompt_version,
+            prompt_schema_version=prompt_schema_version,
             glossary_version=run_glossary_version,
         )
 
@@ -413,17 +431,30 @@ class TranslatorEngine:
         # PERF §9.6：以 TranslationBatchPlan.start 作为批次键（保持与原 tuple
         # 语义一致：start 单调递增且唯一）。
         completed_by_batch = {plan.start: 0 for plan in batch_ranges}
+        completed_line_count = 0
         batch_starts = tuple(plan.start for plan in batch_ranges)
         finished_batches: set[int] = set()
+        next_unfinished_batch_index = 0
 
-        def display_batch_start():
-            """Return the earliest unfinished batch while holding progress_lock."""
-            return next(
-                (start for start in batch_starts if start not in finished_batches),
-                None,
-            )
+        def display_batch_start() -> int | None:
+            """Return the earliest unfinished batch in O(1) while holding the lock."""
+            if next_unfinished_batch_index >= len(batch_starts):
+                return None
+            return batch_starts[next_unfinished_batch_index]
+
+        def mark_batch_finished(batch_start: int) -> int | None:
+            """Advance the unfinished-batch pointer without rescanning all batches."""
+            nonlocal next_unfinished_batch_index
+            finished_batches.add(batch_start)
+            while (
+                next_unfinished_batch_index < len(batch_starts)
+                and batch_starts[next_unfinished_batch_index] in finished_batches
+            ):
+                next_unfinished_batch_index += 1
+            return display_batch_start()
 
         def batch_progress(progress, data):
+            nonlocal completed_line_count
             if not data:
                 return
             batch_start = data.get("batch_start", 0)
@@ -432,12 +463,11 @@ class TranslatorEngine:
             # 避免 UI 繁忙时阻塞其他批次的进度更新。
             with progress_lock:
                 if data.get("streaming"):
-                    completed_by_batch[batch_start] = max(
-                        completed_by_batch.get(batch_start, 0), completed
-                    )
-                overall = (
-                    sum(completed_by_batch.values()) / total_lines * 100 if total_lines else 100.0
-                )
+                    previous_completed = completed_by_batch.get(batch_start, 0)
+                    if completed > previous_completed:
+                        completed_by_batch[batch_start] = completed
+                        completed_line_count += completed - previous_completed
+                overall = completed_line_count / total_lines * 100 if total_lines else 100.0
                 # Later concurrent batches may update rows, but only the earliest
                 # unfinished batch is allowed to control the UI viewport.
                 display_start = display_batch_start()
@@ -530,7 +560,7 @@ class TranslatorEngine:
                         batch_result = future.result()
                     except TranslationRequestError as exc:
                         with progress_lock:
-                            finished_batches.add(batch_start)
+                            mark_batch_finished(batch_start)
                         failed_indices.extend(range(batch_start, batch_end))
                         last_error = str(exc)
                         logger.error(
@@ -563,14 +593,15 @@ class TranslatorEngine:
                         last_error = batch_result.error_message
 
                     with progress_lock:
-                        finished_batches.add(batch_start)
-                        completed_by_batch[batch_start] = batch_end - batch_start
+                        previous_completed = completed_by_batch.get(batch_start, 0)
+                        batch_completed = batch_end - batch_start
+                        if batch_completed > previous_completed:
+                            completed_by_batch[batch_start] = batch_completed
+                            completed_line_count += batch_completed - previous_completed
                         overall_progress = (
-                            sum(completed_by_batch.values()) / total_lines * 100
-                            if total_lines
-                            else 100.0
+                            completed_line_count / total_lines * 100 if total_lines else 100.0
                         )
-                        display_start = display_batch_start()
+                        display_start = mark_batch_finished(batch_start)
                     # PERF：在锁外调用外部 callback，避免 UI 繁忙时阻塞其他批次。
                     progress_callback(
                         overall_progress,
@@ -855,16 +886,22 @@ class TranslatorEngine:
                         cache_model_name = run_context.model_name
                         cache_temperature = run_context.temperature
                         cache_prompt_version = run_context.prompt_version
+                        cache_prompt_schema_version = run_context.prompt_schema_version
                         cache_glossary_version = run_context.glossary_version
                     else:
                         api_cfg = self.config_manager.get_api_config()
                         cache_provider = api_cfg.get("provider", "")
                         cache_model_name = api_cfg.get("model_name", "")
                         cache_base_prompt = app_config.get("translation_prompt", "")
+                        cache_prompt_schema_version = int(
+                            app_config.get("prompt_schema_version", 1)
+                        )
                         cache_glossary_prompt = self.config_manager.get_glossary_prompt()
                         cache_temperature = float(api_cfg.get("temperature", 0.3))
                         cache_prompt_version = hashlib.sha256(
-                            cache_base_prompt.encode("utf-8")
+                            f"schema:{cache_prompt_schema_version}\n{cache_base_prompt}".encode(
+                                "utf-8"
+                            )
                         ).hexdigest()[:16]
                         cache_glossary_version = hashlib.sha256(
                             cache_glossary_prompt.encode("utf-8")
@@ -875,6 +912,7 @@ class TranslatorEngine:
                         "model_name": cache_model_name,
                         "temperature": cache_temperature,
                         "prompt_version": cache_prompt_version,
+                        "prompt_schema_version": cache_prompt_schema_version,
                         "glossary_version": cache_glossary_version,
                         "normalization_version": "line-marker-v2",
                     }

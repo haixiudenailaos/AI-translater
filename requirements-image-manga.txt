@@ -6,14 +6,21 @@
 # 本文件与 requirements.txt 互补，仅在需要启用图片翻译功能时安装：
 #   python -m pip install -r requirements-image-manga.txt
 #
-# Python 版本：3.10 或 3.11。上游明确声明 requires-python <3.12，
-# 请使用全局 Python 3.11 执行安装和运行，不要使用项目内虚拟环境。
+# 应用支持 Python 3.10 及以上。部分本地漫画翻译依赖可能有自己的 Python
+# 版本或 wheel 限制；这只影响对应的可选 Provider，不影响文本翻译功能启动。
 #
 # 设计原则：
 # - 所有版本经过验证，确保 CPU/GPU 均可运行（默认 device=auto）。
 # - 不污染主 requirements.txt，未启用图片翻译的项目无需安装。
 # - 与 src/infrastructure/image_translation/manga_provider.py 的惰性导入对齐：
 #   若本文件未安装，Manga Provider.validate() 会返回明确错误而不是崩溃。
+#
+# P1-12：本清单是 Full Edition 的输入约束；发布构建使用平台对应的
+# `requirements-full-*.lock.txt`，并通过 `--require-hashes` 安装。
+# 生成命令见 tools/generate_dependency_locks.py。额外索引的 Rust wheel 已
+# 固定版本，hash 由平台 lock 文件记录，避免供应链解析漂移。
+# - PyInstaller 在 CI 中固定（见 .github/workflows/build.yml 的
+#   PYINSTALLER_VERSION），不在此文件声明，避免与打包工具链耦合。
 # ============================================================================
 
 # ── 深度学习框架 ───────────────────────────────────
@@ -105,7 +112,7 @@ torch-summary>=1.4.5
 
 # 上游 detection 包在注册 Paddle detector 时会导入该 Rust 扩展。
 --extra-index-url https://frederik-uni.github.io/manga-image-translator-rust/python/wheels/simple/
-rusty-manga-image-translator
+rusty-manga-image-translator==0.12.1
 
 # ── 不纳入的依赖（按需说明）────────────────────────
 # - PyQt5：manga-image-translator 的独立 GUI，本项目使用 Tkinter，不需要

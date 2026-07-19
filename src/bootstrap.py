@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .app_paths import AppPaths
 from .config.config_manager import ConfigManager
+from .domain.edition import EditionCapabilities, detect_edition_capabilities
 from .infrastructure.keyring_secret_store import KeyringSecretStore
 from .utils.logger import get_logger, setup_logging
 
@@ -35,6 +36,7 @@ class AppContext:
     app_paths: AppPaths
     config_manager: ConfigManager
     secret_store: KeyringSecretStore
+    edition_capabilities: EditionCapabilities
 
 
 def create_app_context() -> AppContext:
@@ -64,11 +66,18 @@ def create_app_context() -> AppContext:
         secret_store=secret_store,
     )
 
-    logger.info("应用上下文初始化完成")
+    # P0-2：运行时检测应用版本能力。Text 版本不导入 Manga 模块。
+    edition_capabilities = detect_edition_capabilities()
+    logger.info(
+        "应用上下文初始化完成（edition=%s, manga_enabled=%s）",
+        edition_capabilities.edition.value,
+        edition_capabilities.manga_enabled,
+    )
     return AppContext(
         app_paths=app_paths,
         config_manager=config_manager,
         secret_store=secret_store,
+        edition_capabilities=edition_capabilities,
     )
 
 
@@ -79,8 +88,9 @@ def create_image_translation_registry(
     config_manager: ConfigManager,
     app_paths: AppPaths,
     font_path: Path | None = None,
+    edition_capabilities: EditionCapabilities | None = None,
 ):
-    """创建图片翻译 Provider 注册表，注册 Manga 和火山引擎 Provider。
+    """创建图片翻译 Provider 注册表，按版本能力注册 Provider。
 
     UI 层应调用此函数获取已配置的注册表，而不是直接创建
     infrastructure 层的 Provider 对象。
@@ -89,6 +99,8 @@ def create_image_translation_registry(
         config_manager: 配置管理器。
         app_paths: 应用路径。
         font_path: 字体路径（可选，用于 Manga Provider 渲染）。
+        edition_capabilities: 版本能力契约。``None`` 时自动检测。
+            Text 版本不注册 Manga Provider，避免触碰 Manga 模块。
 
     Returns:
         ImageTranslationProviderRegistry: 已注册 Provider 的注册表。
@@ -97,14 +109,23 @@ def create_image_translation_registry(
         ImageTranslationProviderRegistry,
     )
 
+    if edition_capabilities is None:
+        edition_capabilities = detect_edition_capabilities()
+
     registry = ImageTranslationProviderRegistry()
 
-    # 注册 Manga Provider（惰性导入，未安装引擎时 validate 会报错）
-    manga_provider = _create_manga_provider(config_manager, app_paths, font_path)
-    if manga_provider is not None:
-        registry.register(manga_provider)
+    # P0-2：仅在 Full 版本注册 Manga Provider。Text 版本禁止触碰 Manga 模块。
+    if edition_capabilities.manga_enabled:
+        manga_provider = _create_manga_provider(config_manager, app_paths, font_path)
+        if manga_provider is not None:
+            registry.register(manga_provider)
+    else:
+        # P0-2：Text 版本必须禁用注册表的 Manga 开关，
+        # 防止任何调用方通过 registry.get(MANGA) 触发 Manga 路径。
+        registry.manga_provider_available = False
+        logger.info("Text Edition：Manga Provider 未注册（能力契约禁用）")
 
-    # 注册火山 AI Provider
+    # 注册火山 AI Provider（Text/Full 共用）
     from .infrastructure.image_translation.volcengine_provider import (
         VolcengineImageTranslationProvider,
     )
@@ -118,6 +139,7 @@ def create_image_translation_service(
     config_manager: ConfigManager,
     app_paths: AppPaths,
     font_path: Path | None = None,
+    edition_capabilities: EditionCapabilities | None = None,
 ):
     """创建已配置的 ImageTranslationService。
 
@@ -128,6 +150,7 @@ def create_image_translation_service(
         config_manager: 配置管理器。
         app_paths: 应用路径。
         font_path: 字体路径（可选）。
+        edition_capabilities: 版本能力契约。``None`` 时自动检测。
 
     Returns:
         ImageTranslationService: 已注入所有依赖的服务实例。
@@ -137,7 +160,12 @@ def create_image_translation_service(
         ManifestRepository,
     )
 
-    registry = create_image_translation_registry(config_manager, app_paths, font_path)
+    registry = create_image_translation_registry(
+        config_manager,
+        app_paths,
+        font_path,
+        edition_capabilities=edition_capabilities,
+    )
 
     def manifest_repository_factory(mapping_dir: Path) -> ManifestRepository:
         return ManifestRepository(mapping_dir)

@@ -39,6 +39,23 @@ class UsageStatistics:
     def record_cache_hit(self) -> None:
         self.cache_hits += 1
 
+    def record_metrics_delta(
+        self,
+        current: dict[str, int | float],
+        previous: dict[str, int | float] | None = None,
+    ) -> None:
+        """Merge cumulative API counters without storing request content."""
+        baseline = previous or {}
+
+        def delta(key: str) -> int:
+            return max(0, int(current.get(key, 0)) - int(baseline.get(key, 0)))
+
+        self.requests += delta("successful_requests")
+        self.retries += delta("retries")
+        self.cache_hits += delta("cache_hits")
+        self.input_tokens += delta("input_tokens_estimated")
+        self.output_tokens += delta("output_tokens_estimated")
+
     def to_dict(self) -> dict[str, int | float]:
         return {
             "requests": self.requests,

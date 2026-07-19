@@ -11,10 +11,18 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 from typing import List
 from unittest.mock import MagicMock
 
+from src.core.queue_scheduler import (
+    QueueMetricsSnapshot,
+    QueueSnapshot,
+    QueueTaskSnapshot,
+    QueueTaskState,
+)
 from src.ui.concurrent_window import ConcurrentWindow
 from src.ui.main_window import MainWindow
 
@@ -42,6 +50,9 @@ class _FakeManager:
 
     def get_all_tasks(self):
         return list(self._tasks)
+
+    def get_snapshot(self):
+        return None
 
 
 def _bypass_init_window(manager: _FakeManager, owns_manager: bool = False) -> ConcurrentWindow:
@@ -90,6 +101,43 @@ def test_close_window_with_injected_manager_clears_progress_callback():
 
     # progress_callback 被置 None，避免窗口销毁后回调投递
     assert manager.progress_callback is None
+
+
+def test_background_import_fingerprint_dialog_runs_on_tk_thread_mailbox():
+    """A queue-import worker must not invoke the Tk recovery dialog directly."""
+
+    class _Mailbox:
+        def __init__(self) -> None:
+            self.callbacks = []
+
+        def submit(self, callback) -> None:
+            self.callbacks.append(callback)
+
+    window = _bypass_init_window(_FakeManager())
+    mailbox = _Mailbox()
+    window._ui_mailbox = mailbox
+    window._show_fingerprint_mismatch_dialog = MagicMock(return_value="map")
+    result: list[str] = []
+
+    worker = threading.Thread(
+        target=lambda: result.append(
+            window._request_fingerprint_mismatch_decision({"file_path": "novel.txt"})
+        )
+    )
+    worker.start()
+
+    deadline = time.monotonic() + 1.0
+    while not mailbox.callbacks and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert mailbox.callbacks
+    window._show_fingerprint_mismatch_dialog.assert_not_called()
+
+    mailbox.callbacks.pop()()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert result == ["map"]
+    window._show_fingerprint_mismatch_dialog.assert_called_once()
 
 
 def test_close_window_with_owned_manager_closes_manager():
@@ -146,6 +194,87 @@ def test_close_window_closes_detail_subwindows():
     assert detail1.win.destroy.called
     assert detail2.win.destroy.called
     assert win._detail_windows == {}
+
+
+def test_refresh_tree_uses_lightweight_snapshot_without_full_task_copies():
+    class SnapshotOnlyManager:
+        def get_snapshot(self):
+            return QueueSnapshot(
+                tasks=(
+                    QueueTaskSnapshot(
+                        task_id="task-1",
+                        file_name="book.txt",
+                        file_type="txt",
+                        state=QueueTaskState.RUNNING,
+                        state_display="翻译中",
+                        progress=42.5,
+                        completed_lines=42,
+                        total_lines=100,
+                        in_flight_batches=2,
+                        pending_batches=3,
+                        error_message="raw exception",
+                        failed_indices=(),
+                        status="running",
+                        checkpoint_dirty=True,
+                        checkpoint_error=None,
+                        error_safe_message="网络暂时不可用，请重试。",
+                    ),
+                ),
+                metrics=QueueMetricsSnapshot(
+                    active_requests=2,
+                    current_limit=3,
+                    hard_cap=4,
+                    configured_max=3,
+                    is_blocked=False,
+                    cooldown_remaining=0,
+                    total_429=0,
+                    total_timeouts=0,
+                    total_success=0,
+                    consecutive_successes=0,
+                    throughput_lines_per_minute=0,
+                    eta_seconds=None,
+                ),
+            )
+
+        def get_all_tasks(self):
+            raise AssertionError("列表刷新不得复制完整任务文本")
+
+    class Tree:
+        def __init__(self):
+            self.rows = {}
+
+        def get_children(self):
+            return tuple(self.rows)
+
+        def item(self, item_id, **kwargs):
+            if "values" in kwargs:
+                self.rows[item_id] = kwargs["values"]
+            return {"values": self.rows[item_id]}
+
+        def insert(self, _parent, _index, *, values):
+            item_id = f"row-{len(self.rows)}"
+            self.rows[item_id] = values
+            return item_id
+
+        def delete(self, item_id):
+            del self.rows[item_id]
+
+    window = ConcurrentWindow.__new__(ConcurrentWindow)
+    window.manager = SnapshotOnlyManager()
+    window.tree = Tree()
+
+    window._refresh_tree()
+
+    values = next(iter(window.tree.rows.values()))
+    assert values == (
+        "task-1",
+        "book.txt",
+        "翻译中",
+        "42%",
+        "",
+        "网络暂时不可用，请重试。",
+        "2",
+    )
 
 
 # ── P1-3：取消全部必须确认 ──────────────────────────────
@@ -340,6 +469,7 @@ def test_main_window_reopens_queue_with_same_application_manager(monkeypatch):
         def __init__(self, parent, config_manager, **kwargs):
             self.parent = parent
             self.config_manager = config_manager
+            self.kwargs = kwargs
             self.manager = kwargs["manager"]
             self._closed = False
             created_windows.append(self)
@@ -352,6 +482,7 @@ def test_main_window_reopens_queue_with_same_application_manager(monkeypatch):
     main.config_manager = object()
     main.app_paths = object()
     main._provider_limiter_registry = object()
+    main.edition_capabilities = object()
     main._queue_manager = None
     main._concurrent_window = None
 
@@ -363,3 +494,4 @@ def test_main_window_reopens_queue_with_same_application_manager(monkeypatch):
     assert len(created_windows) == 2
     assert created_windows[0].manager is created_windows[1].manager
     assert created_managers[0].kwargs["limiter_registry"] is main._provider_limiter_registry
+    assert created_windows[0].kwargs["edition_capabilities"] is main.edition_capabilities

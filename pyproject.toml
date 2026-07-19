@@ -6,7 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "ai-translater"
 version = "1.6.0"
 description = "轻小说翻译器：EPUB/TXT 文学翻译与图片翻译工具"
-requires-python = ">=3.11"
+# 应用支持 Python 3.10 及以上；质量门禁覆盖多个主流 Python 版本。
+requires-python = ">=3.10"
 dependencies = [
     # PERF §10.2：声明 h2 依赖以匹配 SiliconFlowAPI 的 http2=True 配置，
     # 避免运行时缺少 h2 后静默回退到 HTTP/1.1。
@@ -16,10 +17,15 @@ dependencies = [
     "beautifulsoup4>=4.11.0",
     "lxml>=4.9.0",
     "Pillow>=9.0.0",
+    # 在线图片翻译的 SVG 输入需要转换为 PNG；不能只在运行时提示安装。
+    "CairoSVG>=2.7.0,<3.0",
     "chardet>=5.0.0",
     "requests>=2.28.0",
     "aiohttp>=3.9.0",
     "openai>=1.0.0",
+    # ``openai`` imports Pydantic at module import time; keep this direct so
+    # Text Edition environments do not rely on a fragile transitive install.
+    "pydantic>=2.5.0,<3.0",
     "keyring>=24.0.0",
 ]
 
@@ -29,6 +35,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "ruff>=0.6.0",
+    # P2-6：渐进类型门禁。先对 domain/application 启用严格类型，
+    # 再扩展到 infrastructure 与新 UI adapter。
+    "pyright>=1.1.350",
 ]
 # 可选图片翻译依赖：manga-image-translator 深度学习栈
 image-manga = [
@@ -99,7 +108,7 @@ include = ["src*"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 extend-exclude = [
     "third_party",
     "build",
@@ -159,3 +168,35 @@ filterwarnings = [
     "ignore::DeprecationWarning:ebooklib.*",
     "ignore::PendingDeprecationWarning",
 ]
+
+# ── Pyright：渐进类型门禁 ────────────────────────────────────────────
+# P2-6：先对 domain/application 启用严格类型（业务核心，类型契约最关键），
+# infrastructure 和 ui 暂用 basic 模式避免一次性阻塞历史代码。
+# 后续按用例拆分热点模块时，新提取的 command/service/adapter 应继承严格模式。
+[tool.pyright]
+include = ["src/domain", "src/application", "src/infrastructure", "src/ui", "src/core", "src/api", "src/config"]
+exclude = [
+    "third_party",
+    "build",
+    "dist",
+    "**/__pycache__",
+    ".venv",
+]
+# domain/application 严格模式（覆盖业务核心契约）
+strict = ["src/domain", "src/application"]
+# 其余目录使用 basic 模式，避免一次性阻塞历史代码
+typeCheckingMode = "basic"
+# 暂不强制报告这些（历史代码尚未清理）
+reportMissingImports = "none"
+reportMissingTypeStubs = "none"
+# 严格模式下的额外检查（只在 strict 路径生效）
+# Basic-mode legacy adapters are progressively typed. Keep the strict profile
+# for domain/application while allowing the repository-wide gate to catch
+# soundness errors that do not depend on complete third-party annotations.
+reportUnknownParameterType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownVariableType = "none"
+reportUnknownMemberType = "none"
+reportMissingParameterType = "none"
+reportMissingTypeArgument = "none"
+reportPrivateImportUsage = "none"

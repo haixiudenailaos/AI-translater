@@ -18,6 +18,7 @@ import pytest
 
 from src.domain.project import SaveStatus, TaskStatus
 from src.infrastructure.project_repository import (
+    ProjectCorruptError,
     ProjectRepository,
     compute_file_fingerprint,
     compute_project_id,
@@ -137,6 +138,20 @@ class TestCreateAndLoad:
     def test_load_nonexistent(self, repo):
         assert repo.load("nonexistent-id") is None
 
+    def test_load_corrupt_project_quarantines_instead_of_silently_overwriting(self, repo):
+        project_id = "corrupt-project"
+        original_path = repo.projects_dir / f"{project_id}.json"
+        original_path.write_text("{not valid json", encoding="utf-8")
+
+        with pytest.raises(ProjectCorruptError) as exc_info:
+            repo.load(project_id)
+
+        quarantined_path = exc_info.value.quarantined_path
+        assert quarantined_path is not None
+        assert quarantined_path.exists()
+        assert not original_path.exists()
+        assert repo.load(project_id) is None
+
 
 # ── 保存 ──────────────────────────────────
 
@@ -188,6 +203,23 @@ class TestSave:
         assert loaded.failed_indices == {2}
         assert loaded.status == TaskStatus.PARTIAL
         assert loaded.last_error == "timeout"
+
+    def test_save_round_trip_preserves_completed_empty_translation(self, repo):
+        project = repo.create(
+            source_path="/tmp/test.txt",
+            source_fingerprint="fp123",
+            file_type="txt",
+            mapping_dir="",
+            original_lines=["A", "B"],
+        )
+        project.completed_indices.add(0)
+        repo.save(project)
+
+        loaded = repo.load(project.project_id)
+
+        assert loaded is not None
+        assert loaded.translated_lines[0] == ""
+        assert loaded.completed_indices == {0}
 
 
 # ── 检查点 ──────────────────────────────────

@@ -65,6 +65,29 @@ class TestCheckpointSingleFlight:
         finally:
             cc.close()
 
+    def test_lazy_snapshot_is_built_once_after_debounce(self):
+        """PERF-3：高频 dirty 不应在每次调用时复制完整文档快照。"""
+        built_generations: list[int] = []
+        saved_generations: list[int] = []
+        cc = CheckpointCoordinator("lazy-snapshot", debounce_seconds=0.05)
+
+        def make_snapshot(generation: int) -> CheckpointSnapshot:
+            built_generations.append(generation)
+            return _make_snapshot(
+                "lazy-snapshot",
+                generation,
+                lambda saved_generation: saved_generations.append(saved_generation),
+            )
+
+        try:
+            for generation in range(1, 8):
+                cc.mark_dirty_lazy(generation, make_snapshot)
+            assert cc.flush_blocking(timeout=2.0) is True
+            assert built_generations == [7]
+            assert saved_generations == [7]
+        finally:
+            cc.close()
+
     def test_flush_blocking_returns_true_when_no_dirty(self, tmp_path):
         cc = CheckpointCoordinator("task-3")
         try:
@@ -92,6 +115,106 @@ class TestCheckpointSingleFlight:
         cc = CheckpointCoordinator("task-5")
         cc.close()
         cc.close()  # 不抛异常
+
+    def test_p1_2_save_failure_restores_pending_snapshot_no_deadlock(self, tmp_path):
+        """P1-2：保存失败时必须恢复 pending_snapshot，避免 dirty=True/pending=None 死锁。
+
+        旧实现在保存前 ``pending_snapshot = None``，失败时未恢复，
+        导致后续 ``_await_next_snapshot`` 永远进入 else 分支等待唤醒，
+        即便有未保存的 dirty 也无法重试。新实现恢复 pending_snapshot 并
+        按指数退避重试。
+        """
+        from src.core import queue_checkpoint
+
+        # 缩短重试上限与退避基数，使测试在 1 秒内进入终态
+        saved_max_retries = queue_checkpoint._MAX_SAVE_RETRIES
+        saved_backoff = queue_checkpoint._RETRY_BACKOFF_BASE
+        queue_checkpoint._MAX_SAVE_RETRIES = 2
+        queue_checkpoint._RETRY_BACKOFF_BASE = 0.01
+        try:
+            attempts = []
+
+            def _failing_save(generation):
+                attempts.append(generation)
+                raise OSError("disk full")
+
+            cc = CheckpointCoordinator("p1-2-task", debounce_seconds=0.01)
+            try:
+                cc.mark_dirty(_make_snapshot("p1-2-task", 1, _failing_save))
+                # 等待重试到达上限，进入失败终态
+                import time
+
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if cc.has_terminal_failure:
+                        break
+                    time.sleep(0.02)
+                # 至少尝试过 MAX_RETRIES 次
+                assert len(attempts) >= 2
+                assert cc.has_terminal_failure is True
+                assert cc.retry_count >= 2
+                assert cc.is_dirty is True  # dirty 保留
+                assert cc.has_error is True
+            finally:
+                cc.close()
+        finally:
+            queue_checkpoint._MAX_SAVE_RETRIES = saved_max_retries
+            queue_checkpoint._RETRY_BACKOFF_BASE = saved_backoff
+
+    def test_p1_2_new_generation_resets_terminal_failure(self, tmp_path):
+        """P1-2：失败终态后，新的 mark_dirty（更高 generation）必须重置终态。"""
+        from src.core import queue_checkpoint
+
+        saved_max_retries = queue_checkpoint._MAX_SAVE_RETRIES
+        saved_backoff = queue_checkpoint._RETRY_BACKOFF_BASE
+        queue_checkpoint._MAX_SAVE_RETRIES = 1
+        queue_checkpoint._RETRY_BACKOFF_BASE = 0.01
+        try:
+            attempts = []
+
+            def _fail_then_succeed(generation):
+                attempts.append(generation)
+                if generation == 1:
+                    raise OSError("disk full")
+                # generation 2 不抛异常，保存成功
+
+            cc = CheckpointCoordinator("p1-2-recover", debounce_seconds=0.01)
+            try:
+                cc.mark_dirty(_make_snapshot("p1-2-recover", 1, _fail_then_succeed))
+                import time
+
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if cc.has_terminal_failure:
+                        break
+                    time.sleep(0.02)
+                assert cc.has_terminal_failure is True
+
+                # 提交更高 generation，应重置终态并恢复保存
+                cc.mark_dirty(_make_snapshot("p1-2-recover", 2, _fail_then_succeed))
+                assert cc.has_terminal_failure is False
+                assert cc.flush_blocking(timeout=2.0) is True
+                assert cc.is_dirty is False
+                assert 2 in attempts
+            finally:
+                cc.close()
+        finally:
+            queue_checkpoint._MAX_SAVE_RETRIES = saved_max_retries
+            queue_checkpoint._RETRY_BACKOFF_BASE = saved_backoff
+
+    def test_p1_2_close_terminates_save_thread(self, tmp_path):
+        """P1-2：close() 必须让保存线程退出，不留僵尸线程。"""
+        import time
+
+        def _slow_save(generation):
+            time.sleep(0.5)
+
+        cc = CheckpointCoordinator("p1-2-close", debounce_seconds=0.01)
+        cc.mark_dirty(_make_snapshot("p1-2-close", 1, _slow_save))
+        time.sleep(0.05)  # 让保存线程开始
+        cc.close()
+        # close 等待 join，结束后线程应已退出
+        assert cc._save_thread is None or not cc._save_thread.is_alive()
 
 
 class TestTxtSaveFn:

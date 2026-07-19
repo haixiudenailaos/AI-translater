@@ -47,7 +47,7 @@ class QualityReport:
     def error_count(self) -> int:
         return sum(issue.severity is QualitySeverity.ERROR for issue in self.issues)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         return {
             "total_lines": self.total_lines,
             "checked_lines": self.checked_lines,

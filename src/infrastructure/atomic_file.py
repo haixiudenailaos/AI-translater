@@ -46,6 +46,8 @@ def write_bytes_atomic(path: Path, content: bytes) -> None:
     """Write bytes through a unique sibling temporary file before replacement.
 
     P3-1：统一使用 _atomic_replace 处理 Windows 瞬态占用。
+    P2-7：在 replace 前对临时文件执行 flush+fsync，把页缓存刷到磁盘，
+    使“原子写入”在普通断电场景下也尽量可恢复；fsync 失败不静默吞掉。
     失败时清理临时文件并抛出异常，不静默吞掉。
     """
     target = Path(path)
@@ -57,6 +59,8 @@ def write_bytes_atomic(path: Path, content: bytes) -> None:
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
         _atomic_replace(temporary, target)
     except BaseException:
         temporary.unlink(missing_ok=True)

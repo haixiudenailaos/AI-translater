@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import threading
 import time
+import tempfile
+from pathlib import Path
 from typing import List
 from unittest.mock import MagicMock
 
@@ -67,15 +69,20 @@ def _make_policy(**overrides) -> QueuePolicy:
 
 class _MockFileHandler:
     def write_file(self, path, content):
-        from pathlib import Path
-
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(content, encoding="utf-8")
+        resolved = _portable_test_path(path)
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(content, encoding="utf-8")
 
     def read_file(self, path):
-        from pathlib import Path
+        return _portable_test_path(path).read_text(encoding="utf-8")
 
-        return Path(path).read_text(encoding="utf-8")
+
+def _portable_test_path(path: str) -> Path:
+    """Keep legacy POSIX fixture paths writable on Windows test runners."""
+    normalized = str(path).replace("\\", "/")
+    if normalized.startswith("/tmp/"):
+        return Path(tempfile.gettempdir()) / "ai-translater-queue-tests" / Path(path).name
+    return Path(path)
 
 
 class _MockEpubProcessor:
@@ -389,6 +396,57 @@ def _add_task(coord, task_id, file_path, source_lines, target_lines=None) -> boo
 
 class TestSchedulerFairness:
     """§13.1 调度与公平性：用 Barrier/计数器断言并发事实。"""
+
+    def test_active_task_window_lazily_prepares_large_queue(
+        self, tmp_config_manager, tmp_path, monkeypatch
+    ):
+        """PERF-2：活动窗口限制引擎和批次计划，而不只限制请求数。"""
+        probe = _ConcurrencyProbe()
+        policy = _make_policy(
+            max_in_flight_requests=2,
+            max_active_tasks=2,
+            per_task_soft_limit=1,
+            max_batch_lines=1,
+        )
+        engines: list[_ProbeEngine] = []
+
+        def _factory(config_manager):
+            engine = _ProbeEngine(config_manager, probe)
+            engines.append(engine)
+            return engine
+
+        monkeypatch.setattr("src.core.queue_scheduler.TranslatorEngine", _factory)
+        coord = _make_coordinator(tmp_config_manager, policy)
+        coord.start()
+        try:
+            for index in range(8):
+                assert _add_task(
+                    coord,
+                    f"t{index}",
+                    str(tmp_path / f"task-{index}.txt"),
+                    [f"line {index}"],
+                )
+            coord.submit_command("start_all")
+
+            assert _wait_for(lambda: probe.max_seen == 2, timeout=4.0)
+            assert len(engines) == 2
+            assert sum(
+                slot.state == QueueTaskState.PENDING
+                for slot in coord._tasks.values()
+            ) == 6
+
+            probe.release_event.set()
+            assert _wait_for(
+                lambda: all(
+                    coord.get_task_data(f"t{index}")["status"] == "completed"
+                    for index in range(8)
+                ),
+                timeout=10.0,
+            )
+            assert len(engines) == 8
+        finally:
+            probe.release_event.set()
+            coord.close()
 
     def test_start_all_fills_global_request_slots(self, tmp_config_manager, monkeypatch):
         """start_all 后两个单批任务应同时占满全局请求槽位。"""

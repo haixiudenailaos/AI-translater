@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from src.core.image_translator import (
     ImageDownloadError,
+    _rasterize_safe_svg,
     _safe_download_image,
     _validate_download_url,
 )
@@ -402,6 +403,23 @@ class SafeDownloadTests(unittest.TestCase):
             _validate_download_url("http://evil.com")
         # 错误消息是通用的，不包含具体路径
         # 这里主要验证非可信 host 的错误不包含敏感信息
+
+
+class SvgTrustBoundaryTests(unittest.TestCase):
+    """ENG-4：远程 SVG 必须拒绝主动内容后再进入栅格化。"""
+
+    def test_script_is_rejected_before_rasterization(self):
+        svg = b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
+        with self.assertRaises(ImageDownloadError):
+            _rasterize_safe_svg(svg)
+
+    def test_event_handler_and_external_reference_are_rejected(self):
+        svg = (
+            b"<svg xmlns='http://www.w3.org/2000/svg' onload='steal()'>"
+            b"<image href='https://evil.example/image.png'/></svg>"
+        )
+        with self.assertRaises(ImageDownloadError):
+            _rasterize_safe_svg(svg)
 
 
 if __name__ == "__main__":

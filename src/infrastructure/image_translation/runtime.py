@@ -72,7 +72,14 @@ class MangaRuntime:
         return asyncio.run_coroutine_threadsafe(coro, self._loop)  # type: ignore[return-value]
 
     def shutdown(self) -> None:
-        """停止 loop 并等待线程退出（幂等）。"""
+        """停止 loop 并等待线程退出（幂等）。
+
+        P1-3：修正关闭顺序——必须先在 loop 仍在运行时调度取消所有 pending
+        tasks 和 async generators 的清理，再停止 loop。旧实现在 ``loop.stop``
+        + ``thread.join`` 之后才尝试 ``task.cancel()``，此时 loop 已停止，
+        取消请求不会被处理，async generator 也不会运行 ``aclose``，
+        造成资源泄漏和 "Task was destroyed but it is pending!" 警告。
+        """
         with self._lock:
             if not self._started:
                 return
@@ -82,19 +89,46 @@ class MangaRuntime:
             self._loop = None
             self._thread = None
 
-        if loop is not None and loop.is_running():
+        if loop is None or thread is None:
+            return
+
+        if loop.is_running():
+            # P1-3：在 loop 仍在运行时调度 graceful shutdown 协程
+            async def _graceful_shutdown() -> None:
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    # 排除自身
+                    current = asyncio.current_task()
+                    if current is not None and current in pending:
+                        pending.discard(current)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    # P1-3：关闭 async generators，避免资源泄漏
+                    await loop.shutdown_asyncgens()
+                except Exception as exc:
+                    logger.warning("graceful shutdown 失败: %s", exc)
+
+            try:
+                future = asyncio.run_coroutine_threadsafe(_graceful_shutdown(), loop)
+                # 等待 graceful shutdown 完成，但限制总时长
+                future.result(timeout=10)
+            except Exception as exc:
+                logger.warning("调度 graceful shutdown 失败: %s", exc)
+            # graceful shutdown 完成后停止 loop
             try:
                 loop.call_soon_threadsafe(loop.stop)
             except Exception as exc:
                 logger.warning("停止 event loop 失败: %s", exc)
-        if thread is not None:
-            thread.join(timeout=10)
-        if loop is not None:
-            try:
-                # 取消所有未完成任务后关闭 loop
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                loop.close()
-            except Exception as exc:
-                logger.warning("关闭 event loop 失败: %s", exc)
+
+        # 等待 loop 线程退出
+        thread.join(timeout=10)
+        if thread.is_alive():
+            logger.warning("MangaRuntime 线程在 shutdown 后仍未退出")
+
+        # 关闭 loop（此时已停止，可安全 close）
+        try:
+            loop.close()
+        except Exception as exc:
+            logger.warning("关闭 event loop 失败: %s", exc)

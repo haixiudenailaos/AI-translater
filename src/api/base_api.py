@@ -18,13 +18,30 @@ from typing import Any, Callable, Dict, Generator, List
 
 import httpx
 
-from ..core.batch_processor import get_batch_processor
 from ..core.smart_cache import SmartCache
+from ..config.translation_profile import normalize_openai_base_url
 from ..domain.errors import TranslationRequestError
 from ..utils.logger import get_logger
+from ..utils.log_sanitizer import sanitize_for_log
 from ..utils.token_estimator import estimate_tokens
 
 logger = get_logger(__name__)
+
+# P1-5：响应正文日志的最大长度（截断后附加 ...truncated 标记）
+_RESPONSE_LOG_MAX_LENGTH = 500
+
+
+def _summarize_response_body(body: str) -> str:
+    """P1-5：对 HTTP 响应正文做有界摘要，避免超长 JSON 主体占满日志。
+
+    截断到 ``_RESPONSE_LOG_MAX_LENGTH`` 字符并脱敏（API Key 等），
+    超长时附加 ``...(truncated)`` 标记。
+    """
+    if not body:
+        return ""
+    if len(body) > _RESPONSE_LOG_MAX_LENGTH:
+        body = body[:_RESPONSE_LOG_MAX_LENGTH] + "...(truncated)"
+    return str(sanitize_for_log(body))
 
 
 class BaseAPI:
@@ -39,7 +56,15 @@ class BaseAPI:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.base_url = config.get("base_url", self.DEFAULT_BASE_URL).strip().rstrip("/")
+        raw_base_url = config.get("base_url", self.DEFAULT_BASE_URL)
+        # Validate at the transport boundary too.  Callers can construct an
+        # API directly from a file, queue task, or migration and must not be
+        # able to send a Bearer token to a remote plain-HTTP endpoint.
+        self.base_url = (
+            normalize_openai_base_url(raw_base_url)
+            if raw_base_url
+            else ""
+        )
         self.api_key = config.get("api_key", "").strip()
         self.model_name = config.get("model_name", self.DEFAULT_MODEL)
         self.max_tokens = config.get("max_tokens", 2048)
@@ -101,49 +126,49 @@ class BaseAPI:
         if self.enable_cache:
             cc = config.get("cache_config", {})
             self.cache = SmartCache(
-                max_memory_size=cc.get("max_memory_size", 1000),
+                max_entries=cc.get("max_entries", cc.get("max_memory_size", 1000)),
                 ttl_hours=cc.get("ttl_hours", 24),
             )
         else:
             self.cache = None
-
-        # PERF §10.3：批处理改为延迟创建。主文本翻译路径使用
-        # translate_stream_enhanced()，不会触及 batch_processor；旧式
-        # translate_batch() 首次调用时才构造，避免无用后台线程常驻。
-        self.enable_batch = config.get("enable_batch", True)
-        if self.enable_batch:
-            bc = config.get("batch_config", {})
-            self._batch_config = {
-                "max_batch_size": bc.get("max_batch_size", 10),
-                "max_wait_time": bc.get("max_wait_time", 0.5),
-                "max_workers": bc.get("max_workers", 4),
-            }
-        else:
-            self._batch_config = None
-        self.batch_processor = None
-        self._batch_lock = threading.Lock()
 
         self.enable_stream = config.get("enable_stream", True)
         self.stream_callbacks: Dict[str, Callable] = {}
 
     # ── HTTP 客户端管理 ─────────────────────────────────
 
-    def _recreate_client(self):
-        """重建持久 HTTP 客户端（连接池）。子类可覆盖以定制传输层。"""
+    def _build_client(self) -> httpx.Client:
+        """Build a fresh HTTP client without publishing it to other threads."""
         try:
-            if self._current_client:
-                try:
-                    self._current_client.close()
-                except Exception as exc:
-                    logger.warning("关闭旧 HTTP 客户端失败: %s", exc)
             limits = httpx.Limits(
                 max_keepalive_connections=self._max_keepalive,
                 max_connections=self._max_connections,
             )
-            self._current_client = httpx.Client(timeout=self._http_timeout, limits=limits)
+            return httpx.Client(timeout=self._http_timeout, limits=limits)
         except Exception as e:
             logger.error("重建HTTP客户端失败: %s", e)
-            self._current_client = httpx.Client(timeout=self._http_timeout)
+            return httpx.Client(timeout=self._http_timeout)
+
+    @staticmethod
+    def _close_client(client: httpx.Client | None) -> None:
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as exc:
+            logger.warning("关闭 HTTP 客户端失败: %s", exc)
+
+    def _replace_client_locked(self) -> httpx.Client | None:
+        """Atomically publish a fresh client while holding ``_client_lock``."""
+        old_client = self._current_client
+        self._current_client = self._build_client()
+        return old_client
+
+    def _recreate_client(self) -> None:
+        """Replace the shared client atomically, then close the detached client."""
+        with self._client_lock:
+            old_client = self._replace_client_locked()
+        self._close_client(old_client)
 
     def _get_client(self) -> httpx.Client:
         """获取当前 HTTP 客户端。
@@ -152,10 +177,15 @@ class BaseAPI:
         取消操作会关闭并置空客户端，下次请求必须重建，否则复用已关闭客户端
         会导致连续失败。
         """
-        client = self._current_client
-        if client is None or getattr(client, "is_closed", False):
-            self._recreate_client()
-        return self._current_client
+        old_client: httpx.Client | None = None
+        with self._client_lock:
+            client = self._current_client
+            if client is None or getattr(client, "is_closed", False):
+                old_client = self._replace_client_locked()
+                client = self._current_client
+        self._close_client(old_client)
+        assert client is not None
+        return client
 
     @contextmanager
     def _using_client(self) -> Generator[httpx.Client, None, None]:
@@ -165,10 +195,17 @@ class BaseAPI:
         心跳线程通过 _recreate_client_if_safe() 检查此计数，仅在无活动请求时
         才重建客户端。这样流式翻译持续超过多个心跳周期也不会被中断。
         """
+        old_client: httpx.Client | None = None
         with self._client_lock:
+            client = self._current_client
+            if client is None or getattr(client, "is_closed", False):
+                old_client = self._replace_client_locked()
+                client = self._current_client
             self._active_requests += 1
+        self._close_client(old_client)
         try:
-            yield self._get_client()
+            assert client is not None
+            yield client
         finally:
             with self._client_lock:
                 if self._active_requests > 0:
@@ -185,8 +222,8 @@ class BaseAPI:
             if self._active_requests > 0:
                 logger.debug("心跳检测到 %d 个活动请求，跳过客户端重建", self._active_requests)
                 return
-            # 保持锁直到替换完成，避免检查后有新请求拿到即将关闭的客户端。
-            self._recreate_client()
+            old_client = self._replace_client_locked()
+        self._close_client(old_client)
 
     def cancel_requests(self):
         """取消所有进行中的请求。
@@ -194,14 +231,11 @@ class BaseAPI:
         R2-BUG-008：关闭客户端后立即置空，确保下次 _get_client() 会重建。
         旧实现只关闭不置空，_get_client() 仅判断 None，导致复用已关闭客户端。
         """
-        self._cancel_event.set()
-        client = self._current_client
-        if client is not None:
-            try:
-                client.close()
-            except Exception as exc:
-                logger.warning("关闭 HTTP 客户端失败: %s", exc)
+        with self._client_lock:
+            self._cancel_event.set()
+            client = self._current_client
             self._current_client = None
+        self._close_client(client)
 
     def reset_cancel(self):
         """BUG-005：只重置取消标记，不承担客户端重建/丢弃职责。
@@ -212,21 +246,11 @@ class BaseAPI:
         self._cancel_event.clear()
 
     def close(self):
-        """BUG-005：释放 HTTP 客户端和批处理线程池，幂等可安全多次调用。"""
-        # 关闭 HTTP 客户端
-        if self._current_client:
-            try:
-                self._current_client.close()
-            except Exception as exc:
-                logger.warning("关闭 HTTP 客户端失败: %s", exc)
+        """BUG-005：释放 HTTP 客户端，幂等可安全多次调用。"""
+        with self._client_lock:
+            client = self._current_client
             self._current_client = None
-        # 关闭批处理线程池
-        if self.batch_processor:
-            try:
-                self.batch_processor.close()
-            except Exception as exc:
-                logger.warning("关闭批处理器失败: %s", exc)
-            self.batch_processor = None
+        self._close_client(client)
 
     # ── 连接测试 ────────────────────────────────────────
 
@@ -346,7 +370,12 @@ class BaseAPI:
                         if result.get("choices"):
                             return result["choices"][0]["message"]["content"]
                     else:
-                        logger.error("API请求失败: %s - %s", resp.status_code, resp.text)
+                        # P1-5：响应正文走有界摘要，避免超长 JSON 占满日志
+                        logger.error(
+                            "API请求失败: %s - %s",
+                            resp.status_code,
+                            _summarize_response_body(resp.text),
+                        )
                 if attempt == 0:
                     self._recreate_client_if_safe()
             except httpx.ConnectError:
@@ -475,7 +504,8 @@ class BaseAPI:
                                 continue
                             if rate_limited:
                                 self._record_rate_limit()
-                            body = response.text[:500]
+                            # P1-5：响应正文走有界摘要 + 脱敏，用于异常消息
+                            body = _summarize_response_body(response.text)
                             # 队列并发优化（§8.2）：把 Retry-After 透传给上层
                             # 共享 ProviderLimiter，使其在 Provider 范围统一 cooldown。
                             retry_after_seconds: float | None = None
@@ -598,29 +628,18 @@ class BaseAPI:
                     if result.get("choices"):
                         return result["choices"][0]["message"]["content"]
                 else:
-                    logger.error("视觉查询失败: %s - %s", resp.status_code, resp.text)
+                    # P1-5：响应正文走有界摘要
+                    logger.error(
+                        "视觉查询失败: %s - %s",
+                        resp.status_code,
+                        _summarize_response_body(resp.text),
+                    )
         except Exception as e:
             if not self._cancel_event.is_set():
                 logger.error("视觉查询请求失败: %s", e)
         return None
 
-    # ── 缓存 / 批处理辅助 ──────────────────────────────
-
-    def _batch_translate_handler(
-        self, texts: List[str], contexts: List[Dict[str, Any]]
-    ) -> List[str | None]:
-        results = []
-        for text, context in zip(texts, contexts, strict=False):
-            if self.cache:
-                cached = self.cache.get(text, context)
-                if cached:
-                    results.append(cached)
-                    continue
-            result = self._direct_translate(text, context)
-            if result and self.cache:
-                self.cache.set(text, result, context)
-            results.append(result)
-        return results
+    # ── 缓存辅助 ──────────────────────────────────────
 
     def translate_with_cache(self, text: str, context: Dict[str, Any] = None) -> str | None:
         if self.cache:
@@ -631,48 +650,6 @@ class BaseAPI:
         if result and self.cache:
             self.cache.set(text, result, context)
         return result
-
-    def _ensure_batch_processor(self):
-        """PERF §10.3：线程安全地延迟创建批处理器。
-
-        首次 ``translate_batch()`` 调用时构造；若 ``enable_batch`` 为 False
-        或批处理器已存在，则直接返回。
-        """
-        if self.batch_processor is not None or self._batch_config is None:
-            return
-        with self._batch_lock:
-            if self.batch_processor is not None:
-                return
-            self.batch_processor = get_batch_processor(**self._batch_config)
-            self.batch_processor.set_api_handler(self._batch_translate_handler)
-
-    def translate_batch(
-        self, texts: List[str], contexts: List[Dict[str, Any]] = None
-    ) -> List[str | None]:
-        # PERF §10.3：首次调用时延迟创建批处理器
-        if self.batch_processor is None and self._batch_config is not None:
-            self._ensure_batch_processor()
-        if not self.batch_processor:
-            return [
-                self.translate_with_cache(
-                    t, contexts[i] if contexts and i < len(contexts) else None
-                )
-                for i, t in enumerate(texts)
-            ]
-        futures = []
-        for i, text in enumerate(texts):
-            ctx = contexts[i] if contexts and i < len(contexts) else {}
-            futures.append(self.batch_processor.submit_request(text, ctx))
-        # PERF-010：立即刷新尾批，避免等待 max_wait_time 造成不必要延迟
-        self.batch_processor.flush()
-        results = []
-        for f in futures:
-            try:
-                results.append(f.result(timeout=60))
-            except Exception as e:
-                logger.error("批处理翻译失败: %s", e)
-                results.append(None)
-        return results
 
     def translate_stream_enhanced(
         self,
@@ -727,9 +704,6 @@ class BaseAPI:
     def get_cache_stats(self) -> Dict[str, Any]:
         return self.cache.get_stats() if self.cache else {}
 
-    def get_batch_stats(self) -> Dict[str, Any]:
-        return self.batch_processor.get_stats() if self.batch_processor else {}
-
     def clear_cache(self):
         if self.cache:
             self.cache.clear_all()
@@ -741,14 +715,11 @@ class BaseAPI:
     def get_enhanced_stats(self) -> Dict[str, Any]:
         stats = {
             "cache_enabled": self.enable_cache,
-            "batch_enabled": self.enable_batch,
             "stream_enabled": self.enable_stream,
             "active_streams": len(self.stream_callbacks),
         }
         if self.cache:
             stats["cache_stats"] = self.get_cache_stats()
-        if self.batch_processor:
-            stats["batch_stats"] = self.get_batch_stats()
         stats["performance"] = self.get_performance_metrics()
         return stats
 

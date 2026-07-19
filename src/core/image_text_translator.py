@@ -8,6 +8,7 @@
 3. 导出EPUB时优先使用翻译后的新图片，没有则保留原图
 """
 
+import base64
 import datetime
 import json
 import logging
@@ -15,7 +16,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-from ..infrastructure.image_asset_store import load_image_base64
+from ..infrastructure.image_asset_store import load_image_bytes
 from ..utils.file_handler import write_json_atomic
 
 logger = logging.getLogger(__name__)
@@ -166,22 +167,22 @@ class ImageTextTranslator:
             if progress_callback:
                 progress_callback(idx, total, f"[检测] {image_path}")
 
-            # PERF-004：按需从资源文件编码，旧 Base64 格式仍可兼容读取。
-            b64_data = load_image_base64(mapping_path, image_info)
+            # PERF-6d：内部管道统一传 bytes，避免冗余 base64 编解码循环。
+            raw_bytes = load_image_bytes(mapping_path, image_info)
             mime_type = image_info.get("mime_type", "image/png")
 
-            if b64_data.startswith("data:"):
-                b64_data = b64_data.split(",", 1)[1] if "," in b64_data else b64_data
-
-            if not b64_data:
+            if not raw_bytes:
                 continue
 
-            from .image_utils import convert_to_png
+            from .image_utils import convert_to_png_bytes
 
-            converted_b64, converted_mime = convert_to_png(b64_data, mime_type)
-            if converted_b64 is None:
+            converted_bytes, converted_mime = convert_to_png_bytes(raw_bytes, mime_type)
+            if converted_bytes is None:
                 print(f"[图片检测] 跳过不支持的格式: {image_path} ({mime_type})")
                 continue
+
+            # PERF-6d：只在 HTTP JSON 边界编码一次 base64
+            converted_b64 = base64.b64encode(converted_bytes).decode("ascii")
 
             try:
                 detection = self.detect_text_in_image(converted_b64, converted_mime)

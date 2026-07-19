@@ -154,7 +154,7 @@ class ProjectRepository(Protocol):
         file_type: str,
         mapping_dir: str,
         original_lines: Sequence[str],
-        model_snapshot: dict | None = None,
+        model_snapshot: dict[str, object] | None = None,
     ) -> TranslationProject:
         """创建新翻译项目（同 ID 已存在则返回已有项目）
 

@@ -7,10 +7,18 @@
 import threading
 import tkinter as tk
 import uuid
+from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, List, Tuple
 
+from ..application.error_handling import (
+    ActionableError,
+    RetryPolicy,
+    classify_error,
+    log_classified_error,
+)
+from ..application.export_job import ExportJob, ExportProgress, ExportResult, TextExportJob
 from ..application.translation_document import TranslationDocument
 from ..application.translation_events import (
     TranslationEventKind,
@@ -18,6 +26,11 @@ from ..application.translation_events import (
 )
 from ..core.translation_result import BatchTranslationResult, TranslationStatus
 from ..utils.logger import get_logger
+from .export_helpers import (
+    build_default_epub_filename,
+    load_image_text_translations,
+    load_image_translation_result,
+)
 from .tk_event_pump import TkTranslationEventPump
 from .translation_event_mailbox import TranslationEventMailbox
 from .translation_table_adapter import TranslationTableAdapter
@@ -61,6 +74,11 @@ class TranslationController:
         get_mapping_dir: Callable,
         document: TranslationDocument | None = None,
         table_adapter: TranslationTableAdapter | None = None,
+        get_target_path: Callable[[], "Path | None"] | None = None,
+        update_target_path: Callable[[Path], None] | None = None,
+        on_save_success: Callable[[], None] | None = None,
+        preflight_callback: Callable[[str], bool] | None = None,
+        on_run_terminal: Callable[[BatchTranslationResult, str], None] | None = None,
     ):
         self.root = root
         self.config_manager = config_manager
@@ -83,6 +101,15 @@ class TranslationController:
         # 渲染热路径通过适配器批量写入，避免 get_children() 和逐行 item()。
         self._document = document
         self._table_adapter = table_adapter
+        # P0-3：保存语义修复所需回调。
+        # - get_target_path：读取当前 session 的 target_path；None 表示无目标。
+        # - update_target_path：Save As 成功后将新目标写回 session。
+        # - on_save_success：成功保存后清除 MainWindow 的 dirty 状态。
+        self._get_target_path = get_target_path or (lambda: None)
+        self._update_target_path = update_target_path or (lambda _path: None)
+        self._on_save_success = on_save_success or (lambda: None)
+        self._preflight_callback = preflight_callback
+        self._on_run_terminal = on_run_terminal or (lambda _result, _mode: None)
 
         # Translation state
         self.is_translating = False
@@ -94,6 +121,7 @@ class TranslationController:
         # BUG-004：自动查漏轮次计数与失败索引记录
         self._missing_check_rounds = 0
         self._last_missing_failed_indices = []
+        self._missing_retry_policy = RetryPolicy(max_attempts=MAX_MISSING_CHECK_ROUNDS)
 
         # Continuation mode flags
         self._continuing_mode = False
@@ -124,6 +152,17 @@ class TranslationController:
         self._pending_results: dict[str, BatchTranslationResult] = {}
         self._pending_errors: dict[str, str] = {}
         self._results_lock = threading.Lock()
+        # Retired run IDs prevent late worker callbacks from leaking pending
+        # results after a document replacement or window close.
+        self._retired_run_ids: deque[str] = deque(maxlen=64)
+        # P0-2：流式预览仅写入 Treeview，不写入 TranslationDocument。
+        # 此集合记录当前已有未提交预览的行索引，供终态取消/失败时回退。
+        # BATCH_COMPLETED 提交后会从此集合移除对应行。
+        self._streaming_preview_rows: set[int] = set()
+        self._export_job: ExportJob | TextExportJob | None = None
+        self._export_poll_after_id: str | None = None
+        self._export_kind: str | None = None
+        self._export_success_callback: Callable[[], None] | None = None
 
     def close(self):
         """关闭事件泵并使当前 run_id 失效。
@@ -131,8 +170,18 @@ class TranslationController:
         窗口关闭时必须调用，避免残留 after 回调和迟到事件污染。
         """
         if self._current_run_id is not None:
-            self._mailbox.discard_run(self._current_run_id)
+            self._retire_run(self._current_run_id)
             self._current_run_id = None
+        # P0-2：关闭时清空预览行集合，避免残留状态影响下一次窗口生命周期。
+        self._streaming_preview_rows.clear()
+        if self._export_job is not None:
+            self._export_job.cancel()
+        if self._export_poll_after_id is not None:
+            try:
+                self.root.after_cancel(self._export_poll_after_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._export_poll_after_id = None
         self._event_pump.close()
 
     def invalidate_session(self):
@@ -140,11 +189,49 @@ class TranslationController:
 
         导入新文件、粘贴新内容或替换文档时调用此方法，
         确保旧翻译任务的迟到事件不会写入新文档的行索引。
+
+        P0-2：同时清空未提交的流式预览行集合——预览只属于旧会话，
+        新会话的 Treeview 已重置，不应继续追踪旧预览。
         """
         if self._current_run_id is not None:
-            self._mailbox.discard_run(self._current_run_id)
+            self._retire_run(self._current_run_id)
             self._current_run_id = None
             self._current_mode = None
+        self._streaming_preview_rows.clear()
+
+    def cancel_for_session_replacement(self) -> bool:
+        """Cancel the active run and make the controller immediately reusable.
+
+        The worker may emit a terminal callback later, but its run ID is
+        retired before the session is replaced so it cannot alter the new
+        document or leave ``is_translating`` stuck.
+        """
+        if not self.is_translating:
+            return True
+
+        try:
+            self.translator.call_if_initialized("stop")
+        except Exception as exc:
+            logger.warning("切换文档时停止翻译失败: %s", exc)
+            self.status_updater("无法停止当前翻译，请稍后重试")
+            return False
+
+        run_id = self._current_run_id
+        if run_id is not None:
+            self._retire_run(run_id)
+        self._current_run_id = None
+        self._current_mode = None
+        self.is_translating = False
+        self._continue_missing_indices = []
+        self._missing_translation_indices = []
+        self._selected_translation_data = []
+        self._revert_streaming_preview()
+        self.translate_btn.config(state=tk.NORMAL)
+        self.continue_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_updater("已停止当前翻译，正在切换文档")
+        self.schedule_save(delay_ms=0)
+        return True
 
     def _new_run_id(self, mode: str) -> str:
         """生成新 run_id，丢弃旧任务的事件。
@@ -154,13 +241,15 @@ class TranslationController:
         """
         run_id = uuid.uuid4().hex[:12]
         if self._current_run_id is not None:
-            self._mailbox.discard_run(self._current_run_id)
+            self._retire_run(self._current_run_id)
         self._current_run_id = run_id
         self._current_mode = mode
         return run_id
 
     def start_translation(self):
         """开始翻译（完全重构：分批翻译机制）"""
+        if not self._can_start_translation():
+            return
         # UXF-001：默认只处理缺失译文，绝不静默清空已有译文。
         # 覆盖已有结果应由明确的“重新翻译”操作完成。
         source_lines, target_lines = self.get_table_data()
@@ -171,6 +260,8 @@ class TranslationController:
         if not self.config_manager.is_api_configured():
             messagebox.showwarning("配置警告", "请先配置API设置")
             self.open_settings()
+            return
+        if not self._confirm_preflight("full"):
             return
 
         # 更新界面状态
@@ -218,6 +309,8 @@ class TranslationController:
         2. 只提取缺失行的原文，记录其原始索引
         3. 回调通过索引映射写回，不覆盖已有译文
         """
+        if not self._can_start_translation():
+            return
         # 获取原文和译文
         source_lines, target_lines = self.get_table_data()
 
@@ -247,6 +340,8 @@ class TranslationController:
         if not self.config_manager.is_api_configured():
             messagebox.showwarning("配置警告", "请先配置API设置")
             self.open_settings()
+            return
+        if not self._confirm_preflight("continue"):
             return
 
         # 更新界面状态（不清空译文）
@@ -282,16 +377,19 @@ class TranslationController:
         if self.is_translating:
             # 立即停止翻译并取消API请求
             self.translator.stop()
-            self.is_translating = False
 
             # ✅ 修复3：不删除未翻译的行，只清空未翻译部分的译文
             # 不做任何删除操作，保留所有原文和已翻译的译文
 
+            # P0-2：立即回退未提交的流式预览，避免用户停止后仍看到半成品。
+            # 已通过 BATCH_COMPLETED 提交的行不受影响，保留为最终译文。
+            self._revert_streaming_preview()
+
             # 更新UI状态
-            self.translate_btn.config(state=tk.NORMAL)
-            self.continue_btn.config(state=tk.NORMAL)
+            self.translate_btn.config(state=tk.DISABLED)
+            self.continue_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.DISABLED)
-            self.status_updater("翻译已停止，已翻译内容已保留")
+            self.status_updater("正在停止翻译，已完成内容会保留")
 
             # 重置进度条为当前实际进度
             # PERF §7.5 D2：从文档模型读取译文状态，不反向遍历 Treeview。
@@ -337,6 +435,9 @@ class TranslationController:
         3. 单独翻译这些行
         4. 将翻译结果写回对应的译文栏
         """
+        if not self._can_start_translation():
+            return
+
         # 获取选中的行
         selection = self.translation_table.selection()
         if not selection:
@@ -347,6 +448,8 @@ class TranslationController:
         if not self.config_manager.is_api_configured():
             messagebox.showwarning("配置警告", "请先配置API设置")
             self.open_settings()
+            return
+        if not self._confirm_preflight("selected"):
             return
 
         # 提取选中行的原文和位置信息
@@ -435,7 +538,7 @@ class TranslationController:
         - ``streaming=True`` → ``STREAM`` 事件（邮箱按批次合并最新快照）
         - ``streaming=False`` → ``BATCH_COMPLETED`` 事件（保序、不丢弃）
         """
-        if run_id is None or not batch_data:
+        if run_id is None or not batch_data or self._is_retired_run(run_id):
             return
 
         is_streaming = bool(batch_data.get("streaming", False))
@@ -478,6 +581,8 @@ class TranslationController:
         if run_id is None:
             return
         with self._results_lock:
+            if run_id in getattr(self, "_retired_run_ids", ()):
+                return
             self._pending_results[run_id] = result
 
         if result.is_cancelled:
@@ -508,6 +613,9 @@ class TranslationController:
         """
         if run_id is None:
             return
+        with self._results_lock:
+            if run_id in getattr(self, "_retired_run_ids", ()):
+                return
         event = TranslationProgressEvent(
             run_id=run_id,
             kind=TranslationEventKind.RUN_FAILED,
@@ -578,20 +686,28 @@ class TranslationController:
                     updates[row_index] = line.strip()
                     last_row_index = row_index
 
-            # PERF §7.4：先更新模型，再批量更新视图。
-            if self._document:
-                for row_index, value in updates.items():
-                    self._document.update_target(row_index, value)
+            # P0-2：流式预览只写入 Treeview，不写入 TranslationDocument。
+            # 业务模型只在 BATCH_COMPLETED 时提交，避免预览值与最终值相同时
+            # update_target() 返回未变化而导致 dirty/save 被跳过。
+            # 取消/失败终态由 _revert_streaming_preview 回退未提交预览。
             if self._table_adapter:
                 self._table_adapter.apply_streaming_preview(updates)
                 # PERF-002：只滚动到最后一行，不逐行滚动
-                if last_row_index >= 0 and self._should_follow_stream(batch_data):
+                if (
+                    last_row_index in updates
+                    and updates.get(last_row_index) is not None
+                    and self._should_follow_stream(batch_data)
+                ):
                     self._table_adapter.see(last_row_index)
             else:
-                # 回退路径：无适配器时直接操作 Treeview
-                if last_row_index >= 0 and self._should_follow_stream(batch_data):
+                # 回退路径：无适配器时只滚动定位
+                if last_row_index in updates and self._should_follow_stream(batch_data):
                     item = self.translation_table.get_children()[last_row_index]
                     self.translation_table.see(item)
+            # 记录未提交预览的行，供终态取消/失败时回退。
+            # 排除人工编辑保护过的行（apply_streaming_preview 不会真正覆盖它们，
+            # 但 Treeview 已显示预览值；为简化语义，仍追踪这些行，回退时按文档值还原）。
+            self._streaming_preview_rows.update(updates.keys())
         else:
             # 批次完成模式：写入最终结果
             translated_lines = batch_data.get("translated_lines", [])
@@ -607,14 +723,17 @@ class TranslationController:
                         updates[row_index] = new_val
 
             # PERF §7.4：先更新模型，再批量更新视图。
-            if self._document:
-                for row_index, value in updates.items():
-                    self._document.update_target(row_index, value)
+            # P0-4：只把 update_target 返回 True 的行交给适配器渲染。
+            accepted_updates = self._apply_to_document(updates)
             if self._table_adapter:
                 # skip_empty=True 默认行为：空值不覆盖已有译文
-                self._table_adapter.apply_target_updates(updates)
-            # 触发保存
-            self.schedule_save()
+                self._table_adapter.apply_target_updates(accepted_updates)
+            # 只有模型确实发生变化时才标记 dirty。旧 generation 被人工编辑保护
+            # 拒绝时，不应产生无意义的保存任务或关闭提示。
+            if accepted_updates:
+                self.schedule_save()
+            # P0-2：已提交到文档的行不再是未提交预览，从追踪集合移除。
+            self._streaming_preview_rows.difference_update(accepted_updates.keys())
 
     # ── 渲染分派器：事件泵 → 模式对应的渲染/状态处理 ──────────
     # 以下方法只在 Tk 主线程被事件泵调用。
@@ -638,6 +757,52 @@ class TranslationController:
             self._dispatch_terminal_event(event, is_terminal_run=False, is_failed=True)
         elif event.kind is TranslationEventKind.RUN_CANCELLED:
             self._dispatch_terminal_event(event, is_terminal_run=True, is_cancelled=True)
+
+    def _apply_to_document(self, updates: dict[int, str]) -> dict[int, str]:
+        """P0-4：写入 document，只返回实际被接受的行。
+
+        ``TranslationDocument.update_target`` 在行被人工编辑标记保护时
+        返回 ``False``。这些行已被用户校对，机器结果（旧 generation）
+        不得覆盖视图，因此表格适配器只应渲染被接受的子集。
+
+        无 document 时所有更新都视为可渲染，保留旧行为。
+        """
+        if not updates:
+            return {}
+        accepted: dict[int, str] = {}
+        if self._document:
+            for row_index, value in updates.items():
+                if self._document.update_target(row_index, value):
+                    accepted[row_index] = value
+        else:
+            accepted = dict(updates)
+        return accepted
+
+    def _revert_streaming_preview(self) -> None:
+        """P0-2：回退所有未提交的流式预览到文档值。
+
+        在 ``RUN_CANCELLED`` / ``RUN_FAILED`` / ``RUN_COMPLETED`` 终态调用。
+        将 ``_streaming_preview_rows`` 中记录的行回退为文档中的真实译文，
+        避免半成品预览长期滞留 Treeview 而文档 dirty/save 语义不感知。
+
+        - 若无 document 或无 table_adapter：仅清空追踪集合，Treeview 状态
+          由调用方在后续操作中自然覆盖。
+        - 若某行索引超出文档范围（极端边界）：跳过该行，不抛异常。
+        """
+        if not self._streaming_preview_rows:
+            return
+        preview_rows = self._streaming_preview_rows
+        self._streaming_preview_rows = set()
+        if not self._document or not self._table_adapter:
+            return
+        revert: dict[int, str] = {}
+        doc = self._document
+        for row_index in preview_rows:
+            if 0 <= row_index < doc.row_count:
+                revert[row_index] = doc.row(row_index).target
+        if revert:
+            # apply_streaming_preview 不跳过空值，可正确回退到空文档值
+            self._table_adapter.apply_streaming_preview(revert)
 
     def _dispatch_stream_event(self, event: TranslationProgressEvent) -> None:
         """流式事件：转回 ``(progress, data)`` 调用模式对应的渲染方法。"""
@@ -682,25 +847,80 @@ class TranslationController:
         is_cancelled: bool = False,
     ) -> None:
         """终结事件：取回结果并调用模式对应的处理方法。"""
-        result = self._take_pending_result(event.run_id)
-        if result is None:
-            # worker 异常时只发布了 RUN_FAILED 事件，没有结构化结果
-            if is_failed:
-                self._handle_translation_failed(event.message or "未知错误")
-            return
+        try:
+            result = self._take_pending_result(event.run_id)
+            if result is None:
+                # worker 异常时只发布了 RUN_FAILED 事件，没有结构化结果
+                if is_failed:
+                    self._handle_translation_failed(event.message or "未知错误")
+                return
 
-        mode = self._current_mode
-        if mode == "selected":
-            self._handle_selected_translation_complete(result)
-        elif mode == "missing":
-            self._handle_missing_translation_complete(result)
-        else:
-            self._handle_full_translation_complete(result)
+            mode = self._current_mode
+            self._on_run_terminal(result, mode or "full")
+            if mode == "selected":
+                self._handle_selected_translation_complete(result)
+            elif mode == "missing":
+                self._handle_missing_translation_complete(result)
+            else:
+                self._handle_full_translation_complete(result)
+        finally:
+            # A RUN terminal is the final reducer event for this run.  Retire
+            # every residual stream/pending value before a later run starts.
+            if event.run_id == self._current_run_id:
+                self._retire_run(event.run_id)
+                self._current_run_id = None
+                self._current_mode = None
+
+    def _can_start_translation(self) -> bool:
+        """Reject duplicate commands while a run is active or cancelling."""
+        if not self.is_translating:
+            return True
+        self.status_updater("翻译任务正在运行或停止中，请等待当前任务结束")
+        return False
+
+    def _confirm_preflight(self, action: str) -> bool:
+        callback = getattr(self, "_preflight_callback", None)
+        if callback is None:
+            return True
+        try:
+            return bool(callback(action))
+        except Exception as exc:
+            logger.exception("翻译预检失败")
+            messagebox.showerror("翻译预检失败", f"无法完成翻译预检：{exc}")
+            return False
 
     def _take_pending_result(self, run_id: str) -> BatchTranslationResult | None:
         """从暂存区取回并移除指定 ``run_id`` 的结果。"""
         with self._results_lock:
             return self._pending_results.pop(run_id, None)
+
+    def _retire_run(self, run_id: str) -> None:
+        """Discard queued events and pending data for a run that cannot render."""
+        self._mailbox.discard_run(run_id)
+        lock = getattr(self, "_results_lock", None)
+        if lock is None:
+            self._pending_results = getattr(self, "_pending_results", {})
+            self._pending_errors = getattr(self, "_pending_errors", {})
+            self._pending_results.pop(run_id, None)
+            self._pending_errors.pop(run_id, None)
+            retired_run_ids = getattr(self, "_retired_run_ids", None)
+            if retired_run_ids is None:
+                retired_run_ids = deque(maxlen=64)
+                self._retired_run_ids = retired_run_ids
+            retired_run_ids.append(run_id)
+            return
+        with lock:
+            self._pending_results.pop(run_id, None)
+            self._pending_errors.pop(run_id, None)
+            retired_run_ids = getattr(self, "_retired_run_ids", None)
+            if retired_run_ids is None:
+                retired_run_ids = deque(maxlen=64)
+                self._retired_run_ids = retired_run_ids
+            retired_run_ids.append(run_id)
+
+    def _is_retired_run(self, run_id: str) -> bool:
+        with self._results_lock:
+            return run_id in getattr(self, "_retired_run_ids", ())
 
     def _handle_full_translation_complete(self, result: BatchTranslationResult):
         """全文翻译完成：在主线程更新 UI（原 ``_on_translation_complete.update_ui``）。"""
@@ -713,6 +933,9 @@ class TranslationController:
         self._continuing_first_insert = False
         # R2-BUG-014：清理续翻缺失行索引
         self._continue_missing_indices = []
+        # P0-2：回退未提交的流式预览到文档值，避免半成品滞留 Treeview。
+        # 已通过 BATCH_COMPLETED 提交的行不受影响。
+        self._revert_streaming_preview()
 
         if result.is_cancelled:
             # 用户取消：不显示完成，不触发查漏
@@ -721,9 +944,7 @@ class TranslationController:
 
         if result.is_failed:
             # 全部失败：显示错误，不触发查漏
-            self.status_updater("翻译失败")
-            error_detail = result.error_message or "未知错误"
-            messagebox.showerror("翻译错误", f"翻译失败：{error_detail}")
+            self._handle_translation_failed(result.error_message or "未知错误")
             return
 
         # 成功或部分成功
@@ -734,6 +955,10 @@ class TranslationController:
             self.status_updater(f"翻译部分完成（{failed_count} 行失败）")
             # 记录失败索引用于查漏
             self._last_missing_failed_indices = list(result.failed_indices)
+            actionable = self._classify_translation_error(result.error_message)
+            if actionable is not None and not actionable.retryable:
+                self._show_actionable_error(actionable)
+                return
             messagebox.showwarning(
                 "翻译部分完成", f"部分内容翻译失败（{failed_count} 行）。\n将尝试补译失败行。"
             )
@@ -746,13 +971,54 @@ class TranslationController:
         self.root.after(500, self._start_missing_translation_check)
 
     def _handle_translation_failed(self, error_msg: str):
-        """翻译失败（worker 异常）：恢复 UI 状态并显示错误。"""
+        """Restore the UI and present a safe, actionable error summary."""
         self.is_translating = False
         self.translate_btn.config(state=tk.NORMAL)
         self.continue_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.status_updater("翻译失败")
-        messagebox.showerror("翻译错误", f"翻译过程中出现错误: {error_msg}")
+        # P0-2：worker 异常时回退未提交的流式预览
+        self._revert_streaming_preview()
+        actionable = self._classify_translation_error(error_msg) or classify_error(
+            RuntimeError("未知翻译错误")
+        )
+        self.status_updater(f"翻译失败：{actionable.safe_message}")
+        self._show_actionable_error(actionable)
+
+    @staticmethod
+    def _classify_translation_error(error_message: str | None) -> ActionableError | None:
+        """Classify an opaque worker message without exposing it directly to Tk."""
+        if not error_message:
+            return None
+        return classify_error(RuntimeError(error_message))
+
+    @staticmethod
+    def _format_actionable_error(actionable: ActionableError) -> str:
+        return (
+            f"{actionable.safe_message}\n\n"
+            f"建议操作：{actionable.recommended_action}\n"
+            f"诊断编号：{actionable.correlation_id}"
+        )
+
+    def _show_actionable_error(self, actionable: ActionableError) -> None:
+        """Log diagnostic detail separately and show only the safe UI summary."""
+        error = RuntimeError(actionable.safe_message)
+        log_classified_error(error, actionable, context={"surface": "main_translation"})
+        messagebox.showerror("翻译错误", self._format_actionable_error(actionable))
+
+    def _schedule_missing_check_retry(self, actionable: ActionableError) -> None:
+        """Retry only classified transient errors, with bounded jittered backoff."""
+        if not actionable.retryable:
+            self.status_updater(f"翻译查漏已停止：{actionable.safe_message}")
+            self._show_actionable_error(actionable)
+            self._missing_check_rounds = 0
+            return
+        attempts_completed = max(0, self._missing_check_rounds - 1)
+        if attempts_completed >= self._missing_retry_policy.max_attempts:
+            self.status_updater("已达到自动补译上限，剩余空行可手动重试")
+            return
+        delay_ms = int(self._missing_retry_policy.delay_for(attempts_completed) * 1000)
+        self.status_updater(f"翻译查漏暂时失败，将在约 {delay_ms / 1000:.1f} 秒后重试")
+        self.root.after(delay_ms, self._start_missing_translation_check)
 
     def _render_selected_progress(self, progress, batch_data):
         """渲染选中行翻译进度（在主线程执行）。
@@ -794,15 +1060,16 @@ class TranslationController:
                     if abs_row >= 0:
                         updates[abs_row] = line.strip()
                     last_item = item
-            # PERF §7.4：先更新模型，再批量更新视图。
-            if self._document:
-                for row_index, value in updates.items():
-                    self._document.update_target(row_index, value)
+            # P0-2：流式预览只写入 Treeview，不写入 TranslationDocument。
+            # 业务模型只在 BATCH_COMPLETED 时提交，避免预览值与最终值相同时
+            # update_target() 返回未变化而导致 dirty/save 被跳过。
             if self._table_adapter:
                 self._table_adapter.apply_streaming_preview(updates)
-            # PERF-002：只滚动到最后一行
-            if last_item is not None and self._should_follow_stream(batch_data):
+            # PERF-002：只滚动到最后一行（仅当至少有一行被接受时）
+            if updates and last_item is not None and self._should_follow_stream(batch_data):
                 self.translation_table.see(last_item)
+            # P0-2：记录未提交预览的行
+            self._streaming_preview_rows.update(updates.keys())
         else:
             translated_lines = batch_data.get("translated_lines", [])
 
@@ -819,13 +1086,14 @@ class TranslationController:
                         if new_val:
                             updates[abs_row] = new_val
             # PERF §7.4：先更新模型，再批量更新视图。
-            if self._document:
-                for row_index, value in updates.items():
-                    self._document.update_target(row_index, value)
+            # P0-4：只把 update_target 返回 True 的行交给适配器渲染。
+            accepted_updates = self._apply_to_document(updates)
             if self._table_adapter:
-                self._table_adapter.apply_target_updates(updates)
-
-            self.schedule_save()
+                self._table_adapter.apply_target_updates(accepted_updates)
+            if accepted_updates:
+                self.schedule_save()
+            # P0-2：已提交到文档的行不再是未提交预览
+            self._streaming_preview_rows.difference_update(accepted_updates.keys())
 
     def _handle_selected_translation_complete(self, result: BatchTranslationResult):
         """选中行翻译完成：在主线程更新 UI（原 ``_on_selected_translation_complete``）。"""
@@ -834,6 +1102,8 @@ class TranslationController:
         self.translate_btn.config(state=tk.NORMAL)
         self.continue_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
+        # P0-2：回退未提交的流式预览到文档值
+        self._revert_streaming_preview()
 
         # 获取翻译的行数
         selected_count = len(getattr(self, "_selected_translation_data", []))
@@ -842,8 +1112,9 @@ class TranslationController:
         if hasattr(self, "_selected_translation_data"):
             delattr(self, "_selected_translation_data")
 
-        # 立即保存
-        self.schedule_save(delay_ms=0)
+            # 立即保存
+        if result.is_success:
+            self.schedule_save(delay_ms=0)
 
         if result.is_cancelled:
             self.status_updater("已停止选中行翻译")
@@ -940,28 +1211,35 @@ class TranslationController:
         self.stop_btn.config(state=tk.NORMAL)
 
         # PERF：在主线程生成 run_id 并丢弃旧任务事件。
-        self._new_run_id("missing")
+        # P0-3：捕获 run_id 并传入工作线程，避免回调签名不匹配而崩溃。
+        run_id = self._new_run_id("missing")
 
         # 在新线程中执行翻译
         combined_source = "\n".join(empty_source_lines)
         translation_thread = threading.Thread(
-            target=self._translate_missing_worker, args=(combined_source,)
+            target=self._translate_missing_worker, args=(combined_source, run_id)
         )
         translation_thread.daemon = True
         translation_thread.start()
 
-    def _translate_missing_worker(self, content):
-        """翻译查漏工作线程。只调用 ``mailbox.publish()``。"""
+    def _translate_missing_worker(self, content, run_id):
+        """翻译查漏工作线程。只调用 ``mailbox.publish()``。
+
+        P0-3：``run_id`` 由主线程在 ``_start_missing_translation_check``
+        中生成并通过参数传入，工作线程使用闭包显式绑定，不再读取
+        可变的 ``self._current_run_id``。
+        与全文、选中行 worker 保持同一模式，避免签名再次漂移。
+        """
         try:
             self.translator.translate_fast_mode(
                 content,
-                self._publish_progress_event,
-                self._publish_terminal_event,
+                lambda progress, data: self._publish_progress_event(progress, data, run_id),
+                lambda result: self._publish_terminal_event(result, run_id),
             )
         except Exception as exc:
             error_message = str(exc)
             logger.exception("翻译查漏失败")
-            self._publish_run_failed(error_message)
+            self._publish_run_failed(error_message, run_id)
 
     def _render_missing_progress(self, progress, batch_data):
         """渲染翻译查漏进度（在主线程执行）。
@@ -1005,18 +1283,19 @@ class TranslationController:
                     if row_index < row_count:
                         updates[row_index] = line.strip()
                         last_row_index = row_index
-            # PERF §7.4：先更新模型，再批量更新视图。
-            if self._document:
-                for row_index, value in updates.items():
-                    self._document.update_target(row_index, value)
+            # P0-2：流式预览只写入 Treeview，不写入 TranslationDocument。
+            # 业务模型只在 BATCH_COMPLETED 时提交，避免预览值与最终值相同时
+            # update_target() 返回未变化而导致 dirty/save 被跳过。
             if self._table_adapter:
                 self._table_adapter.apply_streaming_preview(updates)
-                if last_row_index >= 0 and self._should_follow_stream(batch_data):
+                if last_row_index in updates and self._should_follow_stream(batch_data):
                     self._table_adapter.see(last_row_index)
-            elif last_row_index >= 0 and self._should_follow_stream(batch_data):
+            elif last_row_index in updates and self._should_follow_stream(batch_data):
                 # 回退路径
                 item = self.translation_table.get_children()[last_row_index]
                 self.translation_table.see(item)
+            # P0-2：记录未提交预览的行
+            self._streaming_preview_rows.update(updates.keys())
         else:
             translated_lines = batch_data.get("translated_lines", [])
 
@@ -1030,13 +1309,14 @@ class TranslationController:
                         if new_val:
                             updates[row_index] = new_val
             # PERF §7.4：先更新模型，再批量更新视图。
-            if self._document:
-                for row_index, value in updates.items():
-                    self._document.update_target(row_index, value)
+            # P0-4：只把 update_target 返回 True 的行交给适配器渲染。
+            accepted_updates = self._apply_to_document(updates)
             if self._table_adapter:
-                self._table_adapter.apply_target_updates(updates)
-
-            self.schedule_save()
+                self._table_adapter.apply_target_updates(accepted_updates)
+            if accepted_updates:
+                self.schedule_save()
+            # P0-2：已提交到文档的行不再是未提交预览
+            self._streaming_preview_rows.difference_update(accepted_updates.keys())
 
     @staticmethod
     def _should_follow_stream(batch_data):
@@ -1068,6 +1348,8 @@ class TranslationController:
         self.translate_btn.config(state=tk.NORMAL)
         self.continue_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
+        # P0-2：回退未提交的流式预览到文档值
+        self._revert_streaming_preview()
 
         # 清理临时数据
         if hasattr(self, "_missing_translation_indices"):
@@ -1075,8 +1357,9 @@ class TranslationController:
         if hasattr(self, "_is_missing_check"):
             delattr(self, "_is_missing_check")
 
-        # 立即保存
-        self.schedule_save(delay_ms=0)
+        # 立即保存已接受的结果；取消/失败且没有模型变化时保持 clean。
+        if result.is_success:
+            self.schedule_save(delay_ms=0)
 
         # 取消：不继续查漏
         if result.is_cancelled:
@@ -1087,19 +1370,25 @@ class TranslationController:
         # 失败：达到上限或继续受限重试
         if result.is_failed:
             error_detail = result.error_message or "未知错误"
-            self.status_updater(f"翻译查漏失败：{error_detail}")
-            # 失败也消耗一次补译机会，由 _start_missing_translation_check 判定上限
-            self.root.after(1000, self._start_missing_translation_check)
+            actionable = self._classify_translation_error(error_detail)
+            if actionable is None:
+                actionable = classify_error(RuntimeError("未知翻译查漏错误"))
+            self._schedule_missing_check_retry(actionable)
             return
 
         # 成功或部分成功：继续检查是否还有空行
         self.root.after(1000, self._start_missing_translation_check)
 
-    def save_translation(self):
-        """保存译文。
+    def _save_translation_sync(self) -> bool:
+        """P0-3：保存译文到当前 session 的 target_path。
 
-        修复说明：确保译文与原文按行号严格对齐。
-        BUG-006：使用原子写入，失败时显示对话框（不显示成功）。
+        修复说明：
+        - 若当前 session 已有 target_path（TXT/EPUB 导入派生）：直接写入，不弹 Save As。
+        - 若无 target_path（剪贴板会话）：弹出 Save As，成功后把新路径写回 session，
+          下次 Ctrl+S 会直接写入该路径，不再每次询问。
+        - 成功后清除 MainWindow 的 dirty 状态，更新保存状态标签。
+        - EPUB 映射同步失败时记日志并提示，但译文文件已保存。
+        - BUG-006：使用原子写入，失败时显示对话框（不显示成功）。
         """
         try:
             # 从表格获取译文
@@ -1108,37 +1397,119 @@ class TranslationController:
 
             if not translated_content.strip():
                 messagebox.showwarning("保存警告", "没有可保存的译文")
-                return
+                return False
 
-            file_path = filedialog.asksaveasfilename(
-                title="保存译文",
-                defaultextension=".txt",
-                filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
-            )
+            current_target = self._get_target_path()
+            if current_target is not None:
+                # P0-3：当前 session 已有目标，直接覆盖写入。
+                file_path = str(current_target)
+                used_save_as = False
+            else:
+                # P0-3：剪贴板会话无 target_path，走 Save As 并写回 session。
+                file_path = filedialog.asksaveasfilename(
+                    title="保存译文",
+                    defaultextension=".txt",
+                    filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+                )
+                if not file_path:
+                    return False  # 用户取消
+                used_save_as = True
 
-            if file_path:
-                # BUG-006：write_file 现在使用原子写入，失败时抛出异常
-                self.file_handler.write_file(file_path, translated_content)
-                self.status_updater(f"译文已保存: {Path(file_path).name}")
+            # BUG-006：write_file 现在使用原子写入，失败时抛出异常
+            self.file_handler.write_file(file_path, translated_content)
+            self.status_updater(f"译文已保存: {Path(file_path).name}")
 
-                # 若存在EPUB映射，则同步更新映射键值对
-                current_mapping_dir = self.get_mapping_dir()
-                if current_mapping_dir:
-                    try:
-                        self.epub_processor.save_translations(
-                            str(current_mapping_dir), target_lines
-                        )
-                    except Exception as e:
-                        # BUG-006：EPUB映射同步失败需可见，但不影响已保存的txt
-                        logger.error("EPUB映射同步失败: %s", e)
-                        messagebox.showwarning(
-                            "保存警告", f"译文文件已保存，但EPUB映射同步失败：\n{str(e)}"
-                        )
+            # P0-3：Save As 产生的新目标写回 session，后续 Ctrl+S 直接覆盖。
+            if used_save_as:
+                self._update_target_path(Path(file_path))
+
+            # 若存在EPUB映射，则同步更新映射键值对
+            current_mapping_dir = self.get_mapping_dir()
+            mapping_failed = False
+            if current_mapping_dir:
+                try:
+                    self.epub_processor.save_translations(
+                        str(current_mapping_dir), target_lines
+                    )
+                except Exception as e:
+                    # BUG-006：EPUB映射同步失败需可见，但不影响已保存的txt
+                    mapping_failed = True
+                    logger.error("EPUB映射同步失败: %s", e)
+                    messagebox.showwarning(
+                        "保存警告", f"译文文件已保存，但EPUB映射同步失败：\n{str(e)}"
+                    )
+
+            # P0-3：只有译文文件和（如有的话）EPUB 映射都成功后，才清除 dirty。
+            if not mapping_failed:
+                self._on_save_success()
+                return True
+
+            return False
 
         except Exception as e:
             messagebox.showerror("保存错误", f"保存译文失败: {str(e)}")
+            return False
 
-    def export_comparison(self):
+    def save_translation(self, *, synchronous: bool = False) -> bool:
+        """Save the current translation without blocking normal Tk commands.
+
+        Session replacement and close flows pass ``synchronous=True`` because
+        they must know whether the durable write completed before proceeding.
+        Interactive saves capture a stable table snapshot in Tk and hand the
+        expensive join/write work to ``TextExportJob``.
+        """
+        if synchronous:
+            return self._save_translation_sync()
+        if self._export_is_running():
+            messagebox.showinfo("保存进行中", "已有导出或保存任务正在运行。")
+            return False
+
+        try:
+            _, target_lines = self.get_table_data()
+            target_snapshot = tuple(target_lines)
+            if not any(line.strip() for line in target_snapshot):
+                messagebox.showwarning("保存警告", "没有可保存的译文")
+                return False
+
+            current_target = self._get_target_path()
+            used_save_as = current_target is None
+            if current_target is None:
+                file_path = filedialog.asksaveasfilename(
+                    title="保存译文",
+                    defaultextension=".txt",
+                    filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+                )
+                if not file_path:
+                    return False
+                output_path = Path(file_path)
+            else:
+                output_path = Path(current_target)
+
+            mapping_dir = self.get_mapping_dir()
+
+            def save_mapping() -> None:
+                if mapping_dir:
+                    self.epub_processor.save_translations(str(mapping_dir), list(target_snapshot))
+
+            def on_success() -> None:
+                if used_save_as:
+                    self._update_target_path(output_path)
+                self._on_save_success()
+
+            self._start_text_export(
+                kind="译文保存",
+                output_path=output_path,
+                build_content=lambda: "\n".join(target_snapshot),
+                save_mapping=save_mapping if mapping_dir else None,
+                on_success=on_success,
+            )
+            return True
+        except Exception as exc:
+            logger.exception("启动译文保存失败")
+            messagebox.showerror("保存错误", f"无法开始保存译文: {exc}")
+            return False
+
+    def _export_comparison_sync(self):
         """导出对照文件"""
         try:
             source_lines, target_lines = self.get_table_data()
@@ -1165,40 +1536,80 @@ class TranslationController:
         except Exception as e:
             messagebox.showerror("导出错误", f"导出对照文件失败: {str(e)}")
 
+    def export_comparison(self) -> None:
+        """Export a comparison file from a Tk-owned snapshot in the background."""
+        if self._export_is_running():
+            messagebox.showinfo("导出进行中", "已有导出或保存任务正在运行。")
+            return
+        try:
+            source_lines, target_lines = self.get_table_data()
+            source_snapshot = tuple(source_lines)
+            target_snapshot = tuple(target_lines)
+            if not any(source_snapshot) or not any(target_snapshot):
+                messagebox.showwarning("导出警告", "原文或译文为空")
+                return
+
+            file_path = filedialog.asksaveasfilename(
+                title="导出对照文件",
+                defaultextension=".txt",
+                filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            )
+            if not file_path:
+                return
+
+            self._start_text_export(
+                kind="对照导出",
+                output_path=Path(file_path),
+                build_content=lambda: self.file_handler.create_comparison_file(
+                    "\n".join(source_snapshot), "\n".join(target_snapshot)
+                ),
+            )
+        except Exception as exc:
+            logger.exception("启动对照导出失败")
+            messagebox.showerror("导出错误", f"无法开始导出对照文件: {exc}")
+
+    def _export_is_running(self) -> bool:
+        return self._export_job is not None and self._export_job.is_running
+
+    def _start_text_export(
+        self,
+        *,
+        kind: str,
+        output_path: Path,
+        build_content: Callable[[], str],
+        save_mapping: Callable[[], None] | None = None,
+        on_success: Callable[[], None] | None = None,
+    ) -> None:
+        job = TextExportJob(
+            output_path=output_path,
+            build_content=build_content,
+            write_content=lambda path, content: self.file_handler.write_file(str(path), content),
+            save_mapping=save_mapping,
+        )
+        self._export_job = job
+        self._export_kind = kind
+        self._export_success_callback = on_success
+        job.start()
+        self.status_updater(f"{kind}已开始，可继续使用界面")
+        self._poll_export_job()
+
     def export_epub_file(self):
-        """基于mapping将译文写回并导出为EPUB文件（新增：自动命名为"原文_译文"）"""
+        """在后台将当前译文安全导出为 EPUB。"""
+        active_export = self._export_job
+        if active_export is not None and active_export.is_running:
+            if messagebox.askyesno("导出进行中", "当前保存或导出尚未完成。是否取消？"):
+                active_export.cancel()
+                self.status_updater("正在取消导出…")
+            return
         try:
             current_mapping_dir = self.get_mapping_dir()
             if not current_mapping_dir:
                 messagebox.showwarning("导出警告", "当前会话并非EPUB映射，无法导出EPUB")
                 return
 
-            # 先同步一次映射（使用当前表格内容）
             _, target_lines = self.get_table_data()
-
-            # R2-BUG-019：映射保存失败必须中止导出，或由用户明确确认使用旧映射
-            using_stale_mapping = False
-            try:
-                self.epub_processor.save_translations(str(current_mapping_dir), target_lines)
-            except Exception as e:
-                logger.error("导出前EPUB映射同步失败: %s", e)
-                confirmed = messagebox.askyesno(
-                    "映射保存失败",
-                    f"导出前映射同步失败：\n{str(e)}\n\n"
-                    "继续导出将使用旧映射中的译文，可能与当前表格内容不一致。\n"
-                    "是否仍要继续导出？",
-                )
-                if not confirmed:
-                    self.status_updater("EPUB导出已取消（映射保存失败）")
-                    return
-                using_stale_mapping = True
-
-            # ✅ 新增：自动生成默认文件名为"原文_译文"
-            default_filename = ""
             current_source_path = self.get_source_path()
-            if current_source_path:
-                source_stem = current_source_path.stem
-                default_filename = f"{source_stem}_译文.epub"
+            default_filename = build_default_epub_filename(current_source_path)
 
             out_path = filedialog.asksaveasfilename(
                 title="导出为EPUB文件",
@@ -1209,55 +1620,80 @@ class TranslationController:
             if not out_path:
                 return
 
-            # 加载插图翻译结果
-            image_map = None
-            if current_mapping_dir:
-                result_file = current_mapping_dir / "image_translation_result.json"
-                if result_file.exists():
-                    try:
-                        import json
+            image_map = (
+                load_image_translation_result(current_mapping_dir)
+                if current_mapping_dir
+                else None
+            )
+            image_text_map = (
+                load_image_text_translations(current_mapping_dir)
+                if current_mapping_dir
+                else None
+            )
+            mapping_dir = str(current_mapping_dir)
+            target_snapshot = tuple(target_lines)
 
-                        with open(result_file, encoding="utf-8") as f:
-                            raw = json.load(f)
-                        # R2-BUG-018：兼容新旧格式
-                        # 新格式: {"result_map": {...}, "run_at": ..., "result_count": ...}
-                        # 旧格式: {original_path: new_filename}
-                        if isinstance(raw, dict) and "result_map" in raw:
-                            image_map = raw["result_map"]
-                        else:
-                            image_map = raw
-                    except Exception:
-                        pass
+            def save_mapping() -> None:
+                self.epub_processor.save_translations(mapping_dir, list(target_snapshot))
 
-            # 加载图片文字翻译结果
-            image_text_map = None
-            if current_mapping_dir:
-                text_trans_file = current_mapping_dir / "image_text_translations.json"
-                if text_trans_file.exists():
-                    try:
-                        import json
-
-                        with open(text_trans_file, encoding="utf-8") as f:
-                            image_text_map = json.load(f)
-                    except Exception:
-                        pass
-
-            try:
-                result_path = self.epub_processor.export_epub(
-                    str(current_mapping_dir), out_path, image_map, image_text_map
+            def export_to(temporary_path: Path) -> Path | str:
+                return self.epub_processor.export_epub(
+                    mapping_dir,
+                    str(temporary_path),
+                    image_map,
+                    image_text_map,
                 )
-                self.status_updater(f"EPUB已导出: {Path(result_path).name}")
-                # R2-BUG-019：使用旧映射导出时在提示中明确说明
-                if using_stale_mapping:
-                    messagebox.showwarning(
-                        "导出完成（使用旧映射）",
-                        f"已导出EPUB文件: {Path(result_path).name}\n\n"
-                        "警告：映射保存失败，导出使用的是旧映射中的译文，\n"
-                        "可能与当前表格内容不一致。",
-                    )
-                else:
-                    messagebox.showinfo("导出成功", f"已导出EPUB文件: {Path(result_path).name}")
-            except Exception as e:
-                messagebox.showerror("导出错误", f"EPUB导出失败: {str(e)}")
+
+            self._export_job = ExportJob(
+                output_path=Path(out_path),
+                save_mapping=save_mapping,
+                export_to=export_to,
+            )
+            self._export_kind = "EPUB 导出"
+            self._export_success_callback = None
+            self._export_job.start()
+            self.status_updater("EPUB 导出已开始，可继续使用界面")
+            self._poll_export_job()
         except Exception as e:
             messagebox.showerror("导出错误", f"导出EPUB操作失败: {str(e)}")
+
+    def _poll_export_job(self) -> None:
+        job = self._export_job
+        if job is None:
+            return
+        terminal = False
+        for event in job.drain_events():
+            if isinstance(event, ExportProgress):
+                self.status_updater(event.message)
+                continue
+            terminal = True
+            kind = self._export_kind or "导出"
+            if event.succeeded:
+                output_path = event.output_path
+                if output_path is None:
+                    event = ExportResult(None, error_message="导出任务未返回输出路径")
+                else:
+                    callback = self._export_success_callback
+                    if callback is not None:
+                        try:
+                            callback()
+                        except Exception:
+                            logger.exception("处理%s成功回调失败", kind)
+                    self.status_updater(f"{kind}已完成: {output_path.name}")
+                    messagebox.showinfo("导出成功", f"{kind}已完成: {output_path.name}")
+                    self._export_job = None
+                    self._export_kind = None
+                    self._export_success_callback = None
+                    continue
+            elif event.cancelled:
+                self.status_updater(f"{kind}已取消，原目标文件未修改")
+            else:
+                self.status_updater(f"{kind}失败")
+                messagebox.showerror("导出错误", f"{kind}失败: {event.error_message or '未知错误'}")
+            self._export_job = None
+            self._export_kind = None
+            self._export_success_callback = None
+        if terminal:
+            self._export_poll_after_id = None
+            return
+        self._export_poll_after_id = self.root.after(50, self._poll_export_job)

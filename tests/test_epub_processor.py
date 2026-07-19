@@ -14,11 +14,13 @@ nested_dirs_epub），不依赖 Tkinter。
 """
 
 import json
+from zipfile import ZipFile
 from pathlib import Path
 
 import pytest
 
 from src.core.epub_processor import EPUBProcessor
+from src.core.epub_processor import EpubArchiveValidationError, _validate_epub_archive
 from src.domain.errors import EpubFingerprintMismatchError
 
 # ── 辅助函数 ──────────────────────────────────────────

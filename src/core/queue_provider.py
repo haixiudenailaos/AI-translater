@@ -477,7 +477,10 @@ def provider_runtime_key_for(api_config: dict) -> ProviderRuntimeKey:
     try:
         normalized_url = normalize_openai_base_url(base_url) if base_url else ""
     except ValueError:
-        normalized_url = base_url
+        # Never retain an unvalidated URL in the runtime key.  Besides making
+        # invalid configurations look usable, that would preserve a remote
+        # plain-HTTP endpoint next to credential-related runtime metadata.
+        normalized_url = ""
     config_version = f"{api_config.get('temperature', '')}:{api_config.get('max_tokens', '')}"
     return ProviderRuntimeKey(
         provider=provider,

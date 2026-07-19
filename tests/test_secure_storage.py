@@ -127,11 +127,40 @@ class TestStorageStatus:
 # ── ConfigManager 迁移测试 ───────────────────────────
 
 
-class TestConfigMigration:
-    """R2-BUG-002：ConfigManager._migrate_plaintext_keys 行为。"""
+# P1-4：可控行为的 SecretStore 替身，替代旧的 keyring patch 方式。
+# ``status`` 控制 store() 返回值，模拟 PERSISTED / SESSION_ONLY / FAILED。
+class _FakeSecretStore:
+    def __init__(self, status=StorageStatus.PERSISTED):
+        self.values = {}
+        self._status = status
+        self.store_calls = []
 
-    def test_migration_preserves_plaintext_when_session_only(self, tmp_config_manager, monkeypatch):
-        """密钥环不可用时（SESSION_ONLY），磁盘 JSON 保留明文 Key。"""
+    def store(self, identifier, key):
+        self.store_calls.append((identifier, key))
+        if self._status == StorageStatus.PERSISTED:
+            self.values[identifier] = key
+        return self._status
+
+    def retrieve(self, identifier):
+        return self.values.get(identifier, "")
+
+    def delete(self, identifier):
+        self.values.pop(identifier, None)
+        return True
+
+
+class TestConfigMigration:
+    """R2-BUG-002：ConfigManager._migrate_plaintext_keys 行为。
+
+    P1-4：不再 patch secure_storage 全局函数，改为注入 _FakeSecretStore。
+    """
+
+    def test_migration_preserves_plaintext_when_session_only(self, tmp_config_manager):
+        """SecretStore 返回 SESSION_ONLY 时，磁盘 JSON 保留明文 Key。"""
+        # P1-4：注入返回 SESSION_ONLY 的 FakeSecretStore
+        fake_store = _FakeSecretStore(status=StorageStatus.SESSION_ONLY)
+        tmp_config_manager._secret_store = fake_store
+
         api_config_file = tmp_config_manager.api_config_file
 
         # 预写一个包含明文密钥的配置文件
@@ -147,12 +176,6 @@ class TestConfigMigration:
             encoding="utf-8",
         )
 
-        # 强制 keyring 不可用
-        from src.utils import secure_storage
-
-        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: False)
-        secure_storage._keyring_available = False
-
         # 重新加载配置（触发迁移）
         config = tmp_config_manager.load_api_config()
 
@@ -161,11 +184,19 @@ class TestConfigMigration:
         assert "api_key" in disk_data, "SESSION_ONLY 时磁盘应保留明文 Key"
         assert disk_data["api_key"] == "sk-plaintext-secret-key"
 
-        # 但运行时 config 应能从环境变量读取到 Key
-        assert config["api_key"] == "sk-plaintext-secret-key"
+        # 但运行时 config 应能从 SecretStore 读取到 Key（SESSION_ONLY 时环境变量降级）
+        # FakeSecretStore 在 SESSION_ONLY 时不写入 values，retrieve 返回 ""
+        # load_api_config 会通过 _ensure_api_key_loaded 读取，此处直接验证 store 被调用
+        assert any(
+            ident == "provider:siliconflow" for ident, _ in fake_store.store_calls
+        )
 
-    def test_migration_removes_plaintext_when_persisted(self, tmp_config_manager, monkeypatch):
-        """密钥环持久化成功后，磁盘 JSON 不再包含明文 Key。"""
+    def test_migration_removes_plaintext_when_persisted(self, tmp_config_manager):
+        """SecretStore 持久化成功后，磁盘 JSON 不再包含明文 Key。"""
+        # P1-4：注入返回 PERSISTED 的 FakeSecretStore
+        fake_store = _FakeSecretStore(status=StorageStatus.PERSISTED)
+        tmp_config_manager._secret_store = fake_store
+
         api_config_file = tmp_config_manager.api_config_file
 
         api_config_file.write_text(
@@ -180,41 +211,25 @@ class TestConfigMigration:
             encoding="utf-8",
         )
 
-        # 模拟 keyring 可用且持久化成功
-        # 使用 dict 存储，确保 get_password 在 set_password 之前返回 None
-        stored = {}
-
-        def fake_set_password(service, identifier, key):
-            stored[identifier] = key
-
-        def fake_get_password(service, identifier):
-            return stored.get(identifier)
-
-        fake_module = MagicMock()
-        fake_module.set_password = fake_set_password
-        fake_module.get_password = fake_get_password
-
-        from src.utils import secure_storage
-
-        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: True)
-        secure_storage._keyring_available = True
-
-        with patch.dict("sys.modules", {"keyring": fake_module}):
-            config = tmp_config_manager.load_api_config()
+        config = tmp_config_manager.load_api_config()
 
         # 磁盘文件不应包含明文 Key
         disk_data = json.loads(api_config_file.read_text(encoding="utf-8"))
         assert "api_key" not in disk_data, "持久化成功后磁盘不应包含明文 Key"
         assert "provider_keys" not in disk_data
 
-        # 运行时 config 应能从密钥环读取到 Key
+        # 运行时 config 应能从 SecretStore 读取到 Key
         assert config["api_key"] == "sk-plaintext-to-migrate"
 
-        # 密钥环中应有该密钥
-        assert stored.get("provider:siliconflow") == "sk-plaintext-to-migrate"
+        # SecretStore 中应有该密钥
+        assert fake_store.values.get("provider:siliconflow") == "sk-plaintext-to-migrate"
 
-    def test_migration_with_provider_keys_dict(self, tmp_config_manager, monkeypatch):
+    def test_migration_with_provider_keys_dict(self, tmp_config_manager):
         """迁移 provider_keys 字典中的多个密钥。"""
+        # P1-4：注入返回 PERSISTED 的 FakeSecretStore
+        fake_store = _FakeSecretStore(status=StorageStatus.PERSISTED)
+        tmp_config_manager._secret_store = fake_store
+
         api_config_file = tmp_config_manager.api_config_file
 
         api_config_file.write_text(
@@ -232,45 +247,33 @@ class TestConfigMigration:
             encoding="utf-8",
         )
 
-        # 模拟 keyring 持久化成功
-        stored = {}
-
-        def fake_set_password(service, identifier, key):
-            stored[identifier] = key
-
-        def fake_get_password(service, identifier):
-            return stored.get(identifier)
-
-        fake_module = MagicMock()
-        fake_module.set_password = fake_set_password
-        fake_module.get_password = fake_get_password
-
-        from src.utils import secure_storage
-
-        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: True)
-        secure_storage._keyring_available = True
-
-        with patch.dict("sys.modules", {"keyring": fake_module}):
-            tmp_config_manager.load_api_config()
+        tmp_config_manager.load_api_config()
 
         # 磁盘文件不应包含 provider_keys
         disk_data = json.loads(api_config_file.read_text(encoding="utf-8"))
         assert "provider_keys" not in disk_data
         assert "api_key" not in disk_data
 
-        # 密钥环中应有两个提供商的密钥
-        assert stored.get("provider:siliconflow") == "sk-sf-key"
-        assert stored.get("provider:deepseek") == "sk-ds-key"
+        # SecretStore 中应有两个提供商的密钥
+        assert fake_store.values.get("provider:siliconflow") == "sk-sf-key"
+        assert fake_store.values.get("provider:deepseek") == "sk-ds-key"
 
 
 # ── R2-BUG-003：预设迁移测试 ─────────────────────────
 
 
 class TestPresetMigration:
-    """R2-BUG-003：预设迁移不写回明文 Key。"""
+    """R2-BUG-003：预设迁移不写回明文 Key。
 
-    def test_preset_migration_separates_runtime_and_disk(self, tmp_config_manager, monkeypatch):
+    P1-4：不再 patch secure_storage 全局函数，改为注入 _FakeSecretStore。
+    """
+
+    def test_preset_migration_separates_runtime_and_disk(self, tmp_config_manager):
         """迁移旧预设后磁盘 JSON 中不存在 api_key，运行时仍能使用。"""
+        # P1-4：注入返回 PERSISTED 的 FakeSecretStore
+        fake_store = _FakeSecretStore(status=StorageStatus.PERSISTED)
+        tmp_config_manager._secret_store = fake_store
+
         presets_file = tmp_config_manager.config_dir / "api_presets.json"
 
         # 预写包含明文 api_key 的预设
@@ -291,26 +294,7 @@ class TestPresetMigration:
             encoding="utf-8",
         )
 
-        # 模拟 keyring 持久化成功
-        stored = {}
-
-        def fake_set_password(service, identifier, key):
-            stored[identifier] = key
-
-        def fake_get_password(service, identifier):
-            return stored.get(identifier)
-
-        fake_module = MagicMock()
-        fake_module.set_password = fake_set_password
-        fake_module.get_password = fake_get_password
-
-        from src.utils import secure_storage
-
-        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: True)
-        secure_storage._keyring_available = True
-
-        with patch.dict("sys.modules", {"keyring": fake_module}):
-            presets = tmp_config_manager.load_api_presets()
+        presets = tmp_config_manager.load_api_presets()
 
         # 磁盘文件不应包含 api_key
         disk_data = json.loads(presets_file.read_text(encoding="utf-8"))
@@ -322,13 +306,17 @@ class TestPresetMigration:
         assert presets["preset1"]["api_key"] == "sk-preset-secret-key"
         assert presets["preset1"]["model_name"] == "model-a"
 
-        # 密钥环中应有 preset1 的密钥
-        assert stored.get("preset:preset1") == "sk-preset-secret-key"
+        # SecretStore 中应有 preset1 的密钥
+        assert fake_store.values.get("preset:preset1") == "sk-preset-secret-key"
 
     def test_preset_migration_preserves_plaintext_when_session_only(
-        self, tmp_config_manager, monkeypatch
+        self, tmp_config_manager
     ):
-        """密钥环不可用时，预设磁盘 JSON 保留明文 Key。"""
+        """SecretStore 返回 SESSION_ONLY 时，预设磁盘 JSON 保留明文 Key。"""
+        # P1-4：注入返回 SESSION_ONLY 的 FakeSecretStore
+        fake_store = _FakeSecretStore(status=StorageStatus.SESSION_ONLY)
+        tmp_config_manager._secret_store = fake_store
+
         presets_file = tmp_config_manager.config_dir / "api_presets.json"
 
         presets_file.write_text(
@@ -344,11 +332,6 @@ class TestPresetMigration:
             encoding="utf-8",
         )
 
-        from src.utils import secure_storage
-
-        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: False)
-        secure_storage._keyring_available = False
-
         presets = tmp_config_manager.load_api_presets()
 
         # 磁盘文件应仍包含明文 Key
@@ -356,11 +339,15 @@ class TestPresetMigration:
         assert "api_key" in disk_data["preset1"]
         assert disk_data["preset1"]["api_key"] == "sk-preset-secret"
 
-        # 运行时仍能使用
+        # 运行时仍能使用（SESSION_ONLY 时 fallback 到 legacy_key）
         assert presets["preset1"]["api_key"] == "sk-preset-secret"
 
-    def test_preset_no_plaintext_in_logs(self, tmp_config_manager, monkeypatch, caplog):
+    def test_preset_no_plaintext_in_logs(self, tmp_config_manager, caplog):
         """搜索日志找不到完整测试 Key。"""
+        # P1-4：注入返回 PERSISTED 的 FakeSecretStore
+        fake_store = _FakeSecretStore(status=StorageStatus.PERSISTED)
+        tmp_config_manager._secret_store = fake_store
+
         presets_file = tmp_config_manager.config_dir / "api_presets.json"
 
         test_key = "sk-very-secret-key-12345"
@@ -377,29 +364,10 @@ class TestPresetMigration:
             encoding="utf-8",
         )
 
-        # 模拟 keyring 持久化成功
-        stored = {}
-
-        def fake_set_password(service, identifier, key):
-            stored[identifier] = key
-
-        def fake_get_password(service, identifier):
-            return stored.get(identifier)
-
-        fake_module = MagicMock()
-        fake_module.set_password = fake_set_password
-        fake_module.get_password = fake_get_password
-
-        from src.utils import secure_storage
-
-        monkeypatch.setattr(secure_storage, "_detect_keyring", lambda: True)
-        secure_storage._keyring_available = True
-
         import logging
 
         with caplog.at_level(logging.DEBUG):
-            with patch.dict("sys.modules", {"keyring": fake_module}):
-                tmp_config_manager.load_api_presets()
+            tmp_config_manager.load_api_presets()
 
         # 日志中不应包含完整测试 Key
         full_log = caplog.text

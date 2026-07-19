@@ -49,18 +49,37 @@ class LazyServiceTests(unittest.TestCase):
 
 class ConfigStartupTests(unittest.TestCase):
     def test_credential_lookup_is_deferred_and_cached(self):
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("src.config.config_manager.get_key", return_value="sk-test") as get_key_mock,
-        ):
-            paths = SimpleNamespace(config_dir=Path(temp_dir))
-            manager = ConfigManager(app_paths=paths)
+        """P1-4：密钥读取延迟到首次需要时，且结果被缓存。
 
-            self.assertEqual(get_key_mock.call_count, 0)
+        旧测试 patch 全局 ``get_key``，P1-4 移除全局调用后改为注入
+        ``CountingSecretStore`` 验证 retrieve 调用次数。
+        """
+        from src.domain.secret import StorageStatus
+
+        class CountingSecretStore:
+            def __init__(self):
+                self.retrieve_count = 0
+
+            def store(self, identifier, key):
+                return StorageStatus.PERSISTED
+
+            def retrieve(self, identifier):
+                self.retrieve_count += 1
+                return "sk-test"
+
+            def delete(self, identifier):
+                return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = SimpleNamespace(config_dir=Path(temp_dir))
+            store = CountingSecretStore()
+            manager = ConfigManager(app_paths=paths, secret_store=store)
+
+            self.assertEqual(store.retrieve_count, 0)
             self.assertEqual(manager.get_api_config(load_secret=False)["api_key"], "")
             self.assertTrue(manager.is_api_configured())
             self.assertEqual(manager.get_api_config()["api_key"], "sk-test")
-            self.assertEqual(get_key_mock.call_count, 1)
+            self.assertEqual(store.retrieve_count, 1)
 
 
 class MainWindowLayoutTests(unittest.TestCase):
@@ -97,6 +116,31 @@ class MainWindowLayoutTests(unittest.TestCase):
         )
         self.assertIs(calls[2][1], footer_frame)
         self.assertIs(calls[3][1], footer_frame)
+
+    def test_shortcuts_bind_control_and_command_variants(self):
+        class Root:
+            def __init__(self):
+                self.bindings = {}
+
+            def bind(self, sequence, callback):
+                self.bindings[sequence] = callback
+
+        window = MainWindow.__new__(MainWindow)
+        window.root = Root()
+        window.file_importer = SimpleNamespace(import_file=lambda: None)
+        window.translation_controller = SimpleNamespace(save_translation=lambda: None)
+        window.focus_search = lambda: None
+        window.undo = lambda: None
+        window.redo = lambda: None
+        window._run_primary_action = lambda: None
+        window._continue_translation = lambda: None
+
+        window.setup_bindings()
+
+        for key in ("o", "s", "f", "z", "y"):
+            self.assertIn(f"<Control-{key}>", window.root.bindings)
+            self.assertIn(f"<Command-{key}>", window.root.bindings)
+        self.assertIn("<Command-Shift-Z>", window.root.bindings)
 
 
 class _Root:
@@ -169,6 +213,8 @@ class ChunkedTableLoadTests(unittest.TestCase):
         window._manually_edited_items = set()
         window._hidden_items = set()
         window._all_items = []
+        # P2-4：行值缓存（_load_table_chunk 写入，apply_review_filter 读取）
+        window._row_values_cache = {}
         # PERF §7：文档模型和表格适配器（load_data_to_table 依赖）
         window._document = TranslationDocument()
         window._table_adapter = TranslationTableAdapter(window.translation_table)

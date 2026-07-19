@@ -264,6 +264,35 @@ class TestResultFileCompat:
 class TestOpenAIClientClose:
     """R2-BUG-025 / PERF-005：OpenAI 客户端复用与显式关闭"""
 
+    def test_custom_volc_endpoint_and_model_are_loaded(self):
+        config_manager = MagicMock()
+        config_manager.get_app_config.return_value = {
+            "image_translation": {
+                "ai_volcengine": {
+                    "base_url": "https://example.com/custom/v1/",
+                    "model": "ep-custom-model-id",
+                }
+            }
+        }
+
+        translator = ImageTranslator(config_manager)
+
+        assert translator.volc_base_url == "https://example.com/custom/v1"
+        assert translator.volc_model == "ep-custom-model-id"
+
+    def test_unknown_custom_volc_model_is_not_replaced(self):
+        config_manager = MagicMock()
+        config_manager.get_app_config.return_value = {
+            "image_translation": {
+                "ai_volcengine": {"model": "user-defined-model"}
+            }
+        }
+
+        translator = ImageTranslator(config_manager)
+
+        assert translator.volc_model == "user-defined-model"
+        assert translator.volc_base_url == ImageTranslator.DEFAULT_BASE_URL
+
     def test_translate_images_does_not_close_client(self, tmp_path):
         """PERF-005：translate_images 完成后不关闭客户端（复用连接池）"""
         config_manager = MagicMock()

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -23,6 +24,7 @@ from src.application.document_session import (
     ImportResult,
     SessionKind,
 )
+from src.application.translation_document import TranslationDocument
 from src.ui.file_importer import FileImporter
 
 # ── DocumentSession 基础行为 ─────────────────────────────
@@ -110,6 +112,15 @@ def test_import_result_failure_does_not_carry_session():
     assert result.failure_kind is ImportFailure.SOURCE_READ_FAILED
     assert result.error_message == "Permission denied"
     assert result.failed_path == "/tmp/locked.txt"
+
+
+def test_import_result_cancelled_is_not_an_error_result():
+    result = ImportResult.cancelled()
+
+    assert result.succeeded is False
+    assert result.cancelled_by_user is True
+    assert result.failure_kind is ImportFailure.CANCELLED
+    assert result.user_message == "已取消导入"
 
 
 def test_import_result_user_message_includes_path_and_reason():
@@ -206,7 +217,7 @@ class _FakeEpubProcessor:
         self._import_error = import_error
         self._load_error = load_error
 
-    def import_epub(self, path: str) -> dict:
+    def import_epub(self, path: str, **_kwargs) -> dict:
         if self._import_error:
             raise self._import_error
         return self._mapping_info or {"mapping_dir": ""}
@@ -363,6 +374,59 @@ def test_txt_import_success_creates_empty_target_file(tmp_path):
     assert (str(tgt_path), "") in file_handler.written
 
 
+def test_txt_import_starts_background_worker_and_commits_only_on_ui_callback(tmp_path, monkeypatch):
+    src_path = tmp_path / "novel.txt"
+    src_path.write_text("原文", encoding="utf-8")
+    file_handler = _FakeFileHandler(read_results={str(src_path): "原文"})
+    importer = _make_file_importer(file_handler, _FakeEpubProcessor())
+    importer._disable_ui_controls = MagicMock()
+    importer._enable_ui_controls = MagicMock()
+    old_session = importer.session
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr("src.ui.file_importer.threading.Thread", ImmediateThread)
+
+    importer._import_txt_in_background(src_path)
+
+    assert importer.session is old_session
+    callbacks = importer._ui_mailbox.drain()
+    assert len(callbacks) == 1
+    callbacks[0]()
+
+    assert importer.session.kind is SessionKind.TXT
+    assert importer.current_source_path == src_path
+    assert importer.current_target_path == tmp_path / "novel_译文.txt"
+    assert importer._txt_import_busy is False
+    importer._disable_ui_controls.assert_called_once()
+    importer._enable_ui_controls.assert_called_once()
+
+
+def test_stale_txt_import_callback_cannot_replace_newer_session(tmp_path):
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    old_session = importer.session
+    result = ImportResult.success(
+        DocumentSession.create(
+            SessionKind.TXT,
+            source_path=tmp_path / "old.txt",
+            target_path=tmp_path / "old_译文.txt",
+            source_lines=["old"],
+        )
+    )
+    importer._txt_import_generation = 2
+    importer._txt_import_busy = True
+
+    importer._finish_txt_import(1, tmp_path / "old.txt", result)
+
+    assert importer.session is old_session
+    assert importer._txt_import_busy is True
+
+
 # ── P0-6：EPUB 导入错误路径 ──────────────────────────────
 
 
@@ -381,6 +445,27 @@ def test_epub_import_parse_failure_returns_structured_result(tmp_path):
     assert result.failure_kind is ImportFailure.EPUB_PARSE_FAILED
     assert result.failed_path == str(src_path)
     assert "EPUB 格式损坏" in result.error_message
+    assert importer.session is old_session
+
+
+def test_epub_import_cancellation_returns_distinct_result(tmp_path):
+    """取消不是解析失败，且不得替换现有会话。"""
+    src_path = tmp_path / "book.epub"
+    src_path.write_bytes(b"placeholder")
+
+    class CancelledProcessor(_FakeEpubProcessor):
+        def import_epub(self, path: str, **_kwargs) -> dict:
+            from src.core.epub_processor import EpubImportCancelled
+
+            raise EpubImportCancelled("cancelled")
+
+    importer = _make_file_importer(_FakeFileHandler(), CancelledProcessor())
+    old_session = importer.session
+
+    result = importer._build_epub_import_result(src_path)
+
+    assert result.cancelled_by_user is True
+    assert result.failure_kind is ImportFailure.CANCELLED
     assert importer.session is old_session
 
 
@@ -437,6 +522,32 @@ def test_commit_session_replaces_old_session_atomically(tmp_path):
     # table_loader 被调用一次，传入新 session 的数据
     assert len(loaded) == 1
     assert loaded[0] == (["X", "Y"], ["译X", ""])
+
+
+def test_commit_session_reuses_shared_document_model(tmp_path):
+    """生产组合根传入的文档模型应成为 session 的唯一实例。"""
+    shared = TranslationDocument()
+    importer = FileImporter(
+        root=SimpleNamespace(),
+        config_manager=None,
+        file_handler=_FakeFileHandler(),
+        epub_processor=_FakeEpubProcessor(),
+        table_loader=lambda _source, _target: None,
+        status_updater=lambda _message: None,
+        image_translation_starter=lambda: None,
+        document=shared,
+    )
+    session = DocumentSession.create(
+        SessionKind.CLIPBOARD,
+        source_lines=["source"],
+        target_lines=["target"],
+    )
+
+    importer._commit_session(session)
+
+    assert importer.session.document is shared
+    assert shared.source_lines() == ["source"]
+    assert shared.target_lines() == ["target"]
 
 
 def test_commit_session_clears_mapping_keys(tmp_path):
@@ -534,3 +645,130 @@ def test_backward_compat_properties_are_read_only():
 
     with pytest.raises(AttributeError):
         importer.current_mapping_dir = Path("/tmp/z")  # type: ignore[misc]
+
+
+# ── P0-3：update_session_target_path / _guard_replace_session ──
+
+
+def test_update_session_target_path_replaces_only_target(tmp_path):
+    """P0-3：update_session_target_path 保留 session 其他字段，仅替换 target_path。"""
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    src = tmp_path / "src.txt"
+    src.write_text("A", encoding="utf-8")
+    importer._session = DocumentSession.create(
+        kind=SessionKind.TXT,
+        source_path=src,
+        target_path=tmp_path / "old.txt",
+        mapping_dir=None,
+        source_lines=["A"],
+        target_lines=["旧译"],
+    )
+    original_session = importer.session
+    new_target = tmp_path / "new.txt"
+
+    importer.update_session_target_path(new_target)
+
+    new_session = importer.session
+    assert new_session is not original_session
+    assert new_session.target_path == new_target
+    # 其他字段保持不变
+    assert new_session.session_id == original_session.session_id
+    assert new_session.kind is SessionKind.TXT
+    assert new_session.source_path == original_session.source_path
+    assert new_session.mapping_dir == original_session.mapping_dir
+
+
+def test_update_session_target_path_noop_when_unchanged(tmp_path):
+    """P0-3：target_path 未变化时不替换 session。"""
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    src = tmp_path / "src.txt"
+    src.write_text("A", encoding="utf-8")
+    target = tmp_path / "target.txt"
+    importer._session = DocumentSession.create(
+        kind=SessionKind.TXT,
+        source_path=src,
+        target_path=target,
+        mapping_dir=None,
+        source_lines=["A"],
+        target_lines=["译"],
+    )
+    original_session = importer.session
+
+    importer.update_session_target_path(target)
+
+    assert importer.session is original_session
+
+
+def test_guard_replace_session_passes_when_not_dirty():
+    """P0-3：无未保存更改时直接放行。"""
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    importer.is_dirty_callback = lambda: False
+    guard_calls: list = []
+    importer._confirm_replace_session = lambda: guard_calls.append("called") or "proceed"
+
+    assert importer._guard_replace_session() is True
+    # dirty=False 时不调用守卫
+    assert guard_calls == []
+
+
+def test_guard_replace_session_discard_allows_replace():
+    """P0-3：dirty + 用户选择 discard → 放行替换。"""
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    importer.is_dirty_callback = lambda: True
+    importer._confirm_replace_session = lambda: "discard"
+
+    assert importer._guard_replace_session() is True
+
+
+def test_guard_replace_session_cancel_blocks_replace():
+    """P0-3：dirty + 用户选择 cancel → 阻止替换。"""
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    importer.is_dirty_callback = lambda: True
+    importer._confirm_replace_session = lambda: "cancel"
+
+    assert importer._guard_replace_session() is False
+
+
+def test_guard_replace_session_save_blocks_when_still_dirty():
+    """P0-3：dirty + 用户选择 save 但保存失败（仍 dirty）→ 阻止替换。"""
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    states = [True]  # 初始 dirty
+    importer.is_dirty_callback = lambda: states[0]
+    importer._confirm_replace_session = lambda: "save"
+    status_messages: list = []
+    importer.status_updater = status_messages.append
+
+    assert importer._guard_replace_session() is False
+    assert any("保存未完成" in m for m in status_messages)
+
+
+def test_guard_replace_session_save_allows_replace_when_clean_after_save():
+    """P0-3：dirty + 用户选择 save 且保存成功（dirty 清空）→ 放行替换。"""
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    states = [True]  # 初始 dirty，保存后变 False
+    importer.is_dirty_callback = lambda: states[0]
+    importer._confirm_replace_session = lambda: (states.__setitem__(0, False), "save")[1]
+
+    assert importer._guard_replace_session() is True
+
+
+def test_guard_replace_session_without_callback_passes():
+    """P0-3：未注入守卫回调时保留旧行为（直接放行）。"""
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    importer.is_dirty_callback = lambda: True
+    # 不设置 _confirm_replace_session（构造器 None）
+
+    assert importer._guard_replace_session() is True
+
+
+def test_is_dirty_delegates_to_callback_and_defaults_false():
+    """P0-3：is_dirty 委派给 is_dirty_callback，未绑定时返回 False。"""
+    importer = _make_file_importer(_FakeFileHandler(), _FakeEpubProcessor())
+    # 未绑定 is_dirty_callback
+    assert importer.is_dirty is False
+
+    flag = [True]
+    importer.is_dirty_callback = lambda: flag[0]
+    assert importer.is_dirty is True
+    flag[0] = False
+    assert importer.is_dirty is False

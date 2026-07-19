@@ -13,7 +13,8 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Callable, Dict, Iterator, List, Tuple
+from zipfile import BadZipFile, ZipFile
 
 from ..infrastructure.document_order import (
     get_item_media_type as _get_item_media_type_impl,
@@ -55,6 +56,60 @@ from ..utils.file_handler import write_json_atomic
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_MAX_EPUB_MEMBERS = 10_000
+_MAX_EPUB_MEMBER_BYTES = 64 * 1024 * 1024
+_MAX_EPUB_TOTAL_BYTES = 512 * 1024 * 1024
+_MAX_EPUB_COMPRESSION_RATIO = 1_000
+
+
+class EpubArchiveValidationError(ValueError):
+    """The EPUB ZIP archive exceeds the application's resource boundary."""
+
+
+class EpubImportCancelled(Exception):
+    """Raised at EPUB import safe points after the user requests cancellation."""
+
+
+def _raise_if_epub_import_cancelled(cancel_requested: Callable[[], bool] | None) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise EpubImportCancelled("EPUB 导入已取消")
+
+
+def _validate_epub_archive(
+    path: Path,
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> None:
+    """Reject malformed, traversal-capable, or compression-bomb EPUB archives."""
+    try:
+        with ZipFile(path) as archive:
+            _raise_if_epub_import_cancelled(cancel_requested)
+            members = archive.infolist()
+            if len(members) > _MAX_EPUB_MEMBERS:
+                raise EpubArchiveValidationError("EPUB 条目数量超出安全上限")
+            total_uncompressed = 0
+            for member in members:
+                _raise_if_epub_import_cancelled(cancel_requested)
+                name = member.filename.replace("\\", "/")
+                parts = [part for part in name.split("/") if part]
+                if name.startswith("/") or ".." in parts:
+                    raise EpubArchiveValidationError("EPUB 包含不安全的文件路径")
+                if member.is_dir():
+                    continue
+                if member.file_size > _MAX_EPUB_MEMBER_BYTES:
+                    raise EpubArchiveValidationError("EPUB 单个资源超出安全上限")
+                total_uncompressed += member.file_size
+                if total_uncompressed > _MAX_EPUB_TOTAL_BYTES:
+                    raise EpubArchiveValidationError("EPUB 解压总大小超出安全上限")
+                if (
+                    member.file_size > 0
+                    and member.compress_size > 0
+                    and member.file_size / member.compress_size > _MAX_EPUB_COMPRESSION_RATIO
+                ):
+                    raise EpubArchiveValidationError("EPUB 资源压缩比异常")
+    except BadZipFile as exc:
+        raise EpubArchiveValidationError("文件不是有效的 EPUB/ZIP") from exc
 
 
 class EPUBProcessor:
@@ -126,11 +181,23 @@ class EPUBProcessor:
         """安全地获取 EpubItem 的文件名（委托到 infrastructure.document_order）。"""
         return _get_item_name_impl(item)
 
-    def import_epub(self, epub_path: str, extract_images: bool = True) -> Dict[str, str]:
+    def import_epub(
+        self,
+        epub_path: str,
+        extract_images: bool = True,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> Dict[str, str]:
         """解析EPUB并生成mapping目录与三个映射文件。
+
+        ``cancel_requested`` is checked at archive, chapter, image, and write
+        boundaries. Cancellation raises ``EpubImportCancelled`` so callers can
+        distinguish it from malformed input.
 
         返回：{"mapping_dir": str, "content_file": str, "images_file": str, "format_file": str}
         """
+        _raise_if_epub_import_cancelled(cancel_requested)
         try:
             import ebooklib
             from bs4 import BeautifulSoup
@@ -141,9 +208,10 @@ class EPUBProcessor:
         epub_path = Path(epub_path)
         if not epub_path.exists() or epub_path.suffix.lower() != ".epub":
             raise Exception("文件不存在或不是EPUB格式")
-
-        # 读取书籍
-        book = epub.read_epub(str(epub_path))
+        if progress_callback is not None:
+            progress_callback("正在检查 EPUB 文件...")
+        _validate_epub_archive(epub_path, cancel_requested=cancel_requested)
+        _raise_if_epub_import_cancelled(cancel_requested)
 
         # 为每个EPUB创建独立的映射子文件夹
         # BUG-003：使用稳定项目 ID（文件名+路径哈希），不同目录下同名 EPUB 生成不同工作区
@@ -152,6 +220,43 @@ class EPUBProcessor:
         mapping_root = self._workspace_dir / "mappings"
         mapping_dir = mapping_root / project_id
         mapping_dir.mkdir(parents=True, exist_ok=True)
+
+        # PERF-6e：源文件未变化时跳过昂贵的 EPUB 重解析。
+        # 用 size + mtime 快速验证；命中已有 mapping 直接返回，不重新
+        # 解析 ebooklib、不重提取图片、不重建 format_info。
+        # 翻译进度保存在 content_mapping.json 中，不受跳过影响。
+        content_file = mapping_dir / "content_mapping.json"
+        images_file = mapping_dir / "images.json"
+        format_file = mapping_dir / "format_info.json"
+        if content_file.exists() and images_file.exists() and format_file.exists():
+            try:
+                old_info = json.loads(content_file.read_text(encoding="utf-8"))
+                cached = old_info.get("project_info", {})
+                stat = epub_path.stat()
+                if (
+                    cached.get("source_file_size") == stat.st_size
+                    and cached.get("source_file_mtime") == stat.st_mtime
+                ):
+                    logger.info(
+                        "[import_epub] 源文件未变化（size=%s, mtime=%s），跳过重解析",
+                        stat.st_size,
+                        stat.st_mtime,
+                    )
+                    return {
+                        "mapping_dir": str(mapping_dir),
+                        "content_file": str(content_file),
+                        "images_file": str(images_file),
+                        "format_file": str(format_file),
+                    }
+            except Exception as exc:
+                logger.debug("[import_epub] 缓存验证失败，回退到全量解析: %s", exc)
+
+        _raise_if_epub_import_cancelled(cancel_requested)
+        if progress_callback is not None:
+            progress_callback("正在读取 EPUB 结构...")
+        # 读取书籍
+        book = epub.read_epub(str(epub_path))
+        _raise_if_epub_import_cancelled(cancel_requested)
 
         # 数据容器
         content_mappings: Dict[str, Dict] = {}
@@ -189,6 +294,7 @@ class EPUBProcessor:
         try:
             # manifest
             for item in book.get_items():
+                _raise_if_epub_import_cancelled(cancel_requested)
                 try:
                     name = self._get_item_name(item)
                     if name:
@@ -196,9 +302,13 @@ class EPUBProcessor:
                             "media_type": self._get_item_media_type(item),
                             "properties": getattr(item, "properties", None),
                         }
+                except EpubImportCancelled:
+                    raise
                 except Exception as e:
                     print(f"⚠ 警告：解析manifest条目失败: {e}")
                     continue
+        except EpubImportCancelled:
+            raise
         except Exception as e:
             print(f"⚠ 警告：提取manifest时发生错误: {e}")
 
@@ -206,6 +316,7 @@ class EPUBProcessor:
         try:
             spine_order = []
             for item in book.spine:
+                _raise_if_epub_import_cancelled(cancel_requested)
                 try:
                     # 提取itemref（处理不同版本的spine格式）
                     if isinstance(item, tuple):
@@ -246,6 +357,8 @@ class EPUBProcessor:
                 # 如果spine提取失败，至少记录警告，并尝试从content_mappings推断
                 print("⚠ 警告：无法从EPUB提取spine_order，将从文档内容推断章节顺序")
                 format_info["spine_order"] = []  # 保持为空列表，后续会从mappings推断
+        except EpubImportCancelled:
+            raise
         except Exception as e:
             # spine提取异常也要记录，不能静默失败
             print(f"⚠ 警告：提取spine_order时发生错误: {e}")
@@ -256,6 +369,7 @@ class EPUBProcessor:
 
             def _flatten_toc(toc, level=1):
                 for entry in toc:
+                    _raise_if_epub_import_cancelled(cancel_requested)
                     try:
                         title = entry.title if hasattr(entry, "title") else str(entry)
                         href = entry.href if hasattr(entry, "href") else None
@@ -264,10 +378,14 @@ class EPUBProcessor:
                         )
                         if hasattr(entry, "children") and entry.children:
                             _flatten_toc(entry.children, level + 1)
+                    except EpubImportCancelled:
+                        raise
                     except Exception:
                         continue
 
             _flatten_toc(book.toc, 1)
+        except EpubImportCancelled:
+            raise
         except Exception:
             pass
 
@@ -276,6 +394,7 @@ class EPUBProcessor:
             import ebooklib
 
             for item in book.get_items():
+                _raise_if_epub_import_cancelled(cancel_requested)
                 if item.get_type() == ebooklib.ITEM_STYLE:
                     name = self._get_item_name(item)
                     if name:
@@ -287,6 +406,8 @@ class EPUBProcessor:
                             format_info["css_styles"][name] = base64.b64encode(
                                 item.get_content()
                             ).decode("ascii")
+        except EpubImportCancelled:
+            raise
         except Exception:
             pass
 
@@ -301,6 +422,7 @@ class EPUBProcessor:
                 old_data = json.loads(content_file.read_text(encoding="utf-8"))
                 old_mappings = old_data.get("content_mappings", {})
                 for _key, item in old_mappings.items():
+                    _raise_if_epub_import_cancelled(cancel_requested)
                     original = item.get("original_text", "")
                     translated = item.get("translated_text", "")
                     translated_at = item.get("translated_at", "")
@@ -330,6 +452,8 @@ class EPUBProcessor:
                     existing_translations[original] = record
 
                 print(f"✓ 检测到已有翻译数据，已保留 {len(existing_translations)} 条翻译记录")
+            except EpubImportCancelled:
+                raise
             except Exception as e:
                 print(f"⚠ 警告：读取旧翻译数据失败: {e}")
                 existing_translations = {}
@@ -344,7 +468,10 @@ class EPUBProcessor:
         # R2-BUG-001：记录 spine 是否非空（用于遍历后校验）
         spine_non_empty = len(book.spine) > 0
 
-        for doc_item in self.iter_spine_documents(book):
+        for chapter_index, doc_item in enumerate(self.iter_spine_documents(book), start=1):
+            _raise_if_epub_import_cancelled(cancel_requested)
+            if progress_callback is not None:
+                progress_callback(f"正在解析第 {chapter_index} 章...")
             # R2-BUG-005：检测章节 ID 冲突（在 try 块外执行，避免被宽泛 except 吞掉）
             base_name = self._normalize_chapter_id(self._get_item_name(doc_item))
             if base_name in seen_chapter_ids:
@@ -361,7 +488,9 @@ class EPUBProcessor:
                 block_index_in_chapter = 0  # BUG-003：章节内块索引，用于稳定定位符
 
                 # 按文档真实顺序遍历所有节点，筛选块级标签
-                for node in soup.find_all(True):
+                for node_index, node in enumerate(soup.find_all(True), start=1):
+                    if node_index % 128 == 1:
+                        _raise_if_epub_import_cancelled(cancel_requested)
                     try:
                         if node.name in self.BLOCK_TAGS:
                             # 检查是否为叶子块节点（避免重复提取嵌套内容）
@@ -434,8 +563,12 @@ class EPUBProcessor:
                                 }
                                 global_line_number += 1
                                 block_index_in_chapter += 1
+                    except EpubImportCancelled:
+                        raise
                     except Exception:
                         continue
+            except EpubImportCancelled:
+                raise
             except Exception:
                 continue
 
@@ -488,6 +621,9 @@ class EPUBProcessor:
                 logger.debug("[import_epub] EPUB共有 %d 个item", total_items)
 
                 for idx, item in enumerate(all_items):
+                    _raise_if_epub_import_cancelled(cancel_requested)
+                    if progress_callback is not None and idx % 16 == 0:
+                        progress_callback(f"正在提取图片（{idx + 1}/{total_items}）...")
                     try:
                         item_type = item.get_type()
                         media_type = self._get_item_media_type(item)
@@ -537,6 +673,8 @@ class EPUBProcessor:
                             print(f"  ✓ 提取图片: {name} ({len(data)} bytes)")
                         else:
                             logger.debug("[import_epub] 非图片item，跳过: name=%s", item_name)
+                    except EpubImportCancelled:
+                        raise
                     except Exception as e:
                         logger.error(
                             "[import_epub] 提取单个图片失败: %s: %s",
@@ -551,6 +689,8 @@ class EPUBProcessor:
                 logger.debug("[import_epub] 成功提取 %d 张图片", image_count)
                 logger.debug("[import_epub] images_mapping包含 %d 个条目", len(images_mapping))
                 print(f"✅ 图片提取完成，共 {image_count} 张图片")
+            except EpubImportCancelled:
+                raise
             except Exception as e:
                 logger.error(
                     "[import_epub] 提取图片时发生错误: %s: %s", type(e).__name__, e, exc_info=True
@@ -605,6 +745,9 @@ class EPUBProcessor:
             print(f"✓ 已推断 {len(inferred_spine)} 个章节（按文件名排序）")
             print("⚠ 建议：使用 tools/fix_spine_order.py 从原EPUB提取精确的spine顺序")
 
+        _raise_if_epub_import_cancelled(cancel_requested)
+        if progress_callback is not None:
+            progress_callback("正在保存导入映射...")
         # 保存JSON
         # BUG-006：统一使用原子写入，写入失败时旧文件保持不变
         logger.debug("[import_epub] 保存content_mapping.json...")

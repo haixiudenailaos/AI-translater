@@ -9,6 +9,7 @@ R2-BUG-022：原子写入使用唯一临时文件
 """
 
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -110,3 +111,25 @@ class TestAtomicWriteUniqueTemp:
         raw = target.read_text(encoding="utf-8")
         assert "日本語テスト" in raw  # ensure_ascii=False
         assert json.loads(raw) == payload
+
+    def test_atomic_write_calls_fsync(self, tmp_path):
+        """P2-7：原子写入在 replace 前调用 fsync 刷盘。"""
+        from unittest.mock import patch
+
+        from src.infrastructure import atomic_file as atomic_mod
+
+        target = tmp_path / "fsync_check.txt"
+        fsync_calls: list[int] = []
+
+        real_fsync = os.fsync
+
+        def tracking_fsync(fd: int) -> None:
+            fsync_calls.append(fd)
+            real_fsync(fd)
+
+        with patch.object(atomic_mod.os, "fsync", side_effect=tracking_fsync):
+            write_text_atomic(target, "durable-content")
+
+        assert target.read_text(encoding="utf-8") == "durable-content"
+        assert fsync_calls, "原子写入必须调用 os.fsync 刷盘"
+

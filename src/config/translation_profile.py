@@ -173,14 +173,49 @@ def default_base_url_for_provider(provider: str) -> str:
     return "https://api.siliconflow.cn/v1"
 
 
+# P1-1：自定义 API 端点的 HTTP 回环白名单。
+# 只允许 HTTPS 远程传输 Bearer 密钥；HTTP 仅限本地回环，
+# 防止通过明文链路把密钥泄漏到网络中间设备。
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_loopback_host(host: str) -> bool:
+    """判断 host 是否属于本地回环（IPv4/IPv6/localhost）。
+
+    P1-1：仅对回环地址允许 HTTP，远程地址强制 HTTPS。
+    """
+    if not host:
+        return False
+    host_lower = host.lower().strip("[]")
+    if host_lower in _LOOPBACK_HOSTS:
+        return True
+    # 127.0.0.0/8 整段都是回环，但 IPv6 回环只有 ::1
+    if host_lower.count(".") == 3 and host_lower.split(".")[0] == "127":
+        try:
+            return all(0 <= int(octet) <= 255 for octet in host_lower.split("."))
+        except ValueError:
+            return False
+    return False
+
+
 def normalize_openai_base_url(value: str) -> str:
-    """Validate and normalize the root URL of an OpenAI-compatible API."""
+    """Validate and normalize the root URL of an OpenAI-compatible API.
+
+    P1-1：拒绝通过远程明文 HTTP 发送 Bearer 密钥。HTTPS 总是允许；
+    HTTP 仅对回环地址（``localhost`` / ``127.0.0.1`` / ``::1``）放行，
+    以保留本地推理服务（如 Ollama）的兼容路径。
+    """
     raw_url = (value or "").strip()
     parsed = urlsplit(raw_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("Base URL 必须是以 http:// 或 https:// 开头的有效地址")
     if parsed.query or parsed.fragment:
         raise ValueError("Base URL 不能包含查询参数或锚点")
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname or ""):
+        raise ValueError(
+            "远程 API 必须使用 HTTPS；如需使用本地推理服务（Ollama 等），"
+            "请使用 http://127.0.0.1、http://localhost 或 http://[::1]"
+        )
 
     path = parsed.path.rstrip("/")
     completion_path = "/chat/completions"

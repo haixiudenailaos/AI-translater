@@ -106,6 +106,7 @@ class TestSecretSaveResult:
             error_message="磁盘满",
         )
         assert bool(result) is False
+        assert result.failed
         assert "配置文件写入失败" in result.user_message
 
 
@@ -387,3 +388,22 @@ class TestSaveVolcKeySecretStatus:
 
         # 注入的 SecretStore 被调用
         assert ("volc:ark_api_key", "volc-injected") in store.store_calls
+
+
+def test_preset_save_stops_when_secret_storage_fails(tmp_config_manager):
+    store = FakeSecretStore(status=StorageStatus.FAILED)
+    tmp_config_manager._secret_store = store
+
+    assert not tmp_config_manager.save_api_and_model_preset("example", "secret", "model")
+    assert not (tmp_config_manager.config_dir / "api_presets.json").exists()
+
+
+def test_legacy_volc_file_is_retained_until_secret_is_persisted(tmp_config_manager):
+    store = FakeSecretStore(status=StorageStatus.SESSION_ONLY)
+    tmp_config_manager._secret_store = store
+    tmp_config_manager.volc_key_file.write_text(
+        '{"ark_api_key": "legacy-secret"}', encoding="utf-8"
+    )
+
+    assert tmp_config_manager.get_volc_key() == "legacy-secret"
+    assert tmp_config_manager.volc_key_file.exists()
