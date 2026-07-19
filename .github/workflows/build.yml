@@ -198,7 +198,6 @@ jobs:
 
       - name: Smoke test - start and exit
         shell: pwsh
-        run: |
         # P1-11：真实产物启动/退出 smoke——给 GUI 进程 15s 启动窗口，
         # 若进程仍在运行视为启动成功，随后强制结束。
         run: |
