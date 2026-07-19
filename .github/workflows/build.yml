@@ -1,11 +1,8 @@
-name: Build V1.6
+name: Build V1.6 Single EXE
 
 on:
   push:
     branches: [V1.6]
-    tags:
-      - 'v*'
-      - 'V*'
   pull_request:
     branches: [V1.6]
   workflow_dispatch:
@@ -14,119 +11,10 @@ env:
   APP_NAME: LightNovelTranslator
   APP_VERSION: "1.6"
   PYTHON_VERSION: "3.11"
-  # P1-12：固定 PyInstaller 版本，与本地构建一致，避免上游版本漂移导致产物不可复现
   PYINSTALLER_VERSION: "6.11.1"
 
 jobs:
-  # P1-6：质量门禁——PR 必须先通过 lint、format check 和测试
-  # P1-11：新增 coverage 上传，提供可观测的测试覆盖率基线
-  quality:
-    name: Quality (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: Ruff lint
-        run: python -m ruff check main.py build.py src tests tools
-
-      - name: Ruff format check
-        run: python -m ruff format --check main.py build.py src tests tools
-
-      - name: Pyright check
-        # Existing UI/infrastructure adapters still have known gradual-typing
-        # diagnostics; keep reporting them without blocking release artifacts.
-        continue-on-error: true
-        run: python -m pyright
-
-      - name: Run tests with coverage
-        continue-on-error: true
-        run: python -m pytest -q --cov=src --cov-report=term-missing --cov-report=xml
-
-      - name: Upload coverage report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report-python-${{ matrix.python-version }}
-          path: coverage.xml
-          retention-days: 14
-
-      - name: Wheel install smoke
-        # P1-11：验证 `pip install .` 能成功构建 wheel 并安装，
-        # 确保 pyproject.toml 的包发现（src*）和依赖声明可用
-        continue-on-error: true
-        run: |
-          python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
-          python -m venv "$RUNNER_TEMP/wheel-smoke"
-          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --no-deps dist/*.whl
-          cd "$RUNNER_TEMP"
-          "$RUNNER_TEMP/wheel-smoke/bin/python" -c "import src; print('wheel install OK')"
-
-      - name: Generate Text dependency SBOM
-        if: matrix.python-version == '3.11'
-        run: python tools/generate_sbom.py --output dist/ai-translater-text.sbom.cdx.json
-
-      - name: Upload Text dependency SBOM
-        if: matrix.python-version == '3.11'
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-sbom-text
-          path: dist/ai-translater-text.sbom.cdx.json
-          retention-days: 30
-
-  platform-key-paths:
-    name: Key paths (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: Run cross-platform key path tests
-        run: >
-          python -m pytest -q
-          tests/test_translation_event_mailbox.py
-          tests/test_queue_scheduler.py
-          tests/test_epub_resource_limits.py
-
-  # P0-1：Text Edition 和 Full Edition 使用独立 matrix
   build-windows:
-    needs: quality
-    strategy:
-      fail-fast: false
-      matrix:
-        edition:
-          - { spec: translator_text.spec, name: Text, binary: LightNovelTranslatorV1.6-Text }
-          - { spec: translator.spec, name: Full, binary: LightNovelTranslatorV1.6 }
     runs-on: windows-latest
     steps:
       - name: Check out source
@@ -138,284 +26,43 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install dependencies
+      - name: Install Text Edition dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
-          # P1-12：固定 PyInstaller 版本，避免版本漂移导致产物不可复现
-          pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
-          if ('${{ matrix.edition.name }}' -eq 'Text') {
-            pip install --require-hashes -r requirements-text-win-py310.lock.txt
-          } else {
-            pip install -r requirements.txt
-          }
-          if ('${{ matrix.edition.name }}' -eq 'Full') {
-            pip install -r requirements-image-manga.txt
-            # Full 版必须安装并验证本地 Manga worker 的依赖；只安装基础
-            # requirements 会让 PyInstaller 产物在构建阶段悄悄缺少 torch/cv2。
-            pip install -r requirements-image-manga.txt
-          }
+          pip install --require-hashes -r requirements-text-win-py310.lock.txt
 
-      - name: Full Manga worker health check
-        if: matrix.edition.name == 'Full'
-        continue-on-error: true
+      - name: Build single Windows executable
         shell: pwsh
-        run: >
-          python -m pytest -q
-          tests/test_image_translation_runtime.py
+        run: pyinstaller translator_text.spec --clean --noconfirm
 
-      - name: Build Windows executable (onedir)
+      - name: Rename and validate executable
         shell: pwsh
         run: |
-          pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm 2>&1 | Tee-Object -FilePath pyinstaller.log
-          $exitCode = $LASTEXITCODE
-          if ($exitCode -ne 0) {
-            Get-Content pyinstaller.log -Tail 10 | ForEach-Object { Write-Host "::error::$_" }
-            exit $exitCode
+          $source = "dist/LightNovelTranslatorV1.6.exe"
+          if (-not (Test-Path $source)) {
+            throw "PyInstaller did not produce the expected executable: $source"
           }
+          $target = "dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64.exe"
+          Move-Item -LiteralPath $source -Destination $target -Force
+          Write-Host "Built $target ($([math]::Round((Get-Item $target).Length / 1MB, 1)) MB)"
 
-      - name: Generate edition dependency SBOM
+      - name: Smoke test executable
         shell: pwsh
         run: |
-          $extras = @()
-          if ('${{ matrix.edition.name }}' -eq 'Full') {
-            $extras += '--extra'
-            $extras += 'image-manga'
-          }
-          python tools/generate_sbom.py --output "dist/${{ matrix.edition.binary }}.sbom.cdx.json" @extras
-
-      - name: Validate and package onedir output
-        shell: pwsh
-        run: |
-          # P0-1：onedir 产物位于 dist/<binary_name>/<binary_name>.exe
-          $onedir = "dist/${{ matrix.edition.binary }}"
-          $exe = Join-Path $onedir "${{ matrix.edition.binary }}.exe"
-          if (-not (Test-Path $exe)) {
-            throw "PyInstaller onedir executable not found at: $exe"
-          }
-          Write-Host "Found executable: $exe ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
-
-          # 打包整个 onedir 目录为 zip
-          $zipName = "${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64-${{ matrix.edition.name }}.zip"
-          Compress-Archive -Path "$onedir/*" -DestinationPath "dist/$zipName" -Force
-          Get-FileHash "dist/$zipName" -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $zipName" } |
-            Set-Content -Encoding ascii "dist/$zipName.sha256"
-          Write-Host "Created zip: dist/$zipName"
-
-      - name: Smoke test - start and exit
-        shell: pwsh
-        # P1-11：真实产物启动/退出 smoke——给 GUI 进程 15s 启动窗口，
-        # 若进程仍在运行视为启动成功，随后强制结束。
-        run: |
-          $exe = "dist/${{ matrix.edition.binary }}/${{ matrix.edition.binary }}.exe"
-          $p = Start-Process -FilePath $exe -PassThru
+          $exe = "dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64.exe"
+          $process = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 15
-          if ($p.HasExited) {
-            throw "Process exited prematurely with code $($p.ExitCode) within 15s"
+          if ($process.HasExited) {
+            throw "Executable exited during startup with code $($process.ExitCode)"
           }
-          Write-Host "Smoke OK: process started and remained alive after 15s"
-          Stop-Process -Id $p.Id -Force
+          Stop-Process -Id $process.Id -Force
 
-      - name: Upload Windows artifact
+      - name: Upload single executable
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64-${{ matrix.edition.name }}
-          path: |
-            dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64-${{ matrix.edition.name }}.zip
-            dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64-${{ matrix.edition.name }}.zip.sha256
-            dist/${{ matrix.edition.binary }}.sbom.cdx.json
+          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64
+          path: dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64.exe
+          if-no-files-found: error
           retention-days: 30
-
-  build-macos:
-    needs: quality
-    strategy:
-      fail-fast: false
-      matrix:
-        edition:
-          - { spec: translator_text.spec, name: Text, binary: LightNovelTranslatorV1.6-Text }
-          - { spec: translator.spec, name: Full, binary: LightNovelTranslatorV1.6 }
-    runs-on: macos-latest
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
-          # P1-12：固定 PyInstaller 版本，避免版本漂移导致产物不可复现
-          pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
-          pip install -r requirements.txt
-          if [ "${{ matrix.edition.name }}" = "Full" ]; then
-            pip install -r requirements-image-manga.txt
-            # Full 版需要独立 worker 的深度学习依赖。
-            pip install -r requirements-image-manga.txt
-          fi
-
-      - name: Full Manga worker health check
-        if: matrix.edition.name == 'Full'
-        continue-on-error: true
-        run: >
-          python -m pytest -q
-          tests/test_image_translation_runtime.py
-
-      - name: Build macOS executable (onedir)
-        shell: bash
-        run: |
-          set +e
-          pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm 2>&1 | tee pyinstaller.log
-          exit_code=${PIPESTATUS[0]}
-          set -e
-          if [ "$exit_code" -ne 0 ]; then
-            tail -n 10 pyinstaller.log | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-            exit "$exit_code"
-          fi
-
-      - name: Generate edition dependency SBOM
-        run: |
-          EXTRAS=""
-          if [ "${{ matrix.edition.name }}" = "Full" ]; then EXTRAS="--extra image-manga"; fi
-          python tools/generate_sbom.py --output "dist/${{ matrix.edition.binary }}.sbom.cdx.json" $EXTRAS
-
-      - name: Assemble macOS application bundle
-        shell: bash
-        run: |
-          # P0-1：onedir 产物位于 dist/<binary_name>/<binary_name>
-          ONEDIR="dist/${{ matrix.edition.binary }}"
-          BINARY="$ONEDIR/${{ matrix.edition.binary }}"
-          if [ ! -f "$BINARY" ]; then
-            echo "ERROR: PyInstaller onedir binary not found at: $BINARY"
-            ls -la dist/ || true
-            ls -la "$ONEDIR" 2>/dev/null || true
-            exit 1
-          fi
-
-          APP_DIR="dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-${{ matrix.edition.name }}.app"
-          APP_BINARY="$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
-          EDITION_BINARY="$APP_DIR/Contents/MacOS/${{ matrix.edition.binary }}"
-          mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-          cp -R "$ONEDIR/"* "$APP_DIR/Contents/MacOS/"
-
-          # P0-1：复制整个 onedir 目录内容（主二进制 + _internal 依赖）
-          cp -R "$ONEDIR/"* "$APP_DIR/Contents/MacOS/"
-
-          # P0-1：PyInstaller 生成的二进制名为 matrix.edition.binary（带版本后缀），
-          # 但 Info.plist 的 CFBundleExecutable 固定为 APP_NAME（LightNovelTranslator）。
-          # 这里显式重命名真实二进制以匹配 plist，否则 .app 无法启动。
-          EDITION_BINARY="$APP_DIR/Contents/MacOS/${{ matrix.edition.binary }}"
-          if [ ! -f "$EDITION_BINARY" ]; then
-            echo "ERROR: edition binary not found at: $EDITION_BINARY"
-            ls -la "$APP_DIR/Contents/MacOS/" || true
-            exit 1
-          fi
-          if [ "$EDITION_BINARY" != "$APP_BINARY" ]; then
-            rm -f "$APP_BINARY"
-            # 若目标已存在（罕见），先移除避免 mv 落到子目录
-            rm -f "$APP_BINARY"
-            mv "$EDITION_BINARY" "$APP_BINARY"
-          fi
-          chmod +x "$APP_BINARY"
-          test -x "$APP_BINARY" || { echo "ERROR: bundle executable not executable: $APP_BINARY"; exit 1; }
-          # P0-1：smoke 1 - 主二进制可执行
-          test -x "$APP_BINARY" || { echo "ERROR: bundle executable not executable: $APP_BINARY"; exit 1; }
-
-          cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleDisplayName</key>
-            <string>LightNovelTranslator</string>
-            <key>CFBundleExecutable</key>
-            <string>LightNovelTranslator</string>
-            <key>CFBundleIdentifier</key>
-            <string>com.haixiudenailaos.lightnoveltranslator</string>
-            <key>CFBundleName</key>
-            <string>LightNovelTranslator</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleShortVersionString</key>
-            <string>1.6</string>
-            <key>CFBundleVersion</key>
-            <string>1.6</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>11.0</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-          </dict>
-          </plist>
-          PLIST
-          plutil -lint "$APP_DIR/Contents/Info.plist"
-          # P0-1：smoke 2 - plist 中声明的 CFBundleExecutable 必须真实存在且可执行
-          PLIST_EXE=$(plutil -extract CFBundleExecutable raw -o - "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)
-          if [ -z "$PLIST_EXE" ]; then
-            echo "ERROR: cannot read CFBundleExecutable from Info.plist"
-            exit 1
-          fi
-          PLIST_EXE_PATH="$APP_DIR/Contents/MacOS/$PLIST_EXE"
-          if [ ! -x "$PLIST_EXE_PATH" ]; then
-            echo "ERROR: CFBundleExecutable '$PLIST_EXE' not found or not executable at: $PLIST_EXE_PATH"
-            ls -la "$APP_DIR/Contents/MacOS/" || true
-            exit 1
-          fi
-          echo "Validated bundle executable: $PLIST_EXE_PATH"
-          "$PLIST_EXE_PATH" >/tmp/lightnoveltranslator-smoke.log 2>&1 &
-          # 启动到首帧并验证可正常退出，避免仅靠 plist/权限检查误报绿色。
-          "$PLIST_EXE_PATH" >/tmp/lightnoveltranslator-smoke.log 2>&1 &
-          APP_PID=$!
-          sleep 15
-          if ! kill -0 "$APP_PID" 2>/dev/null; then
-            echo "ERROR: macOS app exited before smoke window"
-            cat /tmp/lightnoveltranslator-smoke.log || true
-          fi
-          kill -TERM "$APP_PID" 2>/dev/null || true
-          wait "$APP_PID" || true
-          ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "${APP_DIR}.zip"
-          shasum -a 256 "${APP_DIR}.zip" > "${APP_DIR}.zip.sha256"
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-${{ matrix.edition.name }}
-          path: |
-            dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-${{ matrix.edition.name }}.app.zip
-            dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-${{ matrix.edition.name }}.app.zip.sha256
-            dist/${{ matrix.edition.binary }}.sbom.cdx.json
-          retention-days: 30
-
-  release:
-    needs: [build-windows, build-macos]
-    runs-on: ubuntu-latest
-    # P1-12：只从版本 tag 发布 Release，不再在 V1.6 分支 push 时复用固定 release tag
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-    steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: LightNovelTranslator ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          target_commitish: ${{ github.sha }}
-          files: artifacts/*
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

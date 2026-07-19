@@ -158,9 +158,11 @@ pyz = PYZ(a.pure, a.zipped_data)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
-    name='LightNovelTranslatorV1.6-Text',
+    name='LightNovelTranslatorV1.6',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -180,16 +182,4 @@ exe = EXE(
     ),
     # 如果有图标文件，取消下面这行的注释
     # icon='assets/icon.ico',
-)
-
-# PERF §11.3：COLLECT 将 EXE 和所有二进制/数据收集到 onedir 目录，
-# 避免单文件启动时解包到临时目录的开销。
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    name='LightNovelTranslatorV1.6-Text',
 )
