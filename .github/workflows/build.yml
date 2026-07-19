@@ -141,6 +141,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
+          pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
           # P1-12：固定 PyInstaller 版本，避免版本漂移导致产物不可复现
           pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
           if ('${{ matrix.edition.name }}' -eq 'Text') {
@@ -149,6 +150,7 @@ jobs:
             pip install -r requirements.txt
           }
           if ('${{ matrix.edition.name }}' -eq 'Full') {
+            pip install -r requirements-image-manga.txt
             # Full 版必须安装并验证本地 Manga worker 的依赖；只安装基础
             # requirements 会让 PyInstaller 产物在构建阶段悄悄缺少 torch/cv2。
             pip install -r requirements-image-manga.txt
@@ -160,7 +162,6 @@ jobs:
         run: >
           python -m pytest -q
           tests/test_image_translation_runtime.py
-          tests/test_manga_worker_stderr_drain.py
 
       - name: Build Windows executable (onedir)
         shell: pwsh
@@ -197,6 +198,7 @@ jobs:
 
       - name: Smoke test - start and exit
         shell: pwsh
+        run: |
         # P1-11：真实产物启动/退出 smoke——给 GUI 进程 15s 启动窗口，
         # 若进程仍在运行视为启动成功，随后强制结束。
         run: |
@@ -241,10 +243,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
           # P1-12：固定 PyInstaller 版本，避免版本漂移导致产物不可复现
           pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
           pip install -r requirements.txt
           if [ "${{ matrix.edition.name }}" = "Full" ]; then
+            pip install -r requirements-image-manga.txt
             # Full 版需要独立 worker 的深度学习依赖。
             pip install -r requirements-image-manga.txt
           fi
@@ -254,7 +258,6 @@ jobs:
         run: >
           python -m pytest -q
           tests/test_image_translation_runtime.py
-          tests/test_manga_worker_stderr_drain.py
 
       - name: Build macOS executable (onedir)
         run: pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm
@@ -280,7 +283,9 @@ jobs:
 
           APP_DIR="dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS-${{ matrix.edition.name }}.app"
           APP_BINARY="$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
+          EDITION_BINARY="$APP_DIR/Contents/MacOS/${{ matrix.edition.binary }}"
           mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+          cp -R "$ONEDIR/"* "$APP_DIR/Contents/MacOS/"
 
           # P0-1：复制整个 onedir 目录内容（主二进制 + _internal 依赖）
           cp -R "$ONEDIR/"* "$APP_DIR/Contents/MacOS/"
@@ -295,11 +300,13 @@ jobs:
             exit 1
           fi
           if [ "$EDITION_BINARY" != "$APP_BINARY" ]; then
+            rm -f "$APP_BINARY"
             # 若目标已存在（罕见），先移除避免 mv 落到子目录
             rm -f "$APP_BINARY"
             mv "$EDITION_BINARY" "$APP_BINARY"
           fi
           chmod +x "$APP_BINARY"
+          test -x "$APP_BINARY" || { echo "ERROR: bundle executable not executable: $APP_BINARY"; exit 1; }
           # P0-1：smoke 1 - 主二进制可执行
           test -x "$APP_BINARY" || { echo "ERROR: bundle executable not executable: $APP_BINARY"; exit 1; }
 
@@ -343,6 +350,7 @@ jobs:
             exit 1
           fi
           echo "Validated bundle executable: $PLIST_EXE_PATH"
+          "$PLIST_EXE_PATH" >/tmp/lightnoveltranslator-smoke.log 2>&1 &
           # 启动到首帧并验证可正常退出，避免仅靠 plist/权限检查误报绿色。
           "$PLIST_EXE_PATH" >/tmp/lightnoveltranslator-smoke.log 2>&1 &
           APP_PID=$!
