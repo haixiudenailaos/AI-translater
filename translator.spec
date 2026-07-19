@@ -43,7 +43,7 @@ a = Analysis(
     ],
     binaries=[],
     datas=[
-        ('build/edition_full.json', 'edition.json'),
+        ('config/edition_full.json', 'edition.json'),
         # PERF §11.3：仅保留真正的非 Python 资源；src 模块由 Analysis/PYZ 收集。
         # 配置文件目录（仅包含示例文件和基础配置）
         ('config/api_config_sample.json', 'config'),
@@ -152,7 +152,11 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    manifest=str(project_root / 'windows.manifest'),
+    manifest=(
+        str(project_root / 'windows.manifest')
+        if (project_root / 'windows.manifest').exists()
+        else None
+    ),
     # 如果有图标文件，取消下面这行的注释
     # icon='assets/icon.ico',
 )

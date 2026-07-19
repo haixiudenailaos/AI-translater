@@ -121,6 +121,7 @@ jobs:
   build-windows:
     needs: quality
     strategy:
+      fail-fast: false
       matrix:
         edition:
           - { spec: translator_text.spec, name: Text, binary: LightNovelTranslatorV1.6-Text }
@@ -221,6 +222,7 @@ jobs:
   build-macos:
     needs: quality
     strategy:
+      fail-fast: false
       matrix:
         edition:
           - { spec: translator_text.spec, name: Text, binary: LightNovelTranslatorV1.6-Text }
