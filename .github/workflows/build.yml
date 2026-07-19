@@ -1,4 +1,4 @@
-name: Build V1.6 Single EXE
+name: Build V1.6 Desktop Artifacts
 
 on:
   push:
@@ -64,5 +64,80 @@ jobs:
         with:
           name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64
           path: dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Text Edition dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
+          pip install -r requirements.txt
+
+      - name: Build single macOS executable
+        run: pyinstaller translator_text.spec --clean --noconfirm
+
+      - name: Assemble macOS application
+        shell: bash
+        run: |
+          BINARY="dist/LightNovelTranslatorV1.6"
+          if [ ! -f "$BINARY" ]; then
+            echo "PyInstaller did not produce the expected binary: $BINARY"
+            exit 1
+          fi
+
+          APP_DIR="dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS.app"
+          APP_BINARY="$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
+          mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+          mv "$BINARY" "$APP_BINARY"
+          chmod +x "$APP_BINARY"
+
+          cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDisplayName</key>
+            <string>LightNovelTranslator</string>
+            <key>CFBundleExecutable</key>
+            <string>LightNovelTranslator</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.haixiudenailaos.lightnoveltranslator</string>
+            <key>CFBundleName</key>
+            <string>LightNovelTranslator</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.6</string>
+            <key>CFBundleVersion</key>
+            <string>1.6</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          plutil -lint "$APP_DIR/Contents/Info.plist"
+          test -x "$APP_BINARY"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "${APP_DIR}.zip"
+
+      - name: Upload macOS application
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS
+          path: dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS.app.zip
           if-no-files-found: error
           retention-days: 30

@@ -6,7 +6,7 @@ PERF §11.2/§11.3：onedir 发布结构，默认下载版本。
 - 仅包含 TXT/EPUB 文本翻译 + AI 图片翻译 Provider（在线 API）。
 - 明确排除本地 Manga 推理重依赖：torch、torchvision、cv2、onnxruntime、
   manga_translator 及相关深度学习栈，避免冷启动被重依赖主导。
-- onedir 避免单文件解包开销，启动时不再解压到临时目录。
+- onefile 生成单个可执行文件，保持与 V1.6 早期发布产物一致。
 - 冷启动期间不导入 Torch/OpenCV/ONNX Runtime，符合 §3.1 启动目标。
 - 需要本地图片推理的用户使用 translator.spec（Full Manga Edition）。
 """
@@ -154,7 +154,7 @@ a = Analysis(
 # 去除重复项
 pyz = PYZ(a.pure, a.zipped_data)
 
-# PERF §11.3：onedir 结构。EXE 只包含脚本和 PYZ，二进制由 COLLECT 收集到目录。
+# Text Edition onefile executable.
 exe = EXE(
     pyz,
     a.scripts,
