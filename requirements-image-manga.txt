@@ -109,6 +109,11 @@ google-genai>=1.0.0
 protobuf>=3.20.2,<6.0.0
 pandas>=2.1.0
 torch-summary>=1.4.5
+# Packages required by the Full PyInstaller analysis and manga runtime.
+opencv-python>=4.8.0,<4.10
+safetensors>=0.4.0
+tokenizers>=0.15.0,<0.20
+transformers>=4.38.0,<4.46
 
 # 上游 detection 包在注册 Paddle detector 时会导入该 Rust 扩展。
 --extra-index-url https://frederik-uni.github.io/manga-image-translator-rust/python/wheels/simple/
