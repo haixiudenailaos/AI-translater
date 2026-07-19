@@ -21,11 +21,25 @@ PyInstaller hook: manga-image-translator
 # inpainting 模块的 SD 配置 YAML（guided_ldm_inpaint4_v15.yaml / guided_ldm_inpaint9_v15.yaml）
 datas = [
     (
-        str(_manga_root / "inpainting" / "guided_ldm_inpaint4_v15.yaml"),
+        str(
+            __import__("pathlib").Path(__file__).resolve().parents[1]
+            / "third_party"
+            / "manga-image-translator"
+            / "manga_translator"
+            / "inpainting"
+            / "guided_ldm_inpaint4_v15.yaml"
+        ),
         "manga_translator/inpainting",
     ),
     (
-        str(_manga_root / "inpainting" / "guided_ldm_inpaint9_v15.yaml"),
+        str(
+            __import__("pathlib").Path(__file__).resolve().parents[1]
+            / "third_party"
+            / "manga-image-translator"
+            / "manga_translator"
+            / "inpainting"
+            / "guided_ldm_inpaint9_v15.yaml"
+        ),
         "manga_translator/inpainting",
     ),
 ]
@@ -33,12 +47,24 @@ datas = [
 # translators/tokenizers 下的预置 tokenizer 配置（deepseek 等）
 datas += [
     (
-        str(_manga_root / "translators" / "tokenizers" / "deepseek" / "tokenizer.json"),
+        str(
+            __import__("pathlib").Path(__file__).resolve().parents[1]
+            / "third_party"
+            / "manga-image-translator"
+            / "manga_translator"
+            / "translators"
+            / "tokenizers"
+            / "deepseek"
+            / "tokenizer.json"
+        ),
         "manga_translator/translators/tokenizers/deepseek",
     ),
     (
         str(
-            _manga_root
+            __import__("pathlib").Path(__file__).resolve().parents[1]
+            / "third_party"
+            / "manga-image-translator"
+            / "manga_translator"
             / "translators"
             / "tokenizers"
             / "deepseek"
