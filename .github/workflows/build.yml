@@ -167,7 +167,13 @@ jobs:
 
       - name: Build Windows executable (onedir)
         shell: pwsh
-        run: pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm
+        run: |
+          pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm 2>&1 | Tee-Object -FilePath pyinstaller.log
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            Get-Content pyinstaller.log -Tail 80 | ForEach-Object { Write-Host "::error::$_" }
+            exit $exitCode
+          }
 
       - name: Generate edition dependency SBOM
         shell: pwsh
@@ -262,7 +268,18 @@ jobs:
           tests/test_image_translation_runtime.py
 
       - name: Build macOS executable (onedir)
-        run: pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm
+        shell: bash
+        run: |
+          set +e
+          pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm 2>&1 | tee pyinstaller.log
+          exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ "$exit_code" -ne 0 ]; then
+            tail -n 80 pyinstaller.log | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit "$exit_code"
+          fi
 
       - name: Generate edition dependency SBOM
         run: |
