@@ -171,7 +171,7 @@ jobs:
           pyinstaller ${{ matrix.edition.spec }} --clean --noconfirm 2>&1 | Tee-Object -FilePath pyinstaller.log
           $exitCode = $LASTEXITCODE
           if ($exitCode -ne 0) {
-            Get-Content pyinstaller.log -Tail 80 | ForEach-Object { Write-Host "::error::$_" }
+            Get-Content pyinstaller.log -Tail 10 | ForEach-Object { Write-Host "::error::$_" }
             exit $exitCode
           }
 
@@ -275,7 +275,7 @@ jobs:
           exit_code=${PIPESTATUS[0]}
           set -e
           if [ "$exit_code" -ne 0 ]; then
-            tail -n 80 pyinstaller.log | while IFS= read -r line; do
+            tail -n 10 pyinstaller.log | while IFS= read -r line; do
               echo "::error::$line"
             done
             exit "$exit_code"
