@@ -23,9 +23,9 @@
 
 from __future__ import annotations
 
-from collections import deque
 import queue
 import time
+from collections import deque
 from threading import Lock
 from typing import Callable, List
 
@@ -99,7 +99,9 @@ class UICallbackMailbox:
 
         self._queue.put((self._clock(), run_latest))
 
-    def drain(self, max_callbacks: int = _DEFAULT_MAX_CALLBACKS_PER_POLL) -> List[Callable[[], None]]:
+    def drain(
+        self, max_callbacks: int = _DEFAULT_MAX_CALLBACKS_PER_POLL
+    ) -> List[Callable[[], None]]:
         """主线程排空邮箱，返回待执行回调列表（保持提交顺序）。
 
         只由 Tk 主线程调用（与 pump 轮询同步）。排空后邮箱为空。
@@ -247,10 +249,9 @@ class TkUICallbackPump:
         self._after_id = None
         if self._closed:
             return
-        started_at = self._clock()
         callbacks = self._take_callbacks_for_frame()
         executed_this_frame = 0
-        for index, callback in enumerate(callbacks):
+        for callback in callbacks:
             try:
                 callback()
                 self._executed_count += 1
