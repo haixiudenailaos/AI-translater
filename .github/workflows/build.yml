@@ -233,3 +233,27 @@ jobs:
           path: dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-macOS.app.zip
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish V1.6 release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/V1.6'
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.6
+          target_commitish: V1.6
+          name: LightNovelTranslator v1.6
+          generate_release_notes: true
+          files: release-assets/*
