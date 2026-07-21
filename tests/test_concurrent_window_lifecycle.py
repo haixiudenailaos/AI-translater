@@ -482,7 +482,6 @@ def test_main_window_reopens_queue_with_same_application_manager(monkeypatch):
     main.config_manager = object()
     main.app_paths = object()
     main._provider_limiter_registry = object()
-    main.edition_capabilities = object()
     main._queue_manager = None
     main._concurrent_window = None
 
@@ -494,4 +493,4 @@ def test_main_window_reopens_queue_with_same_application_manager(monkeypatch):
     assert len(created_windows) == 2
     assert created_windows[0].manager is created_windows[1].manager
     assert created_managers[0].kwargs["limiter_registry"] is main._provider_limiter_registry
-    assert created_windows[0].kwargs["edition_capabilities"] is main.edition_capabilities
+    assert "edition_capabilities" not in created_windows[0].kwargs

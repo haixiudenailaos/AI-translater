@@ -16,8 +16,8 @@ EPUB 图片重写模块
 
 import hashlib
 import io
-import mimetypes
 import posixpath
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 from types import MethodType
 from typing import Dict, Tuple
@@ -161,7 +161,7 @@ def add_translated_images(
     EPUB 导出修复（见 docs/EPUB_EXPORT_MIXED_TEXT_AND_BLANK_PAGE_REPAIR.md 5.3.1）：
     统一 result_map 的相对路径契约，兼容两种 provider 的输出：
 
-    - 新格式（Manga Provider）: {orig_path: "translated_images/manga/x.png"}
+    - 新格式: {orig_path: "translated_images/provider/x.png"}
       值为相对于 mapping_dir 的完整路径。
     - 旧格式（AI Provider）: {orig_path: "x.png"}
       值仅为文件名，文件位于 mapping_dir/images/。
@@ -200,14 +200,14 @@ def add_translated_images(
             continue
 
         try:
-            img_content = local_file.read_bytes()
-
-            original_item = _find_unique_image_item(book, orig_path)
-            valid, reason = _validate_replacement_geometry(original_item, img_content)
-            if not valid:
+            raw_img_content = local_file.read_bytes()
+            img_content, detected_media_type, reason = _prepare_replacement_image(raw_img_content)
+            if img_content is None or detected_media_type is None:
                 failed_images.append((orig_path, new_path_value, reason))
                 logger.error("翻译图片校验失败，保留原图: orig=%s, reason=%s", orig_path, reason)
                 continue
+
+            original_item = _find_unique_image_item(book, orig_path)
 
             # 规范化 EPUB 内资源路径
             # - 使用 POSIX 分隔符
@@ -217,10 +217,7 @@ def add_translated_images(
                 get_item_name(original_item) if original_item is not None else orig_path
             )
             orig_p = Path(original_epub_path)
-            detected_media_type = _detect_image_media_type(img_content)
-            media_type = (
-                detected_media_type or mimetypes.guess_type(local_file.name)[0] or "image/jpeg"
-            )
+            media_type = detected_media_type
             new_filename = _filename_for_media_type(local_file.name, media_type)
             new_epub_path = _normalize_epub_image_path(orig_p.parent, new_filename)
 
@@ -259,8 +256,8 @@ def add_translated_images(
 def _resolve_local_image_path(mapping_dir: Path, new_path_value: str | None) -> Path | None:
     """解析本地图片文件路径，兼容新旧两种 result_map 格式。
 
-    新格式（Manga Provider）: new_path_value 是相对于 mapping_dir 的路径，
-        如 "translated_images/manga/x.png"。
+    新格式: new_path_value 是相对于 mapping_dir 的路径，
+        如 "translated_images/provider/x.png"。
     旧格式（AI Provider）: new_path_value 仅是文件名（如 "x.png"），
         文件位于 mapping_dir/images/。
 
@@ -281,7 +278,7 @@ def _resolve_local_image_path(mapping_dir: Path, new_path_value: str | None) -> 
         logger.error("图片结果路径越出 mapping_dir，已拒绝: %s", new_path_value)
         return None
 
-    # 优先按相对路径解析（Manga Provider 新格式）
+    # 优先按相对路径解析新格式
     candidate = mapping_dir / value_norm
     if candidate.exists():
         return candidate
@@ -337,6 +334,74 @@ def _detect_image_media_type(data: bytes) -> str | None:
     return None
 
 
+def _prepare_replacement_image(data: bytes) -> tuple[bytes | None, str | None, str]:
+    """Accept every decodable image and normalize uncommon raster formats.
+
+    File extensions and a small set of magic-byte signatures are not reliable
+    enough to decide whether an AI-generated image is usable. Pillow performs
+    the actual decode. Formats that EPUB readers do not consistently support
+    are converted to PNG instead of rejecting an otherwise valid translation.
+    """
+    if not data:
+        return None, None, "结果图片为空"
+
+    media_type = _detect_image_media_type(data)
+    if media_type == "image/svg+xml":
+        lowered = data.lower()
+        if b"<!doctype" in lowered or b"<!entity" in lowered:
+            return None, None, "结果图片损坏: SVG 不允许声明外部实体"
+        try:
+            root = ElementTree.fromstring(data)
+        except ElementTree.ParseError as exc:
+            return None, None, f"结果图片损坏: {exc}"
+        if root.tag.rsplit("}", 1)[-1].lower() != "svg":
+            return None, None, "结果图片损坏: SVG 根元素无效"
+        for element in root.iter():
+            local_name = element.tag.rsplit("}", 1)[-1].lower()
+            if local_name in {"script", "foreignobject"}:
+                return None, None, "结果图片损坏: SVG 包含不安全内容"
+            for attribute, value in element.attrib.items():
+                attribute_name = attribute.rsplit("}", 1)[-1].lower()
+                if attribute_name.startswith("on"):
+                    return None, None, "结果图片损坏: SVG 包含事件处理器"
+                if attribute_name == "href" and value and not value.startswith("#"):
+                    return None, None, "结果图片损坏: SVG 包含外部资源"
+        return data, media_type, ""
+
+    try:
+        from PIL import Image
+    except ImportError:
+        if media_type is None:
+            return None, None, "无法识别结果图片格式"
+        return data, media_type, ""
+
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            width, height = image.size
+            decoded_media_type = Image.MIME.get(str(image.format or "").upper())
+
+            if width <= 0 or height <= 0:
+                return None, None, "结果图片尺寸无效"
+
+            if decoded_media_type in _MEDIA_TYPE_EXTENSIONS:
+                return data, decoded_media_type, ""
+
+            output = io.BytesIO()
+            normalized = image
+            if image.mode not in {"1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"}:
+                normalized = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+            normalized.save(output, format="PNG")
+            normalized_data = output.getvalue()
+            logger.info(
+                "翻译图片格式 %s 已转换为 PNG 以确保 EPUB 兼容",
+                image.format or "unknown",
+            )
+            return normalized_data, "image/png", ""
+    except Exception as exc:
+        return None, None, f"结果图片损坏或无法解码: {exc}"
+
+
 def _find_unique_image_item(book, image_path: str):
     matches = []
     try:
@@ -388,44 +453,10 @@ def _collect_cover_image_paths(book) -> set[str]:
 
 
 def _validate_replacement_geometry(original_item, replacement: bytes) -> tuple[bool, str]:
-    """Reject corrupt or substantially different aspect ratios to prevent blank pages."""
-    if not replacement:
-        return False, "结果图片为空"
-    if _detect_image_media_type(replacement) is None:
-        return False, "无法识别结果图片格式"
-
-    try:
-        from PIL import Image
-    except ImportError:
-        return True, ""
-
-    try:
-        with Image.open(io.BytesIO(replacement)) as new_image:
-            new_width, new_height = new_image.size
-            new_image.verify()
-    except Exception as exc:
-        return False, f"结果图片损坏: {exc}"
-
-    if new_width <= 0 or new_height <= 0:
-        return False, "结果图片尺寸无效"
-    if original_item is None:
-        return True, ""
-
-    try:
-        original = original_item.get_content()
-        with Image.open(io.BytesIO(original)) as old_image:
-            old_width, old_height = old_image.size
-    except Exception:
-        return True, ""
-
-    old_ratio = old_width / old_height
-    new_ratio = new_width / new_height
-    ratio_delta = abs(new_ratio / old_ratio - 1.0)
-    if ratio_delta > 0.03:
-        return False, (
-            f"结果图片宽高比与原图不一致 ({old_width}x{old_height} -> {new_width}x{new_height})"
-        )
-    return True, ""
+    """Compatibility wrapper: only reject empty or undecodable images."""
+    del original_item
+    content, media_type, reason = _prepare_replacement_image(replacement)
+    return content is not None and media_type is not None, reason
 
 
 def _generate_image_uid(orig_path: str) -> str:

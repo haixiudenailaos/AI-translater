@@ -18,7 +18,6 @@ from ..application.document_session import (
 )
 from ..application.translation_document import TranslationDocument
 from ..core.epub_processor import EpubImportCancelled
-from ..domain.edition import EditionCapabilities, detect_edition_capabilities
 from ..infrastructure.mapping_repository import resolve_mapping_file
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 
@@ -47,7 +46,6 @@ class FileImporter:
         confirm_replace_session: Callable[[], str] | None = None,
         confirm_stop_active_translation: Callable[[], bool] | None = None,
         document: TranslationDocument | None = None,
-        edition_capabilities: EditionCapabilities | None = None,
     ):
         """
         初始化文件导入控制器
@@ -67,7 +65,6 @@ class FileImporter:
                 守卫。确认后负责停止旧请求并清理运行状态，返回是否可以替换。
             document: 可选的应用级文档模型。传入后，导入会话与主窗口共享
                 同一个 ``TranslationDocument``，避免模型和会话各自维护副本。
-            edition_capabilities: Text/Full 版本能力契约。Text 版本不提示 Manga 处理。
         """
         self.root = root
         self.config_manager = config_manager
@@ -79,11 +76,6 @@ class FileImporter:
         self._confirm_replace_session = confirm_replace_session
         self._confirm_stop_active_translation = confirm_stop_active_translation
         self._document = document
-        self.edition_capabilities = (
-            edition_capabilities
-            if edition_capabilities is not None
-            else detect_edition_capabilities()
-        )
 
         # P0-3/P0-6：会话状态唯一真相来源，所有路径字段通过属性委派
         self._session: DocumentSession = DocumentSession.empty()
@@ -613,16 +605,7 @@ class FileImporter:
         self._check_epub_images_for_text()
 
     def _check_epub_images_for_text(self):
-        """EPUB 导入后询问是否使用默认图片翻译模块处理。
-
-        接入 Manga 模块后：不再检查火山 Key，直接走默认 Manga 模块。
-        """
-        capabilities = getattr(self, "edition_capabilities", None)
-        if capabilities is None:
-            capabilities = detect_edition_capabilities()
-        if not capabilities.manga_enabled:
-            return
-
+        """EPUB 导入后询问是否运行 V1.5 智能图片翻译。"""
         if not self.current_mapping_dir:
             return
 
@@ -652,12 +635,12 @@ class FileImporter:
 
         img_count = len(images_data["image_mappings"])
 
-        # 弹出确认对话框：走默认 Manga 模块，不检查火山 Key
+        # V1.5 流程：先用视觉模型筛选，再翻译命中的图片。
         do_translate = messagebox.askyesno(
-            "图片翻译",
-            f"检测到 EPUB 包含 {img_count} 张图片，"
-            "是否使用默认图片翻译模块处理？\n\n"
-            "（可稍后通过「项目 - 图片翻译」手动触发）",
+            "图片文字检测",
+            f"检测到 EPUB 中包含 {img_count} 张图片。\n"
+            "是否使用视觉模型检测外文文字并自动生成译图？\n\n"
+            "（需要配置火山引擎 API Key，可稍后通过「图片翻译」手动触发）",
         )
 
         if do_translate:

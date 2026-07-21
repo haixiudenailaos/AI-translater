@@ -392,6 +392,37 @@ class TestSaveVolcKeySecretStatus:
         assert ("volc:ark_api_key", "volc-injected") in store.store_calls
 
 
+class TestSaveOcrKeySecretStatus:
+    def test_ocr_key_is_stored_separately(self, tmp_config_manager):
+        store = FakeSecretStore(status=StorageStatus.PERSISTED)
+        tmp_config_manager._secret_store = store
+
+        result = tmp_config_manager.save_ocr_key("ocr-secret")
+
+        assert result.persisted
+        assert result.provider == "ocr"
+        assert store.stored["ocr:api_key"] == "ocr-secret"
+        assert tmp_config_manager.get_ocr_key() == "ocr-secret"
+
+    def test_ocr_key_failure_blocks_save(self, tmp_config_manager):
+        tmp_config_manager._secret_store = FakeSecretStore(status=StorageStatus.FAILED)
+
+        result = tmp_config_manager.save_ocr_key("ocr-secret")
+
+        assert result.failed
+        assert not result.config_saved
+
+    def test_ocr_key_result_does_not_leak_credential(self, tmp_config_manager):
+        tmp_config_manager._secret_store = FakeSecretStore(status=StorageStatus.PERSISTED)
+        secret = "ocr-super-secret-12345"
+
+        result = tmp_config_manager.save_ocr_key(secret)
+
+        assert secret not in str(result)
+        assert secret not in result.error_message
+        assert secret not in result.user_message
+
+
 def test_preset_save_stops_when_secret_storage_fails(tmp_config_manager):
     store = FakeSecretStore(status=StorageStatus.FAILED)
     tmp_config_manager._secret_store = store

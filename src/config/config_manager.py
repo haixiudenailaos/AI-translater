@@ -20,6 +20,10 @@ from ..utils.logger import get_logger
 
 # P1-4：移除全局 get_key/store_key/delete_key 导入，密钥读写全部走注入的 SecretStore。
 # 这样测试可通过注入 FakeSecretStore 验证密钥操作，不依赖 keyring 后端。
+from .image_ocr import (
+    SILICONFLOW_OCR_DEFAULT_BASE_URL,
+    SILICONFLOW_OCR_DEFAULT_MODEL,
+)
 from .translation_profile import (
     DEFAULT_QUEUE_ADAPTIVE_CONCURRENCY,
     DEFAULT_QUEUE_HARD_REQUEST_CAP,
@@ -92,17 +96,14 @@ class ConfigManager:
             "auto_save": True,
             "translation_prompt": self._get_default_prompt(),
             "prompt_schema_version": DEFAULT_PROMPT_SCHEMA_VERSION,
-            "vision_model_name": "Pro/Qwen/Qwen2.5-VL-7B-Instruct",
+            "vision_model_name": SILICONFLOW_OCR_DEFAULT_MODEL,
             "image_text_translation_enabled": True,
             "image_gen_provider": "volcengine",
             "image_translation": {
-                "default_provider": "manga",
-                "manga": {
-                    "quality_preset": "standard",
-                    "device": "auto",
-                    "model_dir": "",
-                    "python_executable": "",
-                    "batch_size": 1,
+                "default_provider": "ai_volcengine",
+                "ocr": {
+                    "base_url": "",
+                    "model": SILICONFLOW_OCR_DEFAULT_MODEL,
                 },
                 "ai_volcengine": {
                     "provider": "volcengine",
@@ -497,11 +498,22 @@ class ConfigManager:
                     # token 预算改为内部自动策略，不再保留用户侧上限字段。
                     merged_config.pop("batch_max_input_tokens", None)
                     merged_config.pop("queue_batch_max_input_tokens", None)
-                    # 图片翻译配置迁移：缺 image_translation 时补齐，
-                    # default_provider 固定为 manga
-                    merged_config["image_translation"] = self._migrate_image_translation_config(
-                        merged_config.get("image_translation")
+                    # 图片翻译配置迁移：移除旧本地引擎字段并补齐 AI 配置。
+                    raw_image_translation = config.get("image_translation")
+                    merged_image_translation = self._migrate_image_translation_config(
+                        raw_image_translation
                     )
+                    has_explicit_ocr = isinstance(raw_image_translation, dict) and isinstance(
+                        raw_image_translation.get("ocr"), dict
+                    )
+                    legacy_vision_model = config.get("vision_model_name")
+                    if (
+                        not has_explicit_ocr
+                        and isinstance(legacy_vision_model, str)
+                        and legacy_vision_model.strip()
+                    ):
+                        merged_image_translation["ocr"]["model"] = legacy_vision_model.strip()
+                    merged_config["image_translation"] = merged_image_translation
                     # 新手指导配置归一化：顶层浅合并不会处理子字段，
                     # 这里对 onboarding 段再做一次默认值合并。
                     merged_config["onboarding"] = self._normalize_onboarding_config(
@@ -582,37 +594,29 @@ class ConfigManager:
         """迁移图片翻译配置。
 
         规则：
-        1. 配置缺少 image_translation 时自动补齐，default_provider 固定为 manga。
+        1. 配置缺少 image_translation 时自动补齐，默认使用在线 AI 流程。
         2. 保留旧 image_gen_provider 和密钥环中的 volc:ark_api_key。
-        3. 旧 image_text_translation_enabled 不再控制默认模块。
-        4. 用户单次选择 AI 不写回 default_provider（由调用方保证）。
+        3. 丢弃 V1.6 曾引入的本地图片引擎配置。
+        4. 保留自定义 OCR 地址和模型，密钥单独存入 SecretStore。
         """
         default = self.default_app_config["image_translation"]
         if not existing or not isinstance(existing, dict):
-            return default.copy()
+            return copy.deepcopy(default)
 
-        merged = default.copy()
-        # 深合并子段
-        for section in ("manga", "ai_volcengine"):
-            if section in existing and isinstance(existing[section], dict):
-                merged_section = default.get(section, {}).copy()
-                merged_section.update(existing[section])
-                merged[section] = merged_section
-        # default_provider 强制为 manga（不信任旧值，避免被篡改为 AI）
-        merged["default_provider"] = "manga"
-        # 保留用户在 manga 段的自定义字段
-        if "manga" in existing:
-            manga_existing = existing["manga"]
-            if isinstance(manga_existing, dict):
-                manga_merged = merged.get("manga", {})
-                manga_merged.update(manga_existing)
-                merged["manga"] = manga_merged
+        merged = copy.deepcopy(default)
+        if "ocr" in existing:
+            ocr_existing = existing["ocr"]
+            if isinstance(ocr_existing, dict):
+                ocr_merged = merged.get("ocr", {})
+                ocr_merged.update(ocr_existing)
+                merged["ocr"] = ocr_merged
         if "ai_volcengine" in existing:
             ai_existing = existing["ai_volcengine"]
             if isinstance(ai_existing, dict):
                 ai_merged = merged.get("ai_volcengine", {})
                 ai_merged.update(ai_existing)
                 merged["ai_volcengine"] = ai_merged
+        merged["default_provider"] = "ai_volcengine"
         return merged
 
     def get_image_translation_config(self) -> Dict[str, Any]:
@@ -620,9 +624,61 @@ class ConfigManager:
         with self._app_config_lock:
             return copy.deepcopy(self.app_config.get("image_translation", {}))
 
+    def get_image_ocr_runtime_config(self) -> Dict[str, Any]:
+        """Resolve the OCR endpoint without exposing one provider's key to another.
+
+        A custom URL always uses the dedicated OCR key. When the custom URL is
+        empty, a saved SiliconFlow key activates the built-in PaddleOCR-VL
+        endpoint automatically.
+        """
+        image_config = self.get_image_translation_config()
+        ocr_config = image_config.get("ocr", {})
+        if not isinstance(ocr_config, dict):
+            ocr_config = {}
+
+        model = str(ocr_config.get("model") or SILICONFLOW_OCR_DEFAULT_MODEL).strip()
+        custom_base_url = str(ocr_config.get("base_url") or "").strip()
+        if custom_base_url:
+            try:
+                normalized_url = normalize_openai_base_url(custom_base_url)
+            except ValueError as exc:
+                return {
+                    "configured": False,
+                    "source": "custom",
+                    "base_url": custom_base_url,
+                    "model_name": model,
+                    "api_key": "",
+                    "error": str(exc),
+                }
+            custom_key = self.get_ocr_key()
+            return {
+                "configured": bool(custom_key and model),
+                "source": "custom",
+                "base_url": normalized_url,
+                "model_name": model,
+                "api_key": custom_key,
+                "error": "" if custom_key else "自定义 OCR API Key 未配置",
+            }
+
+        siliconflow_key = self.get_provider_key("siliconflow")
+        return {
+            "configured": bool(siliconflow_key and model),
+            "source": "siliconflow" if siliconflow_key else "none",
+            "base_url": SILICONFLOW_OCR_DEFAULT_BASE_URL if siliconflow_key else "",
+            "model_name": model,
+            "api_key": siliconflow_key,
+            "error": "" if siliconflow_key else "未配置 OCR 或硅基流动 API Key",
+        }
+
+    def is_image_ocr_configured(self) -> bool:
+        """返回当前是否有可用的 OCR 预筛选服务。"""
+        if not self.get_app_config().get("image_text_translation_enabled", True):
+            return False
+        return bool(self.get_image_ocr_runtime_config().get("configured"))
+
     def get_default_image_translation_provider(self) -> str:
-        """获取默认图片翻译 Provider id（始终为 manga）。"""
-        return "manga"
+        """获取默认图片翻译 Provider id。"""
+        return "ai_volcengine"
 
     def save_app_config(self, config: Dict[str, Any]) -> bool:
         """保存应用配置"""
@@ -1079,6 +1135,62 @@ class ConfigManager:
             logger.error("删除API预设失败: %s", e)
 
         return False
+
+    def save_ocr_key(self, api_key: str) -> SecretSaveResult:
+        """保存自定义 OCR API Key，不将密钥写入应用配置。"""
+        api_key = (api_key or "").strip()
+        secret_store = self._get_secret_store()
+        try:
+            secret_status = secret_store.store("ocr:api_key", api_key)
+        except Exception as exc:
+            logger.error("存储 OCR API Key 失败: %s", exc)
+            return SecretSaveResult(
+                secret_status=StorageStatus.FAILED,
+                config_saved=False,
+                error_message=f"OCR API Key 存储异常: {exc}",
+                provider="ocr",
+            )
+
+        if secret_status == StorageStatus.FAILED:
+            return SecretSaveResult(
+                secret_status=StorageStatus.FAILED,
+                config_saved=False,
+                error_message="OCR API Key 存储失败",
+                provider="ocr",
+            )
+
+        try:
+            read_back = (secret_store.retrieve("ocr:api_key") or "").strip()
+        except Exception as exc:
+            logger.error("回读 OCR API Key 失败: %s", exc)
+            return SecretSaveResult(
+                secret_status=StorageStatus.FAILED,
+                config_saved=False,
+                error_message="OCR API Key 保存后无法回读",
+                provider="ocr",
+            )
+        if not hmac.compare_digest(read_back, api_key):
+            logger.error("OCR API Key 保存后回读不一致")
+            return SecretSaveResult(
+                secret_status=StorageStatus.FAILED,
+                config_saved=False,
+                error_message="OCR API Key 保存后校验失败",
+                provider="ocr",
+            )
+
+        return SecretSaveResult(
+            secret_status=secret_status,
+            config_saved=True,
+            provider="ocr",
+        )
+
+    def get_ocr_key(self) -> str:
+        """读取自定义 OCR API Key。"""
+        try:
+            return (self._get_secret_store().retrieve("ocr:api_key") or "").strip()
+        except Exception as exc:
+            logger.warning("读取 OCR API Key 失败: %s", exc)
+            return ""
 
     def save_volc_key(self, api_key: str) -> SecretSaveResult:
         """保存火山引擎API密钥（BUG-009：存入密钥环，不再写入 JSON 文件）

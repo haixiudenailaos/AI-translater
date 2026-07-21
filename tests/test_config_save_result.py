@@ -381,8 +381,11 @@ class TestApiConfigRuntimeSnapshot:
         )
 
         app_snapshot = tmp_config_manager.get_app_config()
-        app_snapshot["image_translation"]["manga"]["batch_size"] = 99
-        assert tmp_config_manager.get_app_config()["image_translation"]["manga"]["batch_size"] != 99
+        app_snapshot["image_translation"]["ai_volcengine"]["model"] = "changed"
+        assert (
+            tmp_config_manager.get_app_config()["image_translation"]["ai_volcengine"]["model"]
+            != "changed"
+        )
 
         glossary_snapshot = tmp_config_manager.get_glossary()
         glossary_snapshot["categories"].append("测试")

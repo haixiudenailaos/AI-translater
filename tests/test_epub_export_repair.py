@@ -23,7 +23,7 @@ EPUB 导出"原文混入与图片相邻空白页"修复回归测试
 - 同名图片、不同目录不会 UID 冲突
 - OEBPS/EPUB/OPS 路径坐标被保留
 - 封面不会被批量插图翻译覆盖
-- 宽高比异常的结果图片回退到原图
+- 可解码的结果图片不受宽高比限制
 """
 
 import json
@@ -334,8 +334,8 @@ class TestAddTranslatedImagesBothFormats:
         assert path_mapping == {}
         assert original.get_content().startswith(b"\xff\xd8\xff")
 
-    def test_wrong_aspect_ratio_falls_back_to_original(self, tmp_path):
-        """明显改变版式比例的生成图不能进入 EPUB。"""
+    def test_different_aspect_ratio_is_accepted(self, tmp_path):
+        """可正常解码的生成图不应因宽高比变化而被拒绝。"""
         from io import BytesIO
 
         from ebooklib import epub
@@ -365,8 +365,34 @@ class TestAddTranslatedImagesBothFormats:
             tmp_path,
         )
 
-        assert failed == 1
-        assert path_mapping == {}
+        assert failed == 0
+        assert path_mapping["Images/inner.png"].endswith("inner_translated.png")
+
+    def test_decodable_uncommon_format_is_converted_to_png(self, tmp_path):
+        """能正常解码的非常用格式应转为 EPUB 兼容的 PNG。"""
+        book = self._make_book()
+        images_dir = tmp_path / "images"
+        images_dir.mkdir()
+
+        buffer = BytesIO()
+        Image.new("RGB", (32, 24), "white").save(buffer, "BMP")
+        (images_dir / "translated_result.jpg").write_bytes(buffer.getvalue())
+
+        path_mapping, failed = add_translated_images(
+            book,
+            {"Images/inner.jpg": "translated_result.jpg"},
+            tmp_path,
+        )
+
+        assert failed == 0
+        assert path_mapping["Images/inner.jpg"].endswith("translated_result.png")
+        translated_item = next(
+            item
+            for item in book.get_items()
+            if getattr(item, "file_name", "").endswith("translated_result.png")
+        )
+        assert translated_item.media_type == "image/png"
+        assert translated_item.get_content().startswith(b"\x89PNG\r\n\x1a\n")
 
 
 # ── 8.3 src query/fragment 匹配 ────────────────────────

@@ -1,48 +1,38 @@
 #!/usr/bin/env python3
-"""
-图片翻译处理器模块
+"""V1.5-style AI image translation workflow.
 
-接入 manga-image-translator 模块后的统一入口：
-- 「本地模块翻译」按钮启动 Manga Provider。
-- 「AI 图片翻译」按钮仅由用户显式选择并二次确认后调用火山图生图。
-- 一次性选择 AI 不得改变后续默认值；下次点击主按钮仍运行 Manga Provider。
-- Manga 失败时只显示失败原因、重试和设置入口，不显示自动切换 AI。
-- 未配置火山引擎 Key 时不影响 Manga 默认模块。
+The primary flow uses the configured vision model to find images containing
+foreign text, then sends only those images to Volcengine image-to-image
+translation. Users can also explicitly translate every image.
 """
 
+from __future__ import annotations
+
+import json
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 from typing import Callable
 
-from ..domain.edition import EditionCapabilities, detect_edition_capabilities
-from ..domain.errors import (
-    ImageTranslationCancelled,
-    ImageTranslationConfigError,
-)
-from ..domain.image_translation import (
-    ImageTranslationProgress,
-    ImageTranslationProviderId,
-)
-from ..domain.translation import OperationStatus
+from ..domain.errors import ImageTranslationCancelled
+from ..infrastructure.image_asset_store import migrate_legacy_images
 from ..infrastructure.mapping_repository import resolve_mapping_file
 from ..utils.logger import get_logger
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 
 logger = get_logger(__name__)
 
+_CLOSE_TIMEOUT_SECONDS = 5.0
+_MODE_DIALOG_MIN_WIDTH = 460
+_MODE_DIALOG_MIN_HEIGHT = 320
+_MODE_DIALOG_SCREEN_MARGIN = 32
+_MODE_DIALOG_DESCRIPTION_WIDTH = 412
+
 
 class ImageTranslationHandler:
-    """处理图片翻译相关功能的控制器"""
-
-    _MANGA_AI_GUIDANCE = "本地 Manga 图片翻译暂时不可用，请先使用「AI 图片翻译」。"
-    _MANGA_DISABLED_TEXT_MSG = (
-        "当前为 Text Edition，未打包本地 Manga 推理依赖。\n\n"
-        "如需使用本地模块图片翻译，请下载 Full Edition。"
-    )
-    _CLOSE_TIMEOUT_SECONDS = 10.0
+    """Coordinate the V1.5 vision-detection and image-generation flow."""
 
     def __init__(
         self,
@@ -50,13 +40,11 @@ class ImageTranslationHandler:
         config_manager,
         status_updater: Callable[[str], None],
         image_progress_updater: Callable[[str], None],
-        get_mapping_dir: Callable,
-        open_settings: Callable,
+        get_mapping_dir: Callable[[], Path | None],
+        open_settings: Callable[[], None],
         busy_state_updater: Callable[[bool], None] | None = None,
-        app_paths=None,
-        font_path: str | None = None,
-        edition_capabilities: EditionCapabilities | None = None,
-    ):
+        **_legacy_options,
+    ) -> None:
         self.root = root
         self.config_manager = config_manager
         self.status_updater = status_updater
@@ -64,388 +52,309 @@ class ImageTranslationHandler:
         self.get_mapping_dir = get_mapping_dir
         self.open_settings = open_settings
         self.busy_state_updater = busy_state_updater or (lambda _busy: None)
-        self._app_paths = app_paths
-        self._font_path = font_path
-        self._service = None  # 惰性创建 ImageTranslationService
+
         self._worker_thread: threading.Thread | None = None
+        self._cancel_event = threading.Event()
+        self._active_text_translator = None
+        self._active_image_translator = None
         self._closed = False
 
-        # P0-2：版本能力契约。Text 版本不导入 Manga 模块、不注册 Provider。
-        # ``None`` 时从运行时检测获取（manga_translator 是否可导入）。
-        self._edition_capabilities = (
-            edition_capabilities
-            if edition_capabilities is not None
-            else detect_edition_capabilities()
-        )
-
-        # P1-1：UI 回调邮箱 + Tk 主线程事件泵
-        # 工作线程只调用 ``_ui_mailbox.submit(func)``，不再直接调用 ``root.after()``。
-        # 仅当 root 支持 Tk ``after`` 时启动 pump（测试替身可能不支持）。
         self._ui_mailbox = UICallbackMailbox()
-        self._ui_pump: TkUICallbackPump | None = None
-        if hasattr(root, "after"):
-            self._ui_pump = TkUICallbackPump(root, self._ui_mailbox)
-            self._ui_pump.start()
+        self._ui_pump = TkUICallbackPump(root, self._ui_mailbox)
+        self._ui_pump.start()
 
-    # ── 版本能力 ──────────────────────────────────
-
-    @property
-    def edition_capabilities(self) -> EditionCapabilities:
-        """当前版本能力契约（只读）。"""
-        return self._edition_capabilities
-
-    @property
-    def manga_enabled(self) -> bool:
-        """是否启用本地 Manga 图片翻译入口。"""
-        return self._edition_capabilities.manga_enabled
-
-    # ── Service 构建（惰性） ──────────────────────────────────
-
-    def _get_service(self):
-        """惰性创建并缓存 ImageTranslationService，按版本能力注册 Provider。"""
-        if self._service is not None:
-            return self._service
-
-        from ..application.image_translation_service import ImageTranslationService
-        from ..infrastructure.image_translation.registry import (
-            ImageTranslationProviderRegistry,
-        )
-
-        registry = ImageTranslationProviderRegistry()
-
-        # P0-2：仅在 Full 版本注册 Manga Provider。Text 版本禁止触碰 Manga 模块，
-        # 防止运行时 ImportError（spec excludes 已移除 manga_translator）。
-        if self._edition_capabilities.manga_enabled:
-            manga_provider = self._create_manga_provider()
-            if manga_provider is not None:
-                registry.register(manga_provider)
-        else:
-            registry.manga_provider_available = False
-            logger.info("Text Edition：跳过 Manga Provider 注册")
-
-        # 注册火山 AI Provider（Text/Full 共用）
-        from ..infrastructure.image_translation.volcengine_provider import (
-            VolcengineImageTranslationProvider,
-        )
-
-        registry.register(VolcengineImageTranslationProvider(self.config_manager))
-
-        self._service = ImageTranslationService(self.config_manager, registry)
-        return self._service
-
-    def _create_manga_provider(self):
-        """创建 Manga Provider，配置模型目录和质量预设。"""
-        from ..infrastructure.image_translation.manga_provider import (
-            MangaImageTranslationProvider,
-        )
-
-        img_config = self.config_manager.get_image_translation_config()
-        manga_cfg = img_config.get("manga", {})
-
-        # 模型目录：AppPaths 用户数据目录下的 models/manga
-        model_dir = None
-        if self._app_paths is not None:
-            model_dir = Path(self._app_paths.data_dir) / "models" / "manga"
-            model_dir.mkdir(parents=True, exist_ok=True)
-        elif manga_cfg.get("model_dir"):
-            model_dir = Path(manga_cfg["model_dir"])
-
-        return MangaImageTranslationProvider(
-            self.config_manager,
-            model_dir=model_dir,
-            resource_dir=(
-                Path(self._app_paths.resource_dir) if self._app_paths is not None else None
-            ),
-            font_path=self._font_path,
-            quality_preset=manga_cfg.get("quality_preset", "standard"),
-            device=manga_cfg.get("device", "auto"),
-            python_executable=manga_cfg.get("python_executable") or None,
-        )
-
-    # ── 本地模块入口 ──────────────────────────────────
-
-    def start_image_translation(self):
-        """运行本地 Manga 图片翻译模块。"""
-        # P0-2：Text Edition 未打包 Manga 依赖，直接拒绝并提示。
-        if not self._edition_capabilities.manga_enabled:
-            messagebox.showwarning("图片翻译", self._MANGA_DISABLED_TEXT_MSG)
+    def start_image_translation(self) -> None:
+        """Open the V1.5 image translation mode chooser."""
+        mapping_dir = self._validate_mapping_dir()
+        if mapping_dir is None:
             return
-
-        current_mapping_dir = self.get_mapping_dir()
-        if not current_mapping_dir:
-            messagebox.showwarning("图片翻译", "请先导入EPUB文件")
-            return
-
-        # 检查 images.json 是否存在且有图片
-        images_file = resolve_mapping_file(current_mapping_dir, "images.json")
-        if not images_file.exists():
-            messagebox.showwarning("图片翻译", "当前EPUB没有图片数据")
-            return
-
-        # 迁移旧格式 Base64 图片到二进制资源文件
-        from ..infrastructure.image_asset_store import migrate_legacy_images
-
-        try:
-            migrate_legacy_images(current_mapping_dir)
-        except Exception:
-            pass
-
-        import json
-
-        try:
-            images_file = resolve_mapping_file(current_mapping_dir, "images.json")
-            images_data = json.loads(images_file.read_text(encoding="utf-8"))
-        except Exception:
-            messagebox.showwarning("图片翻译", "images.json 解析失败")
-            return
-        if not images_data.get("image_mappings"):
-            messagebox.showwarning("图片翻译", "当前EPUB没有图片")
-            return
-
-        # 直接启动 Manga（不检查火山 Key）
-        self._start_translation(ImageTranslationProviderId.MANGA)
-
-    # ── AI 显式入口 ──────────────────────────────────
-
-    def start_ai_image_translation(self):
-        """独立 AI 图片翻译入口：用户显式选择并二次确认后才调用火山图生图。"""
-        current_mapping_dir = self.get_mapping_dir()
-        if not current_mapping_dir:
-            messagebox.showwarning("AI 图片翻译", "请先导入EPUB文件")
-            return
-
-        # 校验火山 Key
-        if not self.config_manager.get_volc_key():
-            messagebox.showwarning(
-                "AI 图片翻译",
-                "未配置火山引擎 API Key，请在设置中配置后再使用 AI 图片翻译。",
-            )
-            self.open_settings()
-            return
-
-        # 二次确认：费用提示
-        confirmed = messagebox.askyesno(
-            "AI 图片翻译确认",
-            "AI 图片翻译将调用火山图生图服务并可能产生 API 费用，\n"
-            "且会对图片进行生成式修改。\n\n"
-            "确认继续吗？\n\n"
-            "（本次选择不会改变默认图片翻译模块，下次点击主按钮仍运行 Manga）",
-            icon="warning",
-        )
-        if not confirmed:
-            return
-
-        # 一次性选择 AI 不写回 default_provider
-        self._start_translation(ImageTranslationProviderId.AI_VOLCENGINE)
-
-    # ── 通用翻译启动 ──────────────────────────────────
-
-    def _start_translation(self, provider_id: ImageTranslationProviderId):
-        """启动指定 Provider 的图片翻译工作线程。"""
         if self._worker_thread is not None and self._worker_thread.is_alive():
             messagebox.showinfo("图片翻译", "已有图片翻译任务正在运行，请等待完成")
             return
 
-        # Manga 入口不检查火山 Key
-        if (
-            provider_id == ImageTranslationProviderId.AI_VOLCENGINE
-            and not self.config_manager.get_volc_key()
-        ):
-            messagebox.showwarning("AI 图片翻译", "请先配置火山引擎 API Key")
-            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("选择图片翻译方式")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
 
-        # API 配置校验（Manga 的 external_llm 复用文本翻译 API 配置）
-        if (
-            provider_id == ImageTranslationProviderId.MANGA
-            and not self.config_manager.is_api_configured()
-        ):
-            messagebox.showwarning(
-                "配置警告",
-                "请先配置文本翻译 API 设置（Manga 模块复用该配置翻译图片文字）",
-            )
+        container = ttk.Frame(dialog, padding=20)
+        container.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(container, text="请选择图片翻译方式：", font=("微软雅黑", 11)).pack(
+            anchor=tk.W, pady=(0, 15)
+        )
+
+        def start_smart() -> None:
+            dialog.destroy()
+            self._start_image_text_translation(mapping_dir)
+
+        def start_all() -> None:
+            dialog.destroy()
+            self._start_all_image_translation(mapping_dir)
+
+        ttk.Button(container, text="OCR 预筛选 + 插图翻译（推荐）", command=start_smart).pack(
+            fill=tk.X, pady=(0, 4)
+        )
+        ttk.Label(
+            container,
+            text="先用 OCR 排除无文字图片，再将命中图片交给火山图生图",
+            foreground="gray",
+            justify=tk.LEFT,
+            wraplength=_MODE_DIALOG_DESCRIPTION_WIDTH,
+        ).pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
+        ttk.Button(container, text="全部插图翻译（火山引擎）", command=start_all).pack(
+            fill=tk.X, pady=(0, 4)
+        )
+        ttk.Label(
+            container,
+            text="跳过文字检测并处理所有图片，会消耗更多 API 额度",
+            foreground="gray",
+            justify=tk.LEFT,
+            wraplength=_MODE_DIALOG_DESCRIPTION_WIDTH,
+        ).pack(anchor=tk.W, fill=tk.X)
+
+        action_bar = ttk.Frame(container)
+        action_bar.pack(fill=tk.X, pady=(16, 0))
+        ttk.Button(action_bar, text="取消", command=dialog.destroy, width=12).pack()
+
+        self._size_and_center_mode_dialog(dialog)
+
+    def _size_and_center_mode_dialog(self, dialog: tk.Toplevel) -> None:
+        """使方式选择窗口容纳完整说明与操作按钮。"""
+        dialog.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        max_width = max(1, screen_width - 2 * _MODE_DIALOG_SCREEN_MARGIN)
+        max_height = max(1, screen_height - 2 * _MODE_DIALOG_SCREEN_MARGIN)
+        width = min(max_width, max(_MODE_DIALOG_MIN_WIDTH, dialog.winfo_reqwidth()))
+        height = min(max_height, max(_MODE_DIALOG_MIN_HEIGHT, dialog.winfo_reqheight()))
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+    def start_default_image_translation(self) -> None:
+        """Run smart detection after the EPUB import confirmation."""
+        mapping_dir = self._validate_mapping_dir()
+        if mapping_dir is not None:
+            self._start_image_text_translation(mapping_dir)
+
+    def start_ai_image_translation(self) -> None:
+        """Compatibility alias for callers from the former dual-provider UI."""
+        self.start_image_translation()
+
+    def _validate_mapping_dir(self) -> Path | None:
+        mapping_dir = self.get_mapping_dir()
+        if not mapping_dir:
+            messagebox.showwarning("图片翻译", "请先导入 EPUB 文件")
+            return None
+        mapping_dir = Path(mapping_dir)
+
+        try:
+            migrate_legacy_images(mapping_dir)
+        except Exception as exc:
+            logger.warning("迁移旧图片资源失败: %s", exc)
+
+        images_file = resolve_mapping_file(mapping_dir, "images.json")
+        if not images_file.exists():
+            messagebox.showwarning("图片翻译", "当前 EPUB 没有图片数据")
+            return None
+        try:
+            images_data = json.loads(images_file.read_text(encoding="utf-8"))
+        except Exception:
+            messagebox.showwarning("图片翻译", "images.json 解析失败")
+            return None
+        if not images_data.get("image_mappings"):
+            messagebox.showwarning("图片翻译", "当前 EPUB 没有图片")
+            return None
+        return mapping_dir
+
+    def _start_image_text_translation(self, mapping_dir: Path | None = None) -> None:
+        if not self.config_manager.get_volc_key():
+            messagebox.showwarning("配置警告", "请先配置火山引擎 API Key")
             self.open_settings()
             return
+        mapping_dir = mapping_dir or self._validate_mapping_dir()
+        if mapping_dir is None:
+            return
 
-        label = (
-            "Manga 图片翻译" if provider_id == ImageTranslationProviderId.MANGA else "AI 图片翻译"
+        if not self._is_ocr_configured():
+            confirmed = messagebox.askyesno(
+                "OCR 未配置",
+                "当前没有可用的 OCR 预筛选服务。\n\n"
+                "继续后，包括无文字图片在内的所有图片都会进入 AI 图生图，"
+                "API 调用次数和花销会更高。\n\n"
+                "是否仍要继续？",
+                parent=self.root,
+            )
+            if not confirmed:
+                return
+            self._start_worker("all", Path(mapping_dir))
+            return
+
+        self._start_worker("smart", Path(mapping_dir))
+
+    def _is_ocr_configured(self) -> bool:
+        checker = getattr(self.config_manager, "is_image_ocr_configured", None)
+        if callable(checker):
+            return bool(checker())
+        return bool(self.config_manager.is_api_configured())
+
+    def _start_all_image_translation(self, mapping_dir: Path | None = None) -> None:
+        if not self.config_manager.get_volc_key():
+            messagebox.showwarning("配置警告", "请先配置火山引擎 API Key")
+            self.open_settings()
+            return
+        mapping_dir = mapping_dir or self._validate_mapping_dir()
+        if mapping_dir is not None:
+            self._start_worker("all", Path(mapping_dir))
+
+    def _start_worker(self, mode: str, mapping_dir: Path) -> None:
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            messagebox.showinfo("图片翻译", "已有图片翻译任务正在运行，请等待完成")
+            return
+        self._cancel_event.clear()
+        self.status_updater(
+            "正在启动智能图片翻译..." if mode == "smart" else "正在启动全部插图翻译..."
         )
-        self.status_updater(f"正在启动{label}...")
         self.image_progress_updater("翻译中...")
-        getattr(self, "busy_state_updater", lambda _busy: None)(True)
-
+        self.busy_state_updater(True)
         self._worker_thread = threading.Thread(
             target=self._translation_worker,
-            args=(provider_id,),
+            args=(mode, mapping_dir),
+            name=f"image-translation-{mode}",
             daemon=True,
         )
         self._worker_thread.start()
 
-    def _translation_worker(self, provider_id: ImageTranslationProviderId):
-        """图片翻译工作线程，通过 ImageTranslationService 调用 Provider。"""
-        service = None
+    def _translation_worker(self, mode: str, mapping_dir: Path) -> None:
         try:
-            service = self._get_service()
             target_lang = self.config_manager.get_app_config().get("target_language", "中文")
-            current_mapping_dir = self.get_mapping_dir()
 
-            request = service.make_request(
-                mapping_dir=current_mapping_dir,
-                target_language=target_lang,
-                provider_id=provider_id,
+            def progress_callback(current: int, total: int, name: str) -> None:
+                self._safe_after(
+                    lambda c=current, t=total, n=name: self.status_updater(
+                        f"图片处理: {c}/{t} - {n}"
+                    )
+                )
+                self._safe_after(lambda c=current, t=total: self.image_progress_updater(f"{c}/{t}"))
+
+            if mode == "smart":
+                from ..core.image_text_translator import ImageTextTranslator
+
+                translator = ImageTextTranslator(self.config_manager)
+                self._active_text_translator = translator
+                result_map = translator.process_all_images(
+                    str(mapping_dir),
+                    target_lang,
+                    progress_callback,
+                    cancel_event=self._cancel_event,
+                )
+                summary = translator.last_summary
+            else:
+                from ..core.image_text_translator import ImageTextTranslator
+                from ..core.image_translator import ImageTranslator
+
+                translator = ImageTranslator(self.config_manager)
+                self._active_image_translator = translator
+
+                def all_progress(success: int, total: int, current: str) -> None:
+                    progress_callback(success, total, f"[插图翻译] {current}")
+
+                result_map = translator.translate_images(
+                    str(mapping_dir),
+                    target_lang,
+                    all_progress,
+                    cancel_event=self._cancel_event,
+                )
+                ImageTextTranslator.write_image_translation_result(mapping_dir, result_map)
+                summary = {
+                    "total": self._image_count(mapping_dir),
+                    "detected": self._image_count(mapping_dir),
+                    "translated": len(result_map),
+                    "skipped": 0,
+                    "failed": 0,
+                }
+
+            count = len(result_map)
+            self._safe_after(
+                lambda c=count: self.status_updater(f"图片翻译完成: {c} 张图片已生成译图")
             )
+            self._safe_after(lambda c=count: self.image_progress_updater(f"完成({c}张)"))
 
-            # 执行前校验
-            errors = service.validate_request(request)
-            if errors:
-                msg = "\n".join(errors)
-                self._safe_after(lambda m=msg: self.status_updater(f"图片翻译前置校验失败: {m}"))
-                self._safe_after(lambda: self.image_progress_updater("校验失败"))
-                # Manga 失败只显示失败原因，不切换 AI
-                self._safe_after(
-                    lambda m=self._format_error_message(provider_id, "无法开始翻译：", msg): (
-                        messagebox.showerror("图片翻译", m)
-                    )
-                )
-                return
-
-            def on_progress(progress: ImageTranslationProgress):
-                self._safe_after(
-                    lambda p=progress: self.status_updater(
-                        f"图片处理: {p.current}/{p.total} - {p.stage}"
-                    )
-                )
-                self._safe_after(
-                    lambda p=progress: self.image_progress_updater(f"{p.current}/{p.total}")
-                )
-
-            result = service.translate(request, on_progress)
-
-            label = (
-                "Manga 图片翻译"
-                if provider_id == ImageTranslationProviderId.MANGA
-                else "AI 图片翻译"
-            )
-
-            if result.status == OperationStatus.CANCELLED:
-                self._safe_after(lambda: self.status_updater(f"{label}已取消"))
-                self._safe_after(lambda: self.image_progress_updater("已取消"))
-            elif result.status == OperationStatus.FAILED:
-                failed_msg = "; ".join(f"{k}: {v}" for k, v in result.failed_images.items())
-                self._safe_after(lambda m=failed_msg: self.status_updater(f"{label}失败: {m}"))
-                self._safe_after(lambda: self.image_progress_updater("失败"))
-                self._safe_after(
-                    lambda m=self._format_error_message(provider_id, "翻译失败：", failed_msg): (
-                        messagebox.showerror("图片翻译", m)
-                    )
+            if count:
+                details = f"已完成 {count} 张图片的翻译。\n导出 EPUB 时将自动使用译图。"
+            elif summary.get("failed", 0):
+                details = (
+                    "没有生成译图。"
+                    f"\n视觉检测失败 {summary['failed']} 张，请检查视觉模型配置后重试。"
                 )
             else:
-                count = result.succeeded_count
-                skipped = len(result.skipped_images)
-                self._safe_after(
-                    lambda c=count: self.status_updater(
-                        f"{label}完成: {c} 张已翻译"
-                        + (f"，{skipped} 张无需翻译" if skipped else "")
-                    )
-                )
-                self._safe_after(lambda c=count: self.image_progress_updater(f"完成({c}张)"))
-                self._safe_after(
-                    lambda c=count, s=skipped: messagebox.showinfo(
-                        "图片翻译",
-                        f"已完成 {c} 张图片的翻译。"
-                        + (f"\n{s} 张图片无需翻译。" if skipped else "")
-                        + "\n导出EPUB时将自动使用翻译后的图片。",
-                    )
-                )
-
+                details = "未检测到包含外文文字的图片，无需生成译图。"
+            self._safe_after(lambda text=details: messagebox.showinfo("图片翻译", text))
         except ImageTranslationCancelled:
             self._safe_after(lambda: self.status_updater("图片翻译已取消"))
             self._safe_after(lambda: self.image_progress_updater("已取消"))
-        except ImageTranslationConfigError as exc:
-            logger.error("图片翻译配置错误: %s", exc)
-            self._safe_after(lambda m=str(exc): self.status_updater(f"图片翻译配置错误: {m}"))
-            self._safe_after(lambda: self.image_progress_updater("出错"))
-            self._safe_after(
-                lambda m=self._format_error_message(provider_id, "配置错误：", str(exc)): (
-                    messagebox.showerror("图片翻译", m)
-                )
-            )
         except Exception as exc:
             error_message = str(exc)
-            logger.error(f"图片翻译出错: {error_message}", exc_info=True)
+            logger.error("图片翻译出错: %s", error_message, exc_info=True)
             self._safe_after(lambda msg=error_message: self.status_updater(f"图片翻译出错: {msg}"))
             self._safe_after(lambda: self.image_progress_updater("出错"))
             self._safe_after(
-                lambda m=self._format_error_message(provider_id, "图片翻译出错：", error_message): (
-                    messagebox.showerror("图片翻译", m)
+                lambda msg=error_message: messagebox.showerror(
+                    "图片翻译", f"图片翻译失败：\n\n{msg}\n\n请检查视觉模型和火山引擎配置。"
                 )
             )
         finally:
-            # Provider 在多次任务间复用；应用关闭时再统一释放模型和客户端。
+            for translator in (self._active_text_translator, self._active_image_translator):
+                if translator is not None:
+                    try:
+                        translator.close()
+                    except Exception:
+                        pass
+            self._active_text_translator = None
+            self._active_image_translator = None
             self._worker_thread = None
-            self._safe_after(lambda: getattr(self, "busy_state_updater", lambda _busy: None)(False))
+            self._safe_after(lambda: self.busy_state_updater(False))
 
-    @classmethod
-    def _format_error_message(
-        cls,
-        provider_id: ImageTranslationProviderId,
-        heading: str,
-        details: str,
-    ) -> str:
-        message = f"{heading}\n\n{details}"
-        if provider_id == ImageTranslationProviderId.MANGA:
-            return f"{message}\n\n{cls._MANGA_AI_GUIDANCE}"
-        return f"{message}\n\n可在设置中检查配置后重试。"
+    @staticmethod
+    def _image_count(mapping_dir: Path) -> int:
+        try:
+            payload = json.loads(
+                resolve_mapping_file(mapping_dir, "images.json").read_text(encoding="utf-8")
+            )
+            return len(payload.get("image_mappings", {}))
+        except Exception:
+            return 0
 
-    def _safe_after(self, func):
-        """P1-1：通过 UI 回调邮箱提交回调，不在工作线程调用 Tk API。"""
-        if getattr(self, "_closed", False):
-            return
-        self._ui_mailbox.submit(func)
+    def cancel(self) -> None:
+        """Cancel the current detection/generation run."""
+        self._cancel_event.set()
 
-    # ── 兼容入口：file_importer 调用，走 Manga ──────────────────────────────────
-
-    def start_default_image_translation(self):
-        """EPUB 导入后询问确认后调用的默认图片翻译入口（走 Manga）。
-
-        供 file_importer.image_translation_starter 回调使用。
-        """
-        self.start_image_translation()
+    def _safe_after(self, callback: Callable[[], None]) -> None:
+        if not self._closed:
+            self._ui_mailbox.submit(callback)
 
     def close(self, *, timeout_seconds: float = _CLOSE_TIMEOUT_SECONDS) -> None:
-        """在单一 deadline 内取消任务并释放已初始化的 Provider。
-
-        Provider 可能仍被图片工作线程使用。必须先取消并等待工作线程结束；
-        若 deadline 到期，保留资源让 daemon worker 自行收敛，不能在并发运行时
-        卸载模型、关闭 HTTP 客户端或关闭 event loop。
-        """
+        """Cancel work and release HTTP clients within one deadline."""
+        if self._closed:
+            return
         deadline = time.monotonic() + max(0.0, timeout_seconds)
         self._closed = True
-        # P1-1：关闭 UI 回调事件泵
-        pump = getattr(self, "_ui_pump", None)
-        self._ui_pump = None
-        if pump is not None:
-            pump.close()
-
-        service = self._service
-        self._service = None
-        if service is None:
-            return
-        for provider_id in ImageTranslationProviderId:
-            try:
-                service.cancel(provider_id)
-            except Exception:
-                logger.warning("取消图片翻译 Provider 失败: %s", provider_id)
+        self._cancel_event.set()
 
         worker = self._worker_thread
         if worker is not None and worker is not threading.current_thread() and worker.is_alive():
             worker.join(timeout=max(0.0, deadline - time.monotonic()))
-        if worker is threading.current_thread() or (worker is not None and worker.is_alive()):
-            logger.warning("图片翻译 worker 未在关闭 deadline 内退出，跳过 Provider 资源释放")
-            return
 
-        for provider_id in ImageTranslationProviderId:
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                service.close_provider(provider_id, timeout_seconds=remaining)
-            except Exception:
-                logger.warning("关闭图片翻译 Provider 失败: %s", provider_id)
+        if worker is None or not worker.is_alive():
+            for translator in (self._active_text_translator, self._active_image_translator):
+                if translator is not None:
+                    try:
+                        translator.close()
+                    except Exception:
+                        pass
+
+        pump = self._ui_pump
+        self._ui_pump = None
+        if pump is not None:
+            pump.close()

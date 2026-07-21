@@ -34,7 +34,6 @@
 - 第一方 Python：`main.py`、`build.py`、`src/**`、`tests/**`、`tools/**`。
 - 工程配置：`pyproject.toml`、`requirements*.txt`、PyInstaller spec、GitHub Actions、README。
 - 用户链路：启动、配置、导入、翻译、流式进度、停止、补译、队列、保存、导出、关闭和恢复。
-- `third_party/manga-image-translator/**` 不评价上游代码风格，只检查本项目的依赖、启动和进程边界。
 - `workspace/**`、缓存和构建产物不纳入源码质量结论。
 
 ### 2.2 静态基线
@@ -60,7 +59,7 @@
 - 性能、启动和事件邮箱专项：94 passed、1 failed；失败是 Python 3.10 对 `frozen + slots` 未声明属性抛出 `TypeError`，项目测试按 3.11 的 `AttributeError` 断言。
 - 更大测试子集在 120 秒内未跑完；不能据此声明全量绿色。
 - 本机没有安装 Ruff 和 Pyright，未复跑静态门禁。
-- Text 开发环境的独立进程 `import main` 约 217-271ms；`-X importtime` 显示模块累计约 156-166ms。Full Edition 未安装完整 Manga 依赖，未量化其冷启动。
+- 开发环境的独立进程 `import main` 约 217-271ms；`-X importtime` 显示模块累计约 156-166ms。
 - 未执行真实 Windows/macOS 打包产物、NVDA/Narrator、多 DPI、真实大 EPUB 和真实模型端到端测试。
 
 ## 3. 已符合最佳实践的部分
@@ -229,8 +228,7 @@ Save、Discard、Cancel 三种选择在 UI、模型、autosave 状态和磁盘�
 **证据**
 
 - `pyproject.toml:9` 声明 `>=3.11`，包含未验证的 3.12/3.13。
-- `requirements-image-manga.txt:9-10` 明确上游只支持 `<3.12`，CI 只跑 3.11。
-- 图片依赖主要使用范围版本；额外索引的 `rusty-manga-image-translator` 没有精确版本和 hash。
+- 本地图片推理依赖已移除；在线图片翻译与文本版本共用 Python 支持矩阵和依赖锁。
 - CI 先安装 `.[dev]`，再重复安装 `requirements.txt`，存在双源漂移。
 - `src/core/image_utils.py:47-55` 动态使用 `cairosvg`，但项目依赖没有声明它。
 
@@ -400,8 +398,7 @@ Save、Discard、Cancel 三种选择在 UI、模型、autosave 状态和磁盘�
 **证据**
 
 - `main.py:46-70` 在 Tk `after_idle` 回调里同步初始化。
-- `src/domain/edition.py:61-80` 真实执行 `import manga_translator`。
-- 上游 `manga_translator/__init__.py` 继续导入主模块；Full spec 将其加入导入路径。
+- 旧版发行能力探测和本地图片引擎导入路径已经移除。
 
 **改动**
 
@@ -622,9 +619,9 @@ py -3.11 -m venv .venv
 
 ### 10.3 发布产物门禁
 
-1. Windows 10/11 Text/Full：解压、显示首帧、fake 翻译、保存、重开、正常退出。
-2. macOS Text/Full：`plutil`、真实入口、首帧、保存、退出；正式分发还需签名/公证策略。
-3. Text 版不得导入 Manga；Full 版至少完成 provider health 和一张最小图片任务。
+1. Windows 10/11：解压、显示首帧、fake 翻译、保存、重开、正常退出。
+2. macOS：`plutil`、真实入口、首帧、保存、退出；正式分发还需签名/公证策略。
+3. 图片翻译至少完成一次视觉检测命中和一张最小图片生成任务。
 4. smoke 不能只判断“进程 15 秒未退出”；应由测试钩子报告 `main_window_interactive` 后再正常关闭。
 5. 凭据不得进入 artifact、日志、配置样例、崩溃信息或诊断包。
 
@@ -662,5 +659,5 @@ py -3.11 -m venv .venv
 4. 大 TXT/EPUB 和 50 任务队列达到已冻结的 Tk 停顿、内存和取消预算。
 5. 所有长任务都有 busy、进度、取消、失败和恢复终态。
 6. preflight、完整质检、用量和草稿导出进入真实生产流程。
-7. 关闭后无活动 HTTP 请求、ThreadPoolExecutor、Manga worker、Tk after 或保存线程。
+7. 关闭后无活动 HTTP 请求、ThreadPoolExecutor、图片翻译 worker、Tk after 或保存线程。
 8. 核心流程可纯键盘完成，并通过目标 DPI 和至少一种 Windows 屏幕阅读器实测。

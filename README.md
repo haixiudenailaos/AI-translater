@@ -33,12 +33,12 @@ python main.py
 
 ## 📦 预编译版本
 
-当前 CI 只构建 **Text Edition**：包含 TXT/EPUB 文本翻译和在线图片翻译 Provider，不包含本地 Manga 推理依赖。
+当前 CI 构建统一桌面版本：包含 TXT/EPUB 文本翻译，以及 V1.5 风格的在线 AI 图片翻译。
 
 - **Windows**: 单文件 `LightNovelTranslator-1.6-Windows-x64.exe`。
 - **macOS**: `LightNovelTranslator-1.6-macOS.app.zip`，解压后双击 `.app`。
 
-Full Edition 仍保留 `translator.spec` 供本地构建，包含本地漫画图片翻译的深度学习栈；它尚未由 CI 发布。Text 产物会作为 V1.6 分支推送和 Pull Request 的 GitHub Actions artifact 保存 30 天。
+图片翻译提供两种方式：推荐的“OCR 预筛选 + 火山图生图”，以及直接处理全部图片。可在“图片翻译设置”中填写自定义 OpenAI 兼容 OCR 地址、模型和独立 Key；地址留空且已保存硅基流动 Key 时，默认使用硅基流动 PaddleOCR-VL-1.5 和该 Key。未配置可用 OCR 时，无文字图片也会进入 AI 图生图，调用次数和花销会更高。构建产物会作为 V1.6 分支推送和 Pull Request 的 GitHub Actions artifact 保存 30 天。
 
 > macOS 产物为当前 `macos-latest` runner 的架构，不是 Universal 二进制。
 
@@ -125,16 +125,13 @@ LightNovelTranslator-V1.6/
 pip install -e ".[dev]"
 pip install "pyinstaller==6.11.1"
 
-# 构建 Text Edition（仅文本翻译，体积小）
-pyinstaller translator_text.spec --clean --noconfirm
-
-# 构建 Full Edition（含漫画图片翻译依赖）
+# 构建单文件桌面应用
 pyinstaller translator.spec --clean --noconfirm
 ```
 
-Text spec 生成单文件 `dist/LightNovelTranslatorV1.6[.exe]`；Full spec 生成 onedir 目录 `dist/LightNovelTranslatorV1.6/`。
+构建会生成单文件 `dist/LightNovelTranslatorV1.6[.exe]`。
 
-Windows Text 发布构建使用 Python 3.10 和 `requirements-text-win-py310.lock.txt`。修改发布依赖后，必须在对应平台与 Python 版本执行 `python tools/generate_dependency_locks.py <target>`，并提交更新后的 hash lock。
+Windows 发布构建使用 Python 3.10 和 `requirements-text-win-py310.lock.txt`。修改发布依赖后，必须在对应平台与 Python 版本执行 `python tools/generate_dependency_locks.py <target>`，并提交更新后的 hash lock。
 
 ### 自动化构建
 
@@ -142,7 +139,7 @@ Windows Text 发布构建使用 Python 3.10 和 `requirements-text-win-py310.loc
 
 - ✅ Python 3.10-3.13 的 Ruff、格式、编译和 pytest 质量矩阵
 - ✅ Python 3.11 覆盖率报告、Pyright 迁移报告和 wheel 安装 smoke
-- ✅ Windows/macOS 的 Text Edition 构建与启动 smoke
+- ✅ Windows/macOS 的桌面构建与启动 smoke
 
 V1.6 分支推送、Pull Request 和手动触发都会执行工作流。Pyright 目前是迁移报告，待存量类型错误清零后升级为阻断门禁。
 

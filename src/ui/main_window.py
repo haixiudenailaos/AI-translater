@@ -38,12 +38,10 @@ logger = get_logger(__name__)
 
 
 class MainWindow:
-    def __init__(self, root, config_manager, app_paths=None, edition_capabilities=None):
+    def __init__(self, root, config_manager, app_paths=None):
         self.root = root
         self.config_manager = config_manager
         self.app_paths = app_paths
-        # P0-2：版本能力契约。``None`` 时由 ImageTranslationHandler 自动检测。
-        self.edition_capabilities = edition_capabilities
         from ..core.queue_provider import ProviderLimiterRegistry
 
         # 应用级文本请求额度：主编辑器和后台队列通过同一注册表取槽。
@@ -115,7 +113,6 @@ class MainWindow:
             confirm_replace_session=self.confirm_save_before_replace,
             confirm_stop_active_translation=self.confirm_stop_translation_before_replace,
             document=self._document,
-            edition_capabilities=self.edition_capabilities,
         )
         # P0-3：FileImporter 通过该回调读取当前 dirty 状态。
         self.file_importer.is_dirty_callback = lambda: self.has_unsaved_changes
@@ -128,11 +125,9 @@ class MainWindow:
             get_mapping_dir=lambda: self.file_importer.current_mapping_dir,
             open_settings=self.open_settings,
             busy_state_updater=self._set_image_translation_busy,
-            app_paths=getattr(self, "app_paths", None),
-            edition_capabilities=self.edition_capabilities,
         )
 
-        # 延迟绑定：file_importer 需要 image_handler，走 Manga 默认模块
+        # 导入确认后直接运行 V1.5 智能检测流程。
         self.file_importer.image_translation_starter = lambda: (
             self.image_handler.start_default_image_translation()
         )
@@ -350,11 +345,7 @@ class MainWindow:
         )
         self.project_menu.add_command(label="运行质检", command=self.run_quality_check)
         self.project_menu.add_command(
-            label="本地模块图片翻译", command=lambda: self.image_handler.start_image_translation()
-        )
-        self._project_local_image_action_index = self.project_menu.index("end")
-        self.project_menu.add_command(
-            label="AI 图片翻译...", command=lambda: self.image_handler.start_ai_image_translation()
+            label="图片翻译...", command=lambda: self.image_handler.start_image_translation()
         )
         self._project_ai_image_action_index = self.project_menu.index("end")
         menu_bar.add_cascade(label="项目", menu=self.project_menu)
@@ -526,11 +517,7 @@ class MainWindow:
         self.more_actions_menu = tk.Menu(right_control, tearoff=0)
         self.more_actions_menu.add_command(label="运行质检", command=self.run_quality_check)
         self.more_actions_menu.add_command(
-            label="本地模块图片翻译", command=lambda: self.image_handler.start_image_translation()
-        )
-        self._local_image_action_index = self.more_actions_menu.index("end")
-        self.more_actions_menu.add_command(
-            label="AI 图片翻译...", command=lambda: self.image_handler.start_ai_image_translation()
+            label="图片翻译...", command=lambda: self.image_handler.start_image_translation()
         )
         self._ai_image_action_index = self.more_actions_menu.index("end")
         self.more_actions_menu.add_separator()
@@ -547,21 +534,14 @@ class MainWindow:
 
         image_control = ttk.Frame(parent)
         image_control.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(image_control, text="图片翻译方式:").pack(side=tk.LEFT)
-        self.local_image_translate_btn = ttk.Button(
+        ttk.Label(image_control, text="图片翻译:").pack(side=tk.LEFT)
+        self.ai_image_translate_btn = ttk.Button(
             image_control,
-            text="本地模块翻译",
+            text="选择翻译方式...",
             width=16,
             command=lambda: self.image_handler.start_image_translation(),
         )
-        self.local_image_translate_btn.pack(side=tk.LEFT, padx=(8, 5))
-        self.ai_image_translate_btn = ttk.Button(
-            image_control,
-            text="AI 图片翻译",
-            width=16,
-            command=lambda: self.image_handler.start_ai_image_translation(),
-        )
-        self.ai_image_translate_btn.pack(side=tk.LEFT)
+        self.ai_image_translate_btn.pack(side=tk.LEFT, padx=(8, 5))
 
         middle_control = ttk.Frame(control_frame)
         middle_control.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(20, 20))
@@ -1247,37 +1227,19 @@ class MainWindow:
                 self.export_epub_btn.config(state=menu_state)
             self.more_actions_menu.entryconfigure(self._epub_action_index, state=menu_state)
             image_state = tk.DISABLED if self._image_translation_busy else menu_state
-            # P0-2：Text Edition 下禁用本地 Manga 入口。
-            manga_state = image_state if self._manga_enabled() else tk.DISABLED
-            self.more_actions_menu.entryconfigure(self._local_image_action_index, state=manga_state)
             self.more_actions_menu.entryconfigure(self._ai_image_action_index, state=image_state)
-        if hasattr(self, "local_image_translate_btn"):
+        if hasattr(self, "ai_image_translate_btn"):
             image_state = tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
-            # P0-2：Text Edition 下禁用本地 Manga 入口。
-            manga_state = image_state if self._manga_enabled() else tk.DISABLED
-            self.local_image_translate_btn.config(state=manga_state)
             self.ai_image_translate_btn.config(state=image_state)
         if hasattr(self, "project_menu"):
             project_image_state = (
                 tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
-            )
-            # P0-2：Text Edition 下禁用本地 Manga 入口。
-            project_manga_state = project_image_state if self._manga_enabled() else tk.DISABLED
-            self.project_menu.entryconfigure(
-                self._project_local_image_action_index, state=project_manga_state
             )
             self.project_menu.entryconfigure(
                 self._project_ai_image_action_index, state=project_image_state
             )
         if hasattr(self, "task_summary_label"):
             self.task_summary_label.config(text=f"待翻译 {pending} · 已完成 {completed}")
-
-    def _manga_enabled(self) -> bool:
-        """P0-2：当前版本是否启用本地 Manga 图片翻译。"""
-        handler = getattr(self, "image_handler", None)
-        if handler is None:
-            return True  # UI 初始化早期：保守允许，后续 refresh 会校正
-        return handler.manga_enabled
 
     def _set_save_status(self, status):
         if hasattr(self, "save_status_label"):
@@ -1515,7 +1477,6 @@ class MainWindow:
             self.root,
             self.config_manager,
             self._on_settings_updated,
-            edition_capabilities=self.edition_capabilities,
         )
 
     def open_onboarding(self):
@@ -1557,7 +1518,6 @@ class MainWindow:
             self.config_manager,
             app_paths=self.app_paths,
             manager=self._queue_manager,
-            edition_capabilities=self.edition_capabilities,
         )
         self._schedule_queue_background_status()
 

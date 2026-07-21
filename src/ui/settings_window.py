@@ -7,6 +7,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
+from ..config.image_ocr import SILICONFLOW_OCR_DEFAULT_MODEL
 from ..config.translation_profile import (
     DEEPSEEK_V4_FLASH_MODEL,
     DEFAULT_QUEUE_ADAPTIVE_CONCURRENCY,
@@ -38,9 +39,8 @@ from ..config.volcengine_image import (
     VOLCENGINE_IMAGE_DEFAULT_MODEL,
     VOLCENGINE_IMAGE_MODEL_SUGGESTIONS,
 )
-from ..domain.edition import EditionCapabilities, detect_edition_capabilities
 from .form_validation import FormValidator
-from .theme import COLORS, status_color
+from .theme import COLORS
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 from .window_geometry import WindowGeometryTracker
 
@@ -59,16 +59,10 @@ class SettingsWindow:
         parent,
         config_manager,
         callback=None,
-        edition_capabilities: EditionCapabilities | None = None,
     ):
         self.parent = parent
         self.config_manager = config_manager
         self.callback = callback
-        self.edition_capabilities = (
-            edition_capabilities
-            if edition_capabilities is not None
-            else detect_edition_capabilities()
-        )
         # P2-5：表单字段级校验器 + testing busy 状态（防止连接测试/模块检测
         # 重复启动，避免用户在测试中误触发多次付费请求）。
         self._form_validator = FormValidator()
@@ -857,128 +851,123 @@ class SettingsWindow:
         ).grid(row=17, column=0, columnspan=2, sticky=tk.W, padx=10, pady=4)
 
     def create_volc_tab(self, notebook):
-        """创建图片翻译设置页面
-
-        分区设计：
-        - 上半：Manga 默认模块设置（设备/质量预设/模型目录/模型状态）
-        - 下半：AI 图片翻译（火山引擎）设置（API Key/测试连接/费用提示）
-        两者独立——Manga 不依赖火山 Key；火山入口只能由用户显式触发。
-        """
+        """创建 V1.5 AI 图片翻译设置页面。"""
         volc_frame = self._create_scrollable_tab(notebook, "图片翻译设置")
-        # 响应式布局：列 1（输入控件列）随窗口宽度伸缩，列 2 保持自然宽度
         volc_frame.grid_columnconfigure(1, weight=1)
 
         img_config = self.config_manager.get_image_translation_config()
-        manga_cfg = img_config.get("manga", {})
+        ocr_cfg = img_config.get("ocr", {})
         ai_volc_cfg = img_config.get("ai_volcengine", {})
 
-        # ── Manga 默认模块分区 ──────────────────────────────
-        manga_header = ttk.Label(
+        ttk.Label(
             volc_frame,
-            text="Manga 默认模块（默认图片翻译实现）",
+            text="OCR 文字预筛选（推荐）",
             font=("TkDefaultFont", 10, "bold"),
-        )
-        manga_header.grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(10, 4))
-
-        manga_desc = ttk.Label(
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(10, 4))
+        workflow_desc = ttk.Label(
             volc_frame,
-            text="使用 manga-image-translator 流水线（检测/OCR/翻译/擦除/渲染）。\n"
-            "翻译图片文字复用上方 API 配置，无需单独配置火山 Key。",
+            text="OCR 会先检测图片中是否有需要翻译的文字，只把命中的图片交给 AI 图生图。",
             foreground=COLORS["muted"],
             justify=tk.LEFT,
         )
-        manga_desc.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 8), sticky=tk.EW)
-        manga_desc.bind("<Configure>", lambda e: manga_desc.configure(wraplength=e.width - 4))
-
-        # 默认模块（只读）
-        ttk.Label(volc_frame, text="默认模块:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=6)
-        ttk.Label(
-            volc_frame, text="Manga (manga-image-translator)", font=("TkDefaultFont", 9, "bold")
-        ).grid(row=2, column=1, columnspan=2, padx=10, pady=6, sticky=tk.W)
-
-        # 设备
-        ttk.Label(volc_frame, text="推理设备:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=6)
-        self.manga_device_var = tk.StringVar(value=manga_cfg.get("device", "auto"))
-        ttk.Combobox(
-            volc_frame,
-            textvariable=self.manga_device_var,
-            values=["auto", "cpu", "cuda"],
-            state="readonly",
-            width=20,
-        ).grid(row=3, column=1, padx=10, pady=6, sticky=tk.W)
-
-        # 质量预设
-        ttk.Label(volc_frame, text="质量预设:").grid(row=4, column=0, sticky=tk.W, padx=10, pady=6)
-        self.manga_quality_var = tk.StringVar(value=manga_cfg.get("quality_preset", "standard"))
-        ttk.Combobox(
-            volc_frame,
-            textvariable=self.manga_quality_var,
-            values=["standard", "high_quality", "low_memory"],
-            state="readonly",
-            width=20,
-        ).grid(row=4, column=1, padx=10, pady=6, sticky=tk.W)
-
-        # 模型目录
-        ttk.Label(volc_frame, text="模型目录:").grid(row=5, column=0, sticky=tk.W, padx=10, pady=6)
-        self.manga_model_dir_var = tk.StringVar(value=manga_cfg.get("model_dir", ""))
-        model_dir_entry = ttk.Entry(
-            volc_frame,
-            textvariable=self.manga_model_dir_var,
-            width=32,
-            state="normal",
+        workflow_desc.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 8), sticky=tk.EW)
+        workflow_desc.bind(
+            "<Configure>", lambda event: workflow_desc.configure(wraplength=event.width - 4)
         )
-        model_dir_entry.grid(row=5, column=1, padx=10, pady=6, sticky=tk.EW)
-        ttk.Button(
-            volc_frame,
-            text="浏览...",
-            command=self._browse_manga_model_dir,
-            state="normal",
-        ).grid(row=5, column=2, padx=(0, 10), pady=6, sticky=tk.W)
 
-        # 模型状态
-        ttk.Label(volc_frame, text="模型状态:").grid(row=6, column=0, sticky=tk.W, padx=10, pady=6)
-        self.manga_status_label = ttk.Label(volc_frame, text="未检测", foreground=COLORS["muted"])
-        self.manga_status_label.grid(row=6, column=1, padx=10, pady=6, sticky=tk.W)
-        # P2-5：检测按钮纳入 busy 列表。
-        self.manga_check_btn = ttk.Button(
-            volc_frame,
-            text="检测可用性",
-            command=self._check_manga_status,
-            state="normal",
+        self.image_text_enabled_var = tk.BooleanVar(
+            value=self.app_config.get("image_text_translation_enabled", True)
         )
-        self.manga_check_btn.grid(row=6, column=2, padx=(0, 10), pady=6, sticky=tk.W)
-        self._test_buttons.append(self.manga_check_btn)
+        ttk.Checkbutton(
+            volc_frame,
+            text="启用 OCR 预筛选",
+            variable=self.image_text_enabled_var,
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=10, pady=6)
 
-        # 分隔线
+        default_ocr_tip = ttk.Label(
+            volc_frame,
+            text=(
+                "自定义地址留空时，如果已在「API 配置」中保存硅基流动 API Key，"
+                "将自动使用硅基流动 PaddleOCR-VL-1.5 和该 Key。"
+            ),
+            foreground=COLORS["muted"],
+            justify=tk.LEFT,
+        )
+        default_ocr_tip.grid(row=3, column=0, columnspan=3, padx=10, pady=(0, 6), sticky=tk.EW)
+        default_ocr_tip.bind(
+            "<Configure>", lambda event: default_ocr_tip.configure(wraplength=event.width - 4)
+        )
+
+        self.ocr_base_url_var = tk.StringVar(value=ocr_cfg.get("base_url", ""))
+        ttk.Label(volc_frame, text="自定义 OCR API 地址:").grid(
+            row=4, column=0, sticky=tk.W, padx=10, pady=6
+        )
+        ttk.Entry(volc_frame, textvariable=self.ocr_base_url_var, width=42).grid(
+            row=4, column=1, columnspan=2, padx=10, pady=6, sticky=tk.EW
+        )
+
+        ttk.Label(volc_frame, text="OCR 模型 ID:").grid(
+            row=5, column=0, sticky=tk.W, padx=10, pady=6
+        )
+        self.ocr_model_var = tk.StringVar(
+            value=ocr_cfg.get(
+                "model",
+                self.app_config.get("vision_model_name", SILICONFLOW_OCR_DEFAULT_MODEL),
+            )
+        )
+        ttk.Entry(volc_frame, textvariable=self.ocr_model_var, width=42).grid(
+            row=5, column=1, columnspan=2, padx=10, pady=6, sticky=tk.EW
+        )
+
+        get_ocr_key = getattr(self.config_manager, "get_ocr_key", None)
+        ocr_key = str(get_ocr_key() or "") if callable(get_ocr_key) else ""
+        self.ocr_key_var = tk.StringVar(value=ocr_key)
+        ttk.Label(volc_frame, text="自定义 OCR API Key:").grid(
+            row=6, column=0, sticky=tk.W, padx=10, pady=6
+        )
+        ttk.Entry(volc_frame, textvariable=self.ocr_key_var, show="*", width=32).grid(
+            row=6, column=1, columnspan=2, padx=10, pady=6, sticky=tk.EW
+        )
+
+        ocr_cost_tip = ttk.Label(
+            volc_frame,
+            text=(
+                "费用提示：不启用或未配置可用 OCR 时，无文字的图片也会进入 AI 翻译，"
+                "因此图生图调用次数和花销会更高。"
+            ),
+            foreground=COLORS["warning"],
+            justify=tk.LEFT,
+        )
+        ocr_cost_tip.grid(row=7, column=0, columnspan=3, padx=10, pady=(2, 10), sticky=tk.EW)
+        ocr_cost_tip.bind(
+            "<Configure>", lambda event: ocr_cost_tip.configure(wraplength=event.width - 4)
+        )
+
         ttk.Separator(volc_frame, orient=tk.HORIZONTAL).grid(
-            row=7, column=0, columnspan=3, sticky=tk.EW, padx=10, pady=10
+            row=8, column=0, columnspan=3, sticky=tk.EW, padx=10, pady=10
         )
 
-        # ── AI 图片翻译（火山引擎）分区 ──────────────────────
-        ai_header = ttk.Label(
+        ttk.Label(
             volc_frame,
-            text="AI 图片翻译（火山引擎）",
+            text="火山引擎图生图",
             font=("TkDefaultFont", 10, "bold"),
-        )
-        ai_header.grid(row=8, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(0, 4))
+        ).grid(row=9, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(0, 4))
 
         ai_desc = ttk.Label(
             volc_frame,
-            text="AI 图片翻译为生成式图生图，会产生 API 费用并对图片做较大修改，"
-            "仅由用户显式选择「AI 图片翻译...」时调用，不会作为默认模块。",
+            text="OCR 预筛选后的图片和「全部插图翻译」都会调用该服务生成译图。",
             foreground=COLORS["muted"],
             justify=tk.LEFT,
         )
-        ai_desc.grid(row=9, column=0, columnspan=3, padx=10, pady=(0, 8), sticky=tk.EW)
+        ai_desc.grid(row=10, column=0, columnspan=3, padx=10, pady=(0, 8), sticky=tk.EW)
         ai_desc.bind("<Configure>", lambda e: ai_desc.configure(wraplength=e.width - 4))
 
-        # 火山方舟 API 地址和模型均可由用户自定义。
         self.volc_base_url_var = tk.StringVar(
             value=ai_volc_cfg.get("base_url", VOLCENGINE_IMAGE_DEFAULT_BASE_URL)
         )
-        ttk.Label(volc_frame, text="API 地址:").grid(row=10, column=0, sticky=tk.W, padx=10, pady=6)
+        ttk.Label(volc_frame, text="API 地址:").grid(row=11, column=0, sticky=tk.W, padx=10, pady=6)
         volc_base_url_entry = ttk.Entry(volc_frame, textvariable=self.volc_base_url_var, width=42)
-        volc_base_url_entry.grid(row=10, column=1, columnspan=2, padx=10, pady=6, sticky=tk.EW)
+        volc_base_url_entry.grid(row=11, column=1, columnspan=2, padx=10, pady=6, sticky=tk.EW)
         self._form_validator.register_required_string(
             "volc_base_url", "火山引擎 API 地址", self.volc_base_url_var, volc_base_url_entry
         )
@@ -987,7 +976,7 @@ class SettingsWindow:
         current_volc_model = ai_volc_cfg.get("model", VOLCENGINE_IMAGE_DEFAULT_MODEL)
         self.volc_model_var = tk.StringVar(value=current_volc_model)
         ttk.Label(volc_frame, text="翻译模型 ID:").grid(
-            row=11, column=0, sticky=tk.W, padx=10, pady=6
+            row=12, column=0, sticky=tk.W, padx=10, pady=6
         )
         volc_model_combo = ttk.Combobox(
             volc_frame,
@@ -996,25 +985,22 @@ class SettingsWindow:
             state="normal",
             width=39,
         )
-        volc_model_combo.grid(row=11, column=1, columnspan=2, padx=10, pady=6, sticky=tk.EW)
+        volc_model_combo.grid(row=12, column=1, columnspan=2, padx=10, pady=6, sticky=tk.EW)
         self._form_validator.register_required_string(
             "volc_model", "火山引擎翻译模型 ID", self.volc_model_var, volc_model_combo
         )
 
-        # 火山引擎 API Key
         ttk.Label(volc_frame, text="火山引擎 API Key:").grid(
-            row=12, column=0, sticky=tk.W, padx=10, pady=6
+            row=13, column=0, sticky=tk.W, padx=10, pady=6
         )
         self.volc_key_var = tk.StringVar(value=self.config_manager.get_volc_key())
         volc_key_entry = ttk.Entry(volc_frame, textvariable=self.volc_key_var, show="*", width=32)
-        volc_key_entry.grid(row=12, column=1, columnspan=2, padx=10, pady=6, sticky=tk.EW)
+        volc_key_entry.grid(row=13, column=1, columnspan=2, padx=10, pady=6, sticky=tk.EW)
 
-        # 测试按钮 + 费用提示
-        # P2-5：火山测试按钮纳入 busy 列表。
         self.volc_test_btn = ttk.Button(
             volc_frame, text="测试 AI 图片翻译连接", command=self.test_volc_connection
         )
-        self.volc_test_btn.grid(row=13, column=1, padx=10, pady=6, sticky=tk.W)
+        self.volc_test_btn.grid(row=14, column=1, padx=10, pady=6, sticky=tk.W)
         self._test_buttons.append(self.volc_test_btn)
         fee_tip = ttk.Label(
             volc_frame,
@@ -1022,94 +1008,8 @@ class SettingsWindow:
             font=("TkDefaultFont", 8),
             foreground=COLORS["danger"],
         )
-        fee_tip.grid(row=14, column=0, columnspan=3, padx=10, pady=(0, 10), sticky=tk.EW)
+        fee_tip.grid(row=15, column=0, columnspan=3, padx=10, pady=(0, 10), sticky=tk.EW)
         fee_tip.bind("<Configure>", lambda e: fee_tip.configure(wraplength=e.width - 4))
-
-    def _browse_manga_model_dir(self):
-        """选择 Manga 模型目录。"""
-        from tkinter import filedialog
-
-        path = filedialog.askdirectory(title="选择 Manga 模型目录", parent=self.window)
-        if path:
-            self.manga_model_dir_var.set(path)
-
-    def _check_manga_status(self):
-        """检测 Manga 引擎可用性（惰性导入，未安装时只更新状态文本）。
-
-        不依赖具体 mapping_dir，只检查：
-        1. 引擎依赖（torch + manga_translator）是否可导入
-        2. API 配置（base_url / api_key / model_name）
-        3. 当前目标语言是否受 Manga 支持
-
-        P2-5：加入 testing busy 状态，避免重复点击触发多次检测。
-        """
-        capabilities = getattr(self, "edition_capabilities", None)
-        if capabilities is None:
-            capabilities = detect_edition_capabilities()
-        if not capabilities.manga_enabled:
-            self.manga_status_label.config(text="Text Edition 不可用", foreground=COLORS["muted"])
-            return
-
-        # P2-5：避免重复启动
-        if not self._begin_test():
-            return
-        self.manga_status_label.config(text="正在检测...", foreground=COLORS["muted"])
-
-        def worker():
-            try:
-                import importlib
-
-                from ..infrastructure.image_translation.language_codes import (
-                    to_manga_lang,
-                )
-
-                errors = []
-
-                # 1. 引擎依赖检查（惰性）
-                torch_spec = importlib.util.find_spec("torch")
-                manga_spec = importlib.util.find_spec("manga_translator")
-                if torch_spec is None or manga_spec is None:
-                    errors.append("未安装 manga-image-translator 引擎或 torch 依赖")
-
-                # 2. 语言映射检查
-                target_lang = self.app_config.get("target_language", "中文")
-                if to_manga_lang(target_lang) is None:
-                    errors.append(f"目标语言 {target_lang} 暂不支持")
-
-                # 3. API 配置检查（external_llm 复用文本翻译 API）
-                api_config = self.config_manager.get_api_config()
-                if not api_config.get("base_url"):
-                    errors.append("缺少 API base_url")
-                if not api_config.get("api_key"):
-                    errors.append("缺少 API Key")
-                if not api_config.get("model_name"):
-                    errors.append("缺少模型名称")
-
-                if errors:
-                    msg = "; ".join(errors)
-                    self._safe_after(
-                        lambda m=msg: self.manga_status_label.config(
-                            text=f"配置不完整: {m}", foreground=status_color("error")
-                        )
-                    )
-                else:
-                    self._safe_after(
-                        lambda: self.manga_status_label.config(
-                            text="可用", foreground=status_color("ok")
-                        )
-                    )
-            except Exception as exc:
-                error_message = str(exc)[:80]
-                self._safe_after(
-                    lambda m=error_message: self.manga_status_label.config(
-                        text=f"检测失败: {m}", foreground=status_color("error")
-                    )
-                )
-            finally:
-                # P2-5：检测结束，恢复测试按钮可用状态
-                self._safe_after(self._end_test)
-
-        threading.Thread(target=worker, daemon=True).start()
 
     def test_volc_connection(self):
         """测试插图翻译连接。
@@ -1487,6 +1387,14 @@ class SettingsWindow:
             new_api_config = apply_text_translation_profile(self._current_api_form_config())
             volc_base_url = normalize_openai_base_url(self.volc_base_url_var.get().strip())
             self.volc_base_url_var.set(volc_base_url)
+            ocr_base_url = self.ocr_base_url_var.get().strip()
+            if ocr_base_url:
+                ocr_base_url = normalize_openai_base_url(ocr_base_url)
+                self.ocr_base_url_var.set(ocr_base_url)
+                if not self.ocr_key_var.get().strip():
+                    raise ValueError("使用自定义 OCR API 地址时，请输入自定义 OCR API Key")
+            ocr_model = self.ocr_model_var.get().strip() or SILICONFLOW_OCR_DEFAULT_MODEL
+            self.ocr_model_var.set(ocr_model)
 
             # 更新应用配置
             new_app_config = self.app_config.copy()
@@ -1509,17 +1417,14 @@ class SettingsWindow:
                     "queue_rpm_limit": self.queue_rpm_var.get(),
                     "queue_tpm_limit": self.queue_tpm_var.get(),
                     "queue_adaptive_concurrency": self.queue_adaptive_var.get(),
-                    # 旧字段保留为常量以兼容读取侧（迁移逻辑会忽略这些值）
-                    "image_text_translation_enabled": False,
+                    "vision_model_name": ocr_model,
+                    "image_text_translation_enabled": self.image_text_enabled_var.get(),
                     "image_gen_provider": "volcengine",
-                    # 图片翻译配置：Manga 默认模块 + AI Provider
                     "image_translation": {
-                        "default_provider": "manga",
-                        "manga": {
-                            "quality_preset": self.manga_quality_var.get(),
-                            "device": self.manga_device_var.get(),
-                            "model_dir": self.manga_model_dir_var.get().strip(),
-                            "batch_size": 1,
+                        "default_provider": "ai_volcengine",
+                        "ocr": {
+                            "base_url": ocr_base_url,
+                            "model": ocr_model,
                         },
                         "ai_volcengine": {
                             "provider": "volcengine",
@@ -1532,16 +1437,20 @@ class SettingsWindow:
 
             # P1-2：保存配置，收集各部分的 SecretSaveResult / 布尔状态
             volc_result = self.config_manager.save_volc_key(self.volc_key_var.get())
+            ocr_result = self.config_manager.save_ocr_key(self.ocr_key_var.get())
             api_result = self.config_manager.save_api_config(new_api_config)
             app_saved = self.config_manager.save_app_config(new_app_config)
 
             # P1-2：任一密钥 FAILED 都不关闭窗口，显示具体错误
-            if volc_result.failed or api_result.failed or not app_saved:
+            if volc_result.failed or ocr_result.failed or api_result.failed or not app_saved:
                 # 优先显示密钥相关错误，否则显示通用错误
-                failed_result = volc_result if volc_result.failed else api_result
+                failed_result = next(
+                    (result for result in (volc_result, ocr_result, api_result) if result.failed),
+                    None,
+                )
                 error_msg = (
                     failed_result.user_message
-                    if (volc_result.failed or api_result.failed)
+                    if failed_result is not None
                     else "应用配置保存失败，请重试"
                 )
                 messagebox.showerror("保存失败", error_msg, parent=self.window)
@@ -1551,6 +1460,8 @@ class SettingsWindow:
             session_only_msgs = []
             if volc_result.session_only:
                 session_only_msgs.append(volc_result.user_message)
+            if ocr_result.session_only:
+                session_only_msgs.append(ocr_result.user_message)
             if api_result.session_only:
                 session_only_msgs.append(api_result.user_message)
 

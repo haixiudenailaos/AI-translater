@@ -35,7 +35,6 @@
 - 第一方代码：`main.py`、`build.py`、`src/**`、`tests/**`、`tools/**`。
 - 工程配置：`pyproject.toml`、`requirements*.txt`、PyInstaller spec、GitHub Actions 和 README。
 - 关键链路：启动、配置、导入、翻译、流式预览、队列、检查点、图片翻译、EPUB 导出和关闭。
-- Full Edition：只审查本项目对 Manga worker 的进程、I/O 和生命周期边界，不评价 `third_party` 上游代码风格。
 
 静态规模约为：
 
@@ -67,7 +66,7 @@ Pytest 的 5 项失败应这样解释：
 - 1 项因受控环境无权访问真实 `%APPDATA%`，属于运行环境失败，不作为产品回归。
 - 1 项要求 CI 存在 Python 3.10-3.13 测试矩阵，但当前工作流不存在该矩阵。
 - 2 项仍要求 Text spec 使用 onedir，而 `translator_text.spec` 已改为 onefile。
-- 1 项 Manga hook 测试要求相对源路径，而实现返回绝对路径。
+- 旧的双发行规格和本地引擎 hook 测试已经随单一在线 AI 构建收敛而移除。
 
 `-X importtime` 显示 `src.bootstrap` 累计约 314ms、`main` 累计约 502ms。累计导入时间不能简单相加，但足以说明组合根和其传递依赖是启动优化的首要观察点。该结果依赖硬件和磁盘状态，只用于同机前后对比。
 
@@ -89,7 +88,7 @@ Ruff 通过不等于“已全面符合 Python 最佳实践”。当前 Ruff 配�
 8. 队列主列表已经消费轻量不可变快照，`max_active_tasks`、Future 完成唤醒和异步 finalizer 已实现。
 9. 检查点已经具备 debounce、single-flight 和终态保存；自动保存具备 generation 与迟到结果隔离。
 10. EPUB 导入已有 ZIP 成员数、解压大小、压缩比、路径穿越限制和协作式取消检查点。
-11. Manga worker 的 stderr 在达到日志保留上限后仍会持续 drain，不再因管道写满而死锁。
+11. 图片翻译 worker 使用协作式取消并在关闭 deadline 内释放视觉和图生图客户端。
 12. 关闭取消、会话替换、保存结果语义、RUN 终态清理、损坏项目隔离等旧问题已有回归测试。
 
 这意味着后续工作应以增量修复和测量为主，不需要更换 GUI 框架或重写整个项目。
@@ -125,7 +124,7 @@ Ruff 通过不等于“已全面符合 Python 最佳实践”。当前 Ruff 配�
 | `platform-smoke` | Windows/macOS，主支持 Python | 路径、keyring fallback、Tk 关键测试和启动 smoke |
 | `wheel-smoke` | 干净环境 | 构建 wheel、安装 wheel、从仓库外目录导入/启动 |
 | `build-text` | 明确支持的平台 | 使用与 runner Python 完全匹配的 hash lock 构建 |
-| `build-full` | 仅明确支持的平台 | Manga worker health check、模型外置策略和产物校验 |
+| `build-desktop` | 明确支持的平台 | 在线图片翻译模块、关键资源和产物校验 |
 | `release` | tag | 汇总已通过的产物、校验和、SBOM 和发布说明 |
 
 剩余验收：
@@ -217,7 +216,7 @@ CI 现已阻断 `src/config/config_manager.py`、`src/infrastructure/project_rep
 
 ### P1-6 已实现：图片翻译关闭和 endpoint 校验统一
 
-图片 UI 现使用单一绝对 deadline：先取消所有 Provider，等待活动 worker 直到剩余时间耗尽，再向 Provider 传递剩余预算释放资源。worker 未退出或从自身线程调用关闭时，代码会保留 Provider、模型和 event loop，不会并发卸载资源。Manga worker 的 terminate/kill 和 reader 线程回收共享该预算；本地 runtime 只有在拥有它的线程退出后才关闭 event loop。火山 endpoint 已复用文本 API 的 HTTPS/loopback 校验，拒绝远程 HTTP、URL 用户信息、查询参数和锚点，并在创建 OpenAI/httpx 客户端前失败。
+图片 UI 使用单一绝对 deadline：先设置协作式取消信号，等待活动 worker 使用剩余预算退出，再释放视觉模型 API 和火山图生图客户端。火山 endpoint 已复用文本 API 的 HTTPS/loopback 校验，拒绝远程 HTTP、URL 用户信息、查询参数和锚点，并在创建客户端前失败。
 
 回归覆盖关闭顺序、worker 超时不释放资源、worker terminate/kill 预算和 runtime 线程仍存活时不关闭 loop；当前定向套件为 31 passed。后续保持中央 `sanitize_for_log()`、关闭中回调和恶意 endpoint 覆盖，避免回退到弱化脱敏或竞态 teardown。
 
@@ -487,7 +486,7 @@ python -m venv .venv
 2. `python -m build --wheel` 后在第二个干净环境安装 wheel。
 3. 从仓库目录外执行 import/entry-point smoke，防止源码路径掩盖漏包。
 4. 对 PyInstaller 产物执行启动、关键资源、版本、edition 能力和关闭 smoke。
-5. Full Edition 额外执行 Manga worker health check；不下载模型的 smoke 与含模型集成测试分开。
+5. 图片翻译额外执行视觉检测筛选和在线图生图的 mock smoke；真实付费 API 集成测试单独运行。
 
 ## 12. 旧问题状态对照
 
@@ -498,7 +497,7 @@ python -m venv .venv
 | 关闭取消发生在不可逆 teardown 后 | 已修复 | `tests/test_config_save_result.py` 有关闭取消回归 |
 | 翻译中替换会话永久 busy | 已修复 | `tests/test_translation_single_flight.py` 覆盖会话替换 |
 | 密钥保存语义把失败当成功 | 已修复 | 结构化保存结果已有测试；本轮新问题是并发快照一致性 |
-| Manga stderr 500 行后停止 drain | 已修复 | `tests/test_image_cancel_p1_8.py` 覆盖持续 drain |
+| 图片翻译客户端未及时释放 | 已修复 | `tests/test_image_fixes.py` 覆盖显式关闭 |
 | `max_active_tasks` 不生效 | 已修复 | Coordinator 已按活动窗口惰性 prepare |
 | Future 完成只能等待固定轮询 | 已修复 | Future callback 会设置统一 wake event |
 | Provider 切换后 limiter 释放错配 | 已修复 | `_InFlightBatch` 固定持有派发时 limiter；定向回归覆盖切换、取消和 submit 失败 |

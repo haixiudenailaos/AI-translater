@@ -18,11 +18,6 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from ..domain.image_translation import (
-    ImageTranslationProgress,
-    ImageTranslationRequest,
-    ImageTranslationResult,
-)
 from ..domain.project import TranslationProject
 from ..domain.translation import (
     TranslationOptions,
@@ -196,116 +191,6 @@ class ProjectRepository(Protocol):
 
     def delete(self, project_id: str) -> bool:
         """删除项目及其检查点"""
-        ...
-
-
-@runtime_checkable
-class ImageTranslationProvider(Protocol):
-    """图片翻译 Provider 协议
-
-    现有 Manga 引擎和火山图生图均通过适配器满足此协议。应用服务
-    ImageTranslationService 只依赖此协议，不依赖具体引擎或 tkinter。
-
-    约束：
-    - Provider 不直接访问 Tk 控件，也不显示 messagebox。
-    - Provider 不自行决定切换另一个 Provider。
-    - Provider 返回结构化部分成功结果，不用空字典混淆「无需翻译」和「全部失败」。
-    - cancel() 和 close() 必须幂等，可安全多次调用。
-    - 错误信息不得包含 API Key、完整 Base64、请求头或鉴权响应原文。
-    """
-
-    provider_id: str
-
-    def validate(self, request: ImageTranslationRequest) -> list[str]:
-        """执行前校验请求
-
-        Returns:
-            错误消息列表；非空表示请求不满足前置条件（如缺模型、缺 Key、
-            未知语言）。Service 据此提示用户，不调用 translate。
-        """
-        ...
-
-    def translate(
-        self,
-        request: ImageTranslationRequest,
-        on_progress: Callable[[ImageTranslationProgress], None] | None = None,
-    ) -> ImageTranslationResult:
-        """执行图片翻译
-
-        Args:
-            request: 图片翻译请求
-            on_progress: 进度回调（可选）
-
-        Returns:
-            结构化结果，包含成功映射、跳过和失败列表。
-            取消时抛出 ImageTranslationCancelled。
-        """
-        ...
-
-    def cancel(self) -> None:
-        """取消进行中的翻译，幂等"""
-        ...
-
-    def close(self) -> None:
-        """释放资源（模型、event loop、HTTP 客户端），幂等"""
-        ...
-
-
-@runtime_checkable
-class ImageManifestRepository(Protocol):
-    """图片翻译 manifest 仓储协议（P1-1 / P2-2）
-
-    Application 层只依赖此协议，不依赖具体的 ManifestRepository 实现。
-    bootstrap.py 注入工厂，每次请求按 mapping_dir 创建实例。
-
-    约束：
-    - save / save_empty 失败时抛出异常，不静默吞掉（P1-1）。
-    - 原子写入保证旧文件在写入失败时保持完整。
-    - load 兼容 v1/v2 格式。
-    """
-
-    def save(
-        self,
-        result: ImageTranslationResult,
-        *,
-        source_fingerprint: str = "",
-        config_fingerprint: str = "",
-        run_at: str = "",
-    ) -> None:
-        """以 v2 格式原子写入 manifest，失败时抛出异常"""
-        ...
-
-    def save_empty(self, *, run_at: str = "") -> None:
-        """写入空结果 manifest（取消或全部失败前的清理）"""
-        ...
-
-    def load(self) -> object | None:
-        """读取 manifest，不存在返回 None"""
-        ...
-
-
-@runtime_checkable
-class ImageProviderRegistry(Protocol):
-    """图片翻译 Provider 注册表协议（P2-2）
-
-    Application 层只依赖此协议，不依赖全局 get_registry() 单例。
-    bootstrap.py 注入具体注册表，多个窗口或任务之间不共享状态。
-
-    约束：
-    - 按 provider_id 取得 Provider，不实现自动 fallback。
-    - Manga Provider 在禁用开关关闭时返回 None，调用方展示错误。
-    """
-
-    def register(self, provider: object) -> None:
-        """注册一个 Provider"""
-        ...
-
-    def get(self, provider_id: object) -> object | None:
-        """按 provider_id 取得 Provider，不存在返回 None"""
-        ...
-
-    def is_registered(self, provider_id: object) -> bool:
-        """判断 provider_id 是否已注册且可用"""
         ...
 
 

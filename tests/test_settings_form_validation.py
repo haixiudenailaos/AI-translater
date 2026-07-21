@@ -203,6 +203,7 @@ class _StubConfigManager:
     def __init__(self):
         self._secret_store = _FakeSecretStore()
         self.save_volc_calls = []  # save_volc_key 调用记录
+        self.save_ocr_calls = []  # save_ocr_key 调用记录
         self.save_api_calls = []  # save_api_config 调用记录
         self.save_app_calls = []  # save_app_config 调用记录
 
@@ -222,7 +223,16 @@ class _StubConfigManager:
         return {}
 
     def get_image_translation_config(self):
-        return {"manga": {}, "ai_volcengine": {}}
+        return {
+            "ocr": {
+                "base_url": "",
+                "model": "PaddlePaddle/PaddleOCR-VL-1.5",
+            },
+            "ai_volcengine": {},
+        }
+
+    def get_ocr_key(self):
+        return ""
 
     def get_volc_key(self):
         return ""
@@ -244,6 +254,16 @@ class _StubConfigManager:
         return SecretSaveResult(
             secret_status=StorageStatus.PERSISTED,
             config_saved=True,
+        )
+
+    def save_ocr_key(self, api_key):
+        self.save_ocr_calls.append(api_key)
+        from src.domain.secret import SecretSaveResult, StorageStatus
+
+        return SecretSaveResult(
+            secret_status=StorageStatus.PERSISTED,
+            config_saved=True,
+            provider="ocr",
         )
 
     def save_api_config(self, config):
@@ -364,6 +384,9 @@ class SettingsWindowValidationTests(unittest.TestCase):
             "doubao-seedream-5-0-pro-260628",
         )
         self.assertTrue(hasattr(dialog, "volc_key_var"))
+        self.assertEqual(dialog.ocr_base_url_var.get(), "")
+        self.assertEqual(dialog.ocr_model_var.get(), "PaddlePaddle/PaddleOCR-VL-1.5")
+        self.assertTrue(hasattr(dialog, "ocr_key_var"))
 
     def test_validate_form_passes_with_defaults(self):
         dialog = self._make_dialog()
@@ -549,6 +572,32 @@ class SettingsWindowValidationTests(unittest.TestCase):
         volc_config = self.config_manager.save_app_calls[-1]["image_translation"]["ai_volcengine"]
         self.assertEqual(volc_config["base_url"], "https://example.com/ark/v3")
         self.assertEqual(volc_config["model"], "ep-user-defined-model")
+
+    def test_save_settings_persists_custom_ocr_endpoint_model_and_key(self):
+        dialog = self._make_dialog()
+        dialog.ocr_base_url_var.set("https://ocr.example.com/v1/chat/completions/")
+        dialog.ocr_model_var.set("vendor/custom-ocr")
+        dialog.ocr_key_var.set("ocr-final-key")
+
+        with patch("src.ui.settings_window.messagebox.showinfo"):
+            dialog.save_settings()
+
+        ocr_config = self.config_manager.save_app_calls[-1]["image_translation"]["ocr"]
+        self.assertEqual(ocr_config["base_url"], "https://ocr.example.com/v1")
+        self.assertEqual(ocr_config["model"], "vendor/custom-ocr")
+        self.assertEqual(self.config_manager.save_ocr_calls[-1], "ocr-final-key")
+
+    def test_save_settings_requires_dedicated_key_for_custom_ocr_endpoint(self):
+        dialog = self._make_dialog()
+        dialog.ocr_base_url_var.set("https://ocr.example.com/v1")
+        dialog.ocr_key_var.set("")
+
+        with patch("src.ui.settings_window.messagebox.showwarning") as warning:
+            dialog.save_settings()
+
+        warning.assert_called_once()
+        self.assertEqual(self.config_manager.save_ocr_calls, [])
+        self.assertEqual(self.config_manager.save_app_calls, [])
 
     def test_save_settings_blocks_when_form_invalid(self):
         """P2-5：表单校验失败时 save_settings 不应触发持久化。"""

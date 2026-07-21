@@ -30,6 +30,7 @@ from src.core.image_text_translator import (
 from src.core.image_translator import (
     _CONNECTION_TEST_PNG_BASE64,
     _FORMAT_TO_EXT,
+    ImageDownloadError,
     ImageTranslator,
     _build_image_data_uri,
     _detect_image_format,
@@ -630,6 +631,68 @@ class TestArkClientClose:
         assert kwargs["watermark"] is True
         assert "extra_body" not in kwargs
         assert "sequential_image_generation" not in kwargs
+
+    def test_generated_image_smaller_than_original_is_saved(self, tmp_path):
+        """生成图的编码体积可以小于原图，不应因此被拒绝。"""
+        translator = ImageTranslator(MagicMock())
+        client = MagicMock()
+        client.images.generate.return_value = MagicMock(
+            data=[MagicMock(url="https://ark.volces.com/generated.png")]
+        )
+        original_image = b"\x89PNG\r\n\x1a\n" + b"o" * 2048
+        generated_image = b"\x89PNG\r\n\x1a\n" + b"g" * 128
+        assert len(generated_image) < len(original_image)
+
+        with patch(
+            "src.core.image_translator._safe_download_image",
+            return_value=generated_image,
+        ):
+            result = translator._process_single_image(
+                client,
+                "cover.png",
+                base64.b64encode(original_image).decode("ascii"),
+                "中文",
+                tmp_path,
+                mime_type="image/png",
+                original_path="images/cover.png",
+            )
+
+        assert result is not None
+        original_name, generated_name = result
+        assert original_name == "cover.png"
+        assert (tmp_path / generated_name).read_bytes() == generated_image
+
+    def test_download_or_decode_failure_does_not_retry_generation(self, tmp_path):
+        """结果图片下载失败后不得再次调用付费生成接口。"""
+        translator = ImageTranslator(MagicMock())
+        translator.max_retries = 3
+        client = MagicMock()
+        client.images.generate.return_value = MagicMock(
+            data=[MagicMock(url="https://ark.volces.com/generated.jpg")]
+        )
+
+        with (
+            patch(
+                "src.core.image_translator._safe_download_image",
+                side_effect=ImageDownloadError("结果图片无法解码"),
+            ) as download,
+            patch("src.core.image_translator.time.sleep") as sleep,
+        ):
+            result = translator._process_single_image(
+                client,
+                "cover.jpg",
+                base64.b64encode(b"original-image").decode("ascii"),
+                "中文",
+                tmp_path,
+                mime_type="image/jpeg",
+                original_path="images/cover.jpg",
+            )
+
+        assert result is None
+        assert client.images.generate.call_count == 1
+        assert download.call_count == 1
+        sleep.assert_not_called()
+        assert "下载或解码失败" in translator.last_error
 
     def test_official_ark_sdk_serializes_image_as_top_level_field(self):
         captured = {}

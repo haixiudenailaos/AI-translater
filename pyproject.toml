@@ -26,7 +26,7 @@ dependencies = [
     # 火山方舟数据面官方 SDK，AI 图片翻译使用其原生 images.generate(image=...)。
     "volcengine-python-sdk[ark]>=5.0.41,<6.0",
     # ``openai`` imports Pydantic at module import time; keep this direct so
-    # Text Edition environments do not rely on a fragile transitive install.
+    # Packaged environments must not rely on a fragile transitive install.
     "pydantic>=2.5.0,<3.0",
     "keyring>=24.0.0",
 ]
@@ -45,66 +45,6 @@ dev = [
     # 再扩展到 infrastructure 与新 UI adapter。
     "pyright>=1.1.350",
 ]
-# 可选图片翻译依赖：manga-image-translator 深度学习栈
-image-manga = [
-    "torch>=2.1.0,<2.6",
-    "torchvision>=0.16.0,<0.21",
-    "onnxruntime>=1.16.0,<1.20",
-    "opencv-python>=4.8.0,<4.10",
-    "numpy==1.26.4",
-    "Pillow>=9.0.0",
-    "huggingface-hub>=0.20.0,<0.25",
-    "safetensors>=0.4.0",
-    "tokenizers>=0.15.0,<0.20",
-    "transformers>=4.38.0,<4.46",
-    "sentencepiece>=0.1.99",
-    "ctranslate2>=4.0.0",
-    "accelerate>=0.27.0",
-    "open-clip-torch>=2.24.0",
-    "timm>=0.9.16",
-    "einops>=0.7.0",
-    "scikit-image>=0.22.0",
-    "pyclipper>=1.3.0",
-    "shapely>=2.0.0",
-    "freetype-py>=2.4.0",
-    "kornia>=0.7.0",
-    "ImageHash>=4.3.0",
-    "manga-ocr>=0.1.11",
-    "omegaconf>=2.3.0",
-    "python-bidi>=0.4.2",
-    "arabic-reshaper>=3.0.0",
-    "pyhyphen>=4.0.3",
-    "openai==1.63.0",
-    "httpx[http2]==0.27.2",
-    "pydantic==2.5.0",
-    "aiofiles>=23.2.1",
-    "aioshutil>=1.5",
-    "rich>=13.7.0",
-    "regex>=2023.12.25",
-    "cryptography>=41.0.0",
-    "tqdm>=4.66.0",
-    "networkx>=3.2.0",
-    "py3langid==0.2.2",
-    "langdetect>=1.0.9",
-    "langcodes[data]>=3.3.0",
-    "editdistance>=0.8.1",
-    "tensorboardX>=2.6.0",
-    "websockets>=12.0",
-    "tiktoken>=0.6.0",
-    "colorama>=0.4.6",
-    "python-dotenv>=1.0.0",
-    "nest-asyncio>=1.6.0",
-    "marshmallow>=3.20.0",
-    "backports.cached-property>=1.0.2",
-    "groq>=0.9.0",
-    "deepl>=1.18.0",
-    "google-genai>=1.0.0",
-    "protobuf>=3.20.2,<6.0.0",
-    "pandas>=2.1.0",
-    "torch-summary>=1.4.5",
-    "rusty-manga-image-translator",
-]
-
 [tool.setuptools.packages.find]
 # P1-4：修复 wheel 包发现，包含 src 及其所有子包
 where = ["."]

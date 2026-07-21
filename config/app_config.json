@@ -8,6 +8,13 @@
   "vision_model_name": "PaddlePaddle/PaddleOCR-VL-1.5",
   "image_text_translation_enabled": true,
   "image_gen_provider": "volcengine",
+  "image_translation": {
+    "default_provider": "ai_volcengine",
+    "ocr": {
+      "base_url": "",
+      "model": "PaddlePaddle/PaddleOCR-VL-1.5"
+    }
+  },
   "batch_lines": 10,
   "translation_concurrency": 1
 }

@@ -118,7 +118,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install Text Edition dependencies
+      - name: Install desktop dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
@@ -127,7 +127,7 @@ jobs:
 
       - name: Build single Windows executable
         shell: pwsh
-        run: pyinstaller translator_text.spec --clean --noconfirm
+        run: pyinstaller translator.spec --clean --noconfirm
 
       - name: Rename and validate executable
         shell: pwsh
@@ -171,14 +171,14 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install Text Edition dependencies
+      - name: Install desktop dependencies
         run: |
           python -m pip install --upgrade pip
           pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
           pip install -r requirements.txt
 
       - name: Build single macOS executable
-        run: pyinstaller translator_text.spec --clean --noconfirm
+        run: pyinstaller translator.spec --clean --noconfirm
 
       - name: Assemble macOS application
         shell: bash

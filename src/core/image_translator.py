@@ -7,6 +7,7 @@
 import base64
 import binascii
 import hashlib
+import io
 import json
 import logging
 import threading
@@ -198,6 +199,24 @@ def _validate_image_magic_bytes(data: bytes) -> str:
     raise ImageDownloadError("下载内容无法识别为有效图片格式")
 
 
+def _validate_decodable_image(data: bytes) -> None:
+    """Ensure downloaded raster bytes can actually be opened and decoded."""
+    try:
+        import PIL.Image
+    except ImportError:
+        return
+
+    try:
+        with PIL.Image.open(io.BytesIO(data)) as image:
+            image.load()
+            width, height = image.size
+    except Exception as exc:
+        raise ImageDownloadError(f"下载结果图片损坏或无法解码: {exc}") from exc
+
+    if width <= 0 or height <= 0:
+        raise ImageDownloadError("下载结果图片尺寸无效")
+
+
 def _validate_download_url(url: str) -> None:
     """P1-9：校验下载 URL 的 scheme 和 host。
 
@@ -305,6 +324,7 @@ def _safe_download_image(url: str, *, timeout: int = 60) -> bytes:
     if image_format == "svg+xml":
         data = _rasterize_safe_svg(data)
         _validate_image_magic_bytes(data)
+    _validate_decodable_image(data)
 
     return data
 
@@ -756,24 +776,6 @@ class ImageTranslator:
                     "[_process_single_image] 下载完成，图片大小: %d bytes", len(new_img_data)
                 )
 
-                orig_size = len(base64.b64decode(b64_str))
-                logger.debug(
-                    "[_process_single_image] 原图大小: %d bytes, 新图大小: %d bytes",
-                    orig_size,
-                    len(new_img_data),
-                )
-                if len(new_img_data) < orig_size * 0.9:
-                    logger.warning(
-                        "[_process_single_image] 生成图片太小: %s: %d < %s",
-                        original_name,
-                        len(new_img_data),
-                        orig_size * 0.9,
-                    )
-                    print(
-                        f"Generated image too small for {original_name}: {len(new_img_data)} < {orig_size * 0.9}"
-                    )
-                    return None
-
                 # R2-BUG-016：文件名包含原图完整路径哈希，避免同名图片互相覆盖
                 # 同时根据下载内容的真实格式确定扩展名，不盲信原图扩展名
                 p = Path(original_name)
@@ -811,6 +813,11 @@ class ImageTranslator:
             except ArkAuthenticationError:
                 self._last_error = "火山方舟 API Key 无效或格式错误，请在设置中重新保存。"
                 logger.error("[_process_single_image] 火山方舟鉴权失败")
+                return None
+            except ImageDownloadError as exc:
+                # 生成已经产生费用；下载或解码失败时直接跳过，避免再次调用生成 API。
+                self._last_error = f"生成图片下载或解码失败: {str(exc)[:240]}"
+                logger.error("[_process_single_image] %s", self._last_error)
                 return None
             except (ArkAPIConnectionError, ArkAPITimeoutError) as e:
                 self._last_error = self._connection_error_message(e)

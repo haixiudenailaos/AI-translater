@@ -85,7 +85,6 @@ class TranslatorApp:
                 self.root,
                 config_manager,
                 app_paths=app_paths,
-                edition_capabilities=self.app_context.edition_capabilities,
             )
             if self._loading_frame is not None:
                 self._loading_frame.destroy()

@@ -18,7 +18,6 @@ from tkinter import filedialog, messagebox, ttk
 from ..application.error_handling import format_diagnostic_info
 from ..core.concurrent_manager import ConcurrentTranslationManager
 from ..core.epub_processor import EpubImportCancelled
-from ..domain.edition import EditionCapabilities, detect_edition_capabilities
 from .task_detail_window import TaskDetailWindow
 from .theme import COLORS, FONT_APP_SMALL
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
@@ -44,19 +43,12 @@ class ConcurrentWindow:
         "error": "出错",
     }
 
-    def _manga_enabled(self) -> bool:
-        capabilities = getattr(self, "edition_capabilities", None)
-        if capabilities is None:
-            capabilities = detect_edition_capabilities()
-        return capabilities.manga_enabled
-
     def __init__(
         self,
         parent,
         config_manager,
         app_paths=None,
         manager=None,
-        edition_capabilities: EditionCapabilities | None = None,
     ):
         """初始化队列翻译管理窗口。
 
@@ -66,20 +58,14 @@ class ConcurrentWindow:
         Args:
             parent: 父 Tk 窗口
             config_manager: 配置管理器
-            app_paths: 应用路径（Manga Provider 模型目录）
+            app_paths: 应用路径。
             manager: 外部注入的 ``ConcurrentTranslationManager``。若提供，
                 窗口不拥有其生命周期，关闭时只取消订阅；若为 None，
                 为向后兼容由本窗口自建并拥有（旧路径，将逐步淘汰）。
-            edition_capabilities: Text/Full 版本能力契约。Text 版本禁用 Manga 入口。
         """
         self.parent = parent
         self.config_manager = config_manager
-        self.app_paths = app_paths  # Manga Provider 模型目录使用
-        self.edition_capabilities = (
-            edition_capabilities
-            if edition_capabilities is not None
-            else detect_edition_capabilities()
-        )
+        self.app_paths = app_paths
         # P1-3：manager 归应用所有，窗口只订阅快照
         if manager is not None:
             self.manager = manager
@@ -104,11 +90,11 @@ class ConcurrentWindow:
         # - _image_translate_run_id：单调递增，回调闭包捕获后比对，
         #   迟到回调（旧 run_id）被安全丢弃，避免旧进度覆盖新状态
         # - _image_cancel_event：用户取消信号，worker 在任务间隙检查
-        # - _image_service：运行中的 service 引用，供 cancel 调用
+        # - _image_translator：当前视觉检测器引用，关闭时释放客户端
         self._image_translate_busy = False
         self._image_translate_run_id = 0
         self._image_cancel_event = threading.Event()
-        self._image_service = None
+        self._image_translator = None
 
         # P1-9：批量导出 worker 状态机（与图片翻译同构）
         # - _export_busy：防止重复启动，按钮在 idle/busy 间切换文案与命令
@@ -171,8 +157,6 @@ class ConcurrentWindow:
             toolbar, text="翻译图片", command=self._translate_all_images
         )
         self.translate_images_btn.pack(side=tk.LEFT, padx=(0, 4))
-        if not self._manga_enabled():
-            self.translate_images_btn.configure(state=tk.DISABLED)
 
         # 任务列表
         # P1-UX-3：新增 failed / error_summary 列展示失败行数与脱敏错误摘要
@@ -275,14 +259,6 @@ class ConcurrentWindow:
             cancel_event = getattr(self, "_image_cancel_event", None)
             if cancel_event is not None:
                 cancel_event.set()
-            service = getattr(self, "_image_service", None)
-            if service is not None:
-                try:
-                    from ..domain.image_translation import ImageTranslationProviderId
-
-                    service.cancel(ImageTranslationProviderId.MANGA)
-                except Exception:
-                    pass
 
         # P1-9：取消批量导出 worker，让其在任务间隙退出
         if getattr(self, "_export_busy", False):
@@ -834,23 +810,11 @@ class ConcurrentWindow:
         self._ui_mailbox.submit(guarded)
 
     def _translate_all_images(self):
-        """一键翻译所有已完成EPUB任务中的图片
+        """用 V1.5 智能检测流程翻译所有已完成 EPUB 任务中的图片。
 
         P1-8：worker 通过 ``UICallbackMailbox`` 提交 UI 更新，零跨线程 Tk 调用。
         新增 busy/run_id 防重复启动与迟到回调丢弃，新增 cancel_event 用户取消入口。
-
-        走默认 Manga Provider，移除原火山引擎 Key 硬编码：
-        - Manga external_llm 复用文本翻译 API 配置，因此仍检查 is_api_configured。
-        - 单任务失败/校验失败/无文字/取消都不调用火山 AI Provider。
         """
-        if not self._manga_enabled():
-            messagebox.showwarning(
-                "图片翻译",
-                "当前为 Text Edition，未打包本地 Manga 推理依赖。请使用 Full Edition。",
-                parent=self.win,
-            )
-            return
-
         # P1-8：busy 入口禁用，防止重复启动
         if self._image_translate_busy:
             messagebox.showinfo(
@@ -869,14 +833,28 @@ class ConcurrentWindow:
             messagebox.showinfo("提示", "没有已完成的EPUB任务", parent=self.win)
             return
 
-        # Manga external_llm 复用文本翻译 API 配置，需要 API 配置；
-        # 不再检查火山 Key——Manga 默认模块与火山 Key 无关。
-        if not self.config_manager.is_api_configured():
+        if not self.config_manager.get_volc_key():
             messagebox.showwarning(
                 "配置警告",
-                "请先配置文本翻译 API 设置（Manga 模块复用该配置翻译图片文字）",
+                "请先配置火山引擎 API Key",
                 parent=self.win,
             )
+            return
+
+        ocr_checker = getattr(self.config_manager, "is_image_ocr_configured", None)
+        ocr_configured = (
+            bool(ocr_checker())
+            if callable(ocr_checker)
+            else bool(self.config_manager.is_api_configured())
+        )
+        if not ocr_configured and not messagebox.askyesno(
+            "OCR 未配置",
+            "当前没有可用的 OCR 预筛选服务。\n\n"
+            "继续后，队列中所有 EPUB 的全部图片都会进入 AI 图生图，"
+            "API 调用次数和花销会更高。\n\n"
+            "是否仍要继续？",
+            parent=self.win,
+        ):
             return
 
         target_lang = self.config_manager.get_app_config().get("target_language", "中文")
@@ -891,28 +869,8 @@ class ConcurrentWindow:
         self._set_image_button_busy(True)
 
         def run():
-            from ..application.image_translation_service import ImageTranslationService
-            from ..domain.errors import (
-                ImageTranslationCancelled,
-                ImageTranslationConfigError,
-            )
-            from ..domain.image_translation import (
-                ImageTranslationProgress,
-                ImageTranslationProviderId,
-            )
-            from ..domain.translation import OperationStatus
-            from ..infrastructure.image_translation.registry import (
-                ImageTranslationProviderRegistry,
-            )
-
-            # 构建 Service：仅注册 Manga（队列默认模块）
-            registry = ImageTranslationProviderRegistry()
-            manga_provider = self._create_manga_provider()
-            if manga_provider is not None:
-                registry.register(manga_provider)
-            service = ImageTranslationService(self.config_manager, registry)
-            # P1-8：暴露 service 引用供 cancel 调用
-            self._image_service = service
+            from ..core.image_text_translator import ImageTextTranslator
+            from ..domain.errors import ImageTranslationCancelled
 
             success, fail, cancelled = 0, 0, 0
 
@@ -929,58 +887,44 @@ class ConcurrentWindow:
                         self._submit_ui(
                             run_id,
                             lambda i=idx: self.win.title(
-                                f"队列翻译管理 - Manga 图片翻译 {i}/{total_tasks}"
+                                f"队列翻译管理 - 智能图片翻译 {i}/{total_tasks}"
                             ),
                         )
 
-                        request = service.make_request(
-                            mapping_dir=Path(task.mapping_dir),
-                            target_language=target_lang,
-                            provider_id=ImageTranslationProviderId.MANGA,
-                        )
+                        translator = ImageTextTranslator(self.config_manager)
+                        self._image_translator = translator
 
-                        # 执行前校验：Manga 校验失败不调用 AI，记为失败
-                        errors = service.validate_request(request)
-                        if errors:
-                            fail += 1
-                            continue
-
-                        def on_progress(progress: ImageTranslationProgress, _i=idx):
-                            # P1-8：进度回调也走邮箱 + run_id 检查
+                        def on_progress(current, total, label, _i=idx):
                             self._submit_ui(
                                 run_id,
-                                lambda p=progress, _idx=_i: self.win.title(
-                                    f"队列翻译管理 - [{_idx}/{total_tasks}] "
-                                    f"{p.stage} {p.current}/{p.total}"
+                                lambda c=current, t=total, text=label, _idx=_i: self.win.title(
+                                    f"队列翻译管理 - [{_idx}/{total_tasks}] " f"{text} {c}/{t}"
                                 ),
                             )
 
-                        result = service.translate(request, on_progress)
-                        if result.status in (
-                            OperationStatus.SUCCEEDED,
-                            OperationStatus.PARTIAL,
-                        ):
-                            # 有成功结果即计入成功
-                            success += 1
-                        else:
+                        translator.process_all_images(
+                            str(task.mapping_dir),
+                            target_lang,
+                            on_progress,
+                            cancel_event=self._image_cancel_event,
+                        )
+                        summary = translator.last_summary
+                        if summary["total"] and summary["failed"] == summary["total"]:
                             fail += 1
+                        else:
+                            success += 1
                     except ImageTranslationCancelled:
                         # P1-8：单任务被取消，计入 cancelled 并结束循环
                         cancelled = total_tasks - idx + 1
                         break
-                    except ImageTranslationConfigError:
-                        # 配置错误：跳过该任务，不切换 AI
-                        fail += 1
                     except Exception:
                         fail += 1
+                    finally:
+                        translator = getattr(self, "_image_translator", None)
+                        if translator is not None:
+                            translator.close()
+                        self._image_translator = None
             finally:
-                # 关闭 Provider 生命周期，释放模型/线程资源
-                try:
-                    service.close_provider(ImageTranslationProviderId.MANGA)
-                except Exception:
-                    pass
-                self._image_service = None
-
                 # P1-8：恢复按钮 idle 态，并通过邮箱投递完成提示
                 self._submit_ui(run_id, lambda: self._set_image_button_busy(False))
                 self._image_translate_busy = False
@@ -1002,22 +946,10 @@ class ConcurrentWindow:
         threading.Thread(target=run, daemon=True).start()
 
     def _cancel_image_translation(self):
-        """P1-8：取消正在进行的图片翻译。
-
-        设置 cancel_event 让 worker 在任务间隙退出循环，并调用
-        ``service.cancel`` 触发当前 Provider 的取消路径。
-        """
+        """P1-8：取消正在进行的图片检测与翻译。"""
         if not self._image_translate_busy:
             return
         self._image_cancel_event.set()
-        service = self._image_service
-        if service is not None:
-            try:
-                from ..domain.image_translation import ImageTranslationProviderId
-
-                service.cancel(ImageTranslationProviderId.MANGA)
-            except Exception:
-                pass
 
     def _set_image_button_busy(self, busy: bool) -> None:
         """P1-8：busy 态下按钮文案改为取消入口，并禁用重复启动。"""
@@ -1052,36 +984,6 @@ class ConcurrentWindow:
             callback()
 
         self._ui_mailbox.submit(guarded)
-
-    def _create_manga_provider(self):
-        """创建 Manga Provider（与 ImageTranslationHandler 一致）。"""
-        if not self._manga_enabled():
-            return None
-        from ..infrastructure.image_translation.manga_provider import (
-            MangaImageTranslationProvider,
-        )
-
-        img_config = self.config_manager.get_image_translation_config()
-        manga_cfg = img_config.get("manga", {})
-
-        model_dir = None
-        if self.app_paths is not None:
-            model_dir = Path(self.app_paths.data_dir) / "models" / "manga"
-            model_dir.mkdir(parents=True, exist_ok=True)
-        elif manga_cfg.get("model_dir"):
-            model_dir = Path(manga_cfg["model_dir"])
-
-        return MangaImageTranslationProvider(
-            self.config_manager,
-            model_dir=model_dir,
-            resource_dir=(
-                Path(self.app_paths.resource_dir) if self.app_paths is not None else None
-            ),
-            font_path=None,
-            quality_preset=manga_cfg.get("quality_preset", "standard"),
-            device=manga_cfg.get("device", "auto"),
-            python_executable=manga_cfg.get("python_executable") or None,
-        )
 
     # ── 双击详情 ────────────────────────────────────
     def _on_double_click(self, event):

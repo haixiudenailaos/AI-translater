@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.core.image_translator import (
+    _CONNECTION_TEST_PNG_BASE64,
     ImageDownloadError,
     _rasterize_safe_svg,
     _safe_download_image,
@@ -250,11 +252,13 @@ class SafeDownloadTests(unittest.TestCase):
     def _make_response(
         self,
         status_code=200,
-        content=b"\x89PNG\r\n\x1a\n" + b"\x00" * 100,
+        content=None,
         content_type="image/png",
         location=None,
     ):
         """构造 mock response。"""
+        if content is None:
+            content = base64.b64decode(_CONNECTION_TEST_PNG_BASE64)
         response = unittest.mock.MagicMock()
         response.status_code = status_code
         response.headers = {}
@@ -361,6 +365,20 @@ class SafeDownloadTests(unittest.TestCase):
             with self.assertRaises(ImageDownloadError) as ctx:
                 _safe_download_image("https://ark.volces.com/img.png")
         self.assertIn("无法识别", str(ctx.exception))
+
+    def test_jpeg_prefix_with_corrupt_payload_is_rejected(self):
+        """仅有 JPEG 开头的损坏响应不能再被保存为翻译结果。"""
+        response = self._make_response(
+            content=b"\xff\xd8not-a-decodable-jpeg",
+            content_type="image/jpeg",
+        )
+        with patch(
+            "src.core.image_translator.requests.get",
+            return_value=response,
+        ):
+            with self.assertRaises(ImageDownloadError) as ctx:
+                _safe_download_image("https://ark.volces.com/img.jpg")
+        self.assertIn("无法解码", str(ctx.exception))
 
     def test_http_error_status_rejected(self):
         """HTTP 错误状态码被拒绝。"""

@@ -13,9 +13,12 @@ import datetime
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+from ..config.image_ocr import SILICONFLOW_OCR_DEFAULT_MODEL
+from ..domain.errors import ImageTranslationCancelled
 from ..infrastructure.image_asset_store import load_image_bytes
 from ..infrastructure.mapping_repository import resolve_mapping_file
 from ..utils.file_handler import write_json_atomic
@@ -42,21 +45,47 @@ class ImageTextTranslator:
     def __init__(self, config_manager):
         self.config_manager = config_manager
         self._api_client = None
+        self._active_image_translator = None
+        self.last_summary: dict[str, int] = {
+            "total": 0,
+            "detected": 0,
+            "translated": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
 
     def _get_api_client(self):
-        """获取API客户端实例（复用翻译API配置，用于视觉检测）"""
+        """获取独立 OCR 客户端，自定义地址不复用其他提供商密钥。"""
         if self._api_client is None:
-            api_config = self.config_manager.get_api_config()
-            provider = api_config.get("provider", "siliconflow")
-            if provider == "deepseek":
-                from ..api.deepseek_api import DeepseekAPI
-
-                self._api_client = DeepseekAPI(api_config)
-            else:
+            api_config = self._get_ocr_runtime_config()
+            if not api_config.get("configured"):
+                return None
+            if api_config.get("source") == "siliconflow":
                 from ..api.siliconflow_api import SiliconFlowAPI
 
                 self._api_client = SiliconFlowAPI(api_config)
+            else:
+                from ..api.openai_compatible_api import OpenAICompatibleAPI
+
+                self._api_client = OpenAICompatibleAPI(api_config)
         return self._api_client
+
+    def _get_ocr_runtime_config(self) -> Dict[str, Any]:
+        resolver = getattr(type(self.config_manager), "get_image_ocr_runtime_config", None)
+        if callable(resolver):
+            return self.config_manager.get_image_ocr_runtime_config()
+
+        # 兼容旧的 config_manager stub 和第三方调用方。
+        api_config = dict(self.config_manager.get_api_config())
+        api_config.setdefault("source", api_config.get("provider", "siliconflow"))
+        api_config["configured"] = bool(api_config.get("api_key"))
+        return api_config
+
+    def _is_ocr_configured(self) -> bool:
+        checker = getattr(type(self.config_manager), "is_image_ocr_configured", None)
+        if callable(checker):
+            return bool(self.config_manager.is_image_ocr_configured())
+        return bool(self._get_ocr_runtime_config().get("configured"))
 
     def _reset_api_client(self):
         """重置API客户端，下次调用时重新创建。
@@ -72,15 +101,26 @@ class ImageTextTranslator:
 
     def close(self):
         """BUG-005：关闭持有的 API 客户端，幂等可安全多次调用。"""
+        if self._active_image_translator is not None:
+            try:
+                self._active_image_translator.close()
+            except Exception as exc:
+                logger.warning("关闭图片生成客户端失败: %s", exc)
+            self._active_image_translator = None
         self._reset_api_client()
 
     def _get_vision_model(self) -> str:
-        """获取视觉模型名称 - 优先使用用户配置的视觉模型"""
+        """获取 OCR 模型名称，并兼容旧版顶层配置字段。"""
+        resolver = getattr(type(self.config_manager), "get_image_ocr_runtime_config", None)
+        if callable(resolver):
+            configured = self.config_manager.get_image_ocr_runtime_config().get("model_name", "")
+            if configured:
+                return str(configured)
         app_config = self.config_manager.get_app_config()
         configured = app_config.get("vision_model_name", "")
         if configured:
             return configured
-        return "Qwen/Qwen2.5-VL-32B-Instruct"
+        return SILICONFLOW_OCR_DEFAULT_MODEL
 
     def detect_text_in_image(self, image_base64: str, mime_type: str) -> Dict[str, Any]:
         """使用视觉模型提取图片中的文字，然后程序判断是否包含非中文文字
@@ -103,6 +143,12 @@ class ImageTextTranslator:
         )
 
         api = self._get_api_client()
+        if api is None:
+            return {
+                "status": DETECTION_FAILED,
+                "has_foreign_text": False,
+                "text_content": "",
+            }
         vision_model = self._get_vision_model()
         response = api.vision_query(image_base64, mime_type, prompt, model_override=vision_model)
 
@@ -133,7 +179,11 @@ class ImageTextTranslator:
         }
 
     def process_all_images(
-        self, mapping_dir: str, target_lang: str, progress_callback: Callable | None = None
+        self,
+        mapping_dir: str,
+        target_lang: str,
+        progress_callback: Callable | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> Dict[str, Any]:
         """处理mapping目录中所有图片：视觉检测 + 插图翻译
 
@@ -163,10 +213,25 @@ class ImageTextTranslator:
         total = len(image_mappings)
         skipped_count = 0
         error_count = 0
+        self.last_summary = {
+            "total": total,
+            "detected": 0,
+            "translated": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
+        ocr_configured = self._is_ocr_configured()
 
         for idx, (image_path, image_info) in enumerate(image_mappings.items()):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ImageTranslationCancelled(f"图片文字检测在第 {idx}/{total} 张时被取消")
             if progress_callback:
-                progress_callback(idx, total, f"[检测] {image_path}")
+                stage = "检测" if ocr_configured else "未配置 OCR，直接翻译"
+                progress_callback(idx, total, f"[{stage}] {image_path}")
+
+            if not ocr_configured:
+                foreign_text_images[image_path] = image_info
+                continue
 
             # PERF-6d：内部管道统一传 bytes，避免冗余 base64 编解码循环。
             raw_bytes = load_image_bytes(mapping_path, image_info)
@@ -206,21 +271,23 @@ class ImageTextTranslator:
                 continue
 
         detected_count = len(foreign_text_images)
-        print(
-            f"\n📊 检测完成: 总计 {total} 张图片，"
-            f"含非中文文字 {detected_count} 张，"
-            f"跳过 {skipped_count} 张" + (f"，失败 {error_count} 张" if error_count else "")
+        self.last_summary.update(
+            detected=detected_count,
+            skipped=skipped_count,
+            failed=error_count,
         )
+        if ocr_configured:
+            print(
+                f"\n📊 检测完成: 总计 {total} 张图片，"
+                f"含非中文文字 {detected_count} 张，"
+                f"跳过 {skipped_count} 张" + (f"，失败 {error_count} 张" if error_count else "")
+            )
+        else:
+            print(f"\n⚠ 未配置可用 OCR，{total} 张图片将全部进入 AI 图生图")
 
         # R2-BUG-017：全部检测失败时不显示"无需翻译"的成功提示
         if not foreign_text_images:
-            if error_count > 0 and error_count + skipped_count == total - (
-                total - error_count - skipped_count
-            ):
-                # 有失败项，不显示普通完成
-                msg = f"完成（{error_count} 张检测失败）" if error_count else "完成（无需翻译）"
-            else:
-                msg = "完成（无需翻译）"
+            msg = f"完成（{error_count} 张检测失败）" if error_count else "完成（无需翻译）"
             if progress_callback:
                 progress_callback(total, total, msg)
             # R2-BUG-018：即使没有需要翻译的图片，也写入空结果文件
@@ -241,6 +308,7 @@ class ImageTextTranslator:
         from .image_translator import ImageTranslator
 
         img_translator = ImageTranslator(self.config_manager)
+        self._active_image_translator = img_translator
 
         # 直接传入筛选后的图片映射，无需操作文件
         filtered_mappings = {k: v for k, v in image_mappings.items() if k in foreign_text_images}
@@ -259,24 +327,32 @@ class ImageTextTranslator:
                 target_lang,
                 img2img_progress_cb,
                 image_mappings_override=filtered_mappings,
+                cancel_event=cancel_event,
             )
 
+        except ImageTranslationCancelled:
+            raise
         except Exception as e:
             print(f"插图翻译出错: {e}")
             result_map = {}
+        finally:
+            img_translator.close()
+            self._active_image_translator = None
 
         translated_count = len(result_map)
+        self.last_summary["translated"] = translated_count
         print(f"\n📊 插图翻译完成: {translated_count}/{detected_count} 张图片翻译成功")
 
         if progress_callback:
             progress_callback(total, total, "完成")
 
         # R2-BUG-018：始终写入结果文件，包含运行元数据
-        self._write_image_translation_result(mapping_path, result_map)
+        self.write_image_translation_result(mapping_path, result_map)
 
         return result_map
 
-    def _write_image_translation_result(self, mapping_path: Path, result_map: Dict[str, str]):
+    @staticmethod
+    def write_image_translation_result(mapping_path: Path, result_map: Dict[str, str]) -> None:
         """写入图片翻译结果文件，包含运行元数据。
 
         R2-BUG-018：始终写入，即使 result_map 为空。
@@ -284,9 +360,16 @@ class ImageTextTranslator:
         """
         output_file = mapping_path / "image_translation_result.json"
         payload = {
+            "schema_version": 2,
+            "provider": "ai_volcengine",
+            "status": "succeeded" if result_map else "empty",
             "result_map": result_map,
             "run_at": datetime.datetime.now().isoformat(),
             "result_count": len(result_map),
         }
         # BUG-006：使用原子写入，失败时旧文件保持不变
         write_json_atomic(output_file, payload)
+
+    def _write_image_translation_result(self, mapping_path: Path, result_map: Dict[str, str]):
+        """Backward-compatible wrapper retained for existing callers and tests."""
+        ImageTextTranslator.write_image_translation_result(mapping_path, result_map)
