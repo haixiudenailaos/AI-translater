@@ -137,8 +137,8 @@ Windows 发布构建使用 Python 3.10 和 `requirements-text-win-py310.lock.txt
 
 项目配置了 GitHub Actions 自动化构建，支持：
 
-- ✅ Python 3.10-3.13 的 Ruff、格式、编译和 pytest 质量矩阵
-- ✅ Python 3.11 覆盖率报告、Pyright 迁移报告和 wheel 安装 smoke
+- ✅ Python 3.10、3.12、3.13 的 Ruff、格式、编译和 pytest 质量矩阵
+- ✅ Python 3.12 覆盖率报告、Pyright 迁移报告和 wheel 安装 smoke
 - ✅ Windows/macOS 的桌面构建与启动 smoke
 
 V1.6 分支推送、Pull Request 和手动触发都会执行工作流。Pyright 目前是迁移报告，待存量类型错误清零后升级为阻断门禁。

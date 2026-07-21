@@ -20,6 +20,6 @@ def test_project_python_contract_matches_tested_release_matrix():
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     build_workflow = Path(".github/workflows/build.yml").read_text(encoding="utf-8")
 
-    assert 'requires-python = ">=3.10"' in pyproject
+    assert 'requires-python = ">=3.10,!=3.11.*"' in pyproject
     assert 'target-version = "py310"' in pyproject
-    assert 'python-version: ["3.10", "3.11", "3.12", "3.13"]' in build_workflow
+    assert 'python-version: ["3.10", "3.12", "3.13"]' in build_workflow

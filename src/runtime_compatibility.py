@@ -6,12 +6,13 @@ import sys
 from typing import TextIO
 
 MINIMUM_PYTHON = (3, 10)
+UNSUPPORTED_PYTHON = {(3, 11)}
 
 
 def is_supported_python(version: tuple[int, int] | None = None) -> bool:
-    """Return whether the interpreter meets the minimum version requirement."""
+    """Return whether the interpreter is in the supported release set."""
     current = version if version is not None else sys.version_info[:2]
-    return current >= MINIMUM_PYTHON
+    return current >= MINIMUM_PYTHON and current not in UNSUPPORTED_PYTHON
 
 
 def unsupported_python_message(version: tuple[int, int] | None = None) -> str:
@@ -19,7 +20,7 @@ def unsupported_python_message(version: tuple[int, int] | None = None) -> str:
     current = version if version is not None else sys.version_info[:2]
     return (
         f"当前 Python {current[0]}.{current[1]} 不受支持。"
-        "轻小说翻译器 1.6 支持 Python 3.10 及以上版本。"
+        "轻小说翻译器 1.6 支持 Python 3.10，以及 Python 3.12 及以上版本。"
     )
 
 

@@ -7,7 +7,7 @@ name = "ai-translater"
 version = "1.6.0"
 description = "轻小说翻译器：EPUB/TXT 文学翻译与图片翻译工具"
 # 应用支持 Python 3.10 及以上；质量门禁覆盖多个主流 Python 版本。
-requires-python = ">=3.10"
+requires-python = ">=3.10,!=3.11.*"
 dependencies = [
     # PERF §10.2：声明 h2 依赖以匹配 SiliconFlowAPI 的 http2=True 配置，
     # 避免运行时缺少 h2 后静默回退到 HTTP/1.1。
