@@ -30,7 +30,6 @@ class TranslationExecutionProfile:
             batch_size=self.batch_size,
             max_retries=self.max_retries,
             temperature=options.temperature,
-            max_tokens=options.max_tokens,
         )
 
 

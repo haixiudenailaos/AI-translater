@@ -187,6 +187,7 @@ class MainWindow:
                 on_next=lambda: self.onboarding.next(),
                 on_postpone=lambda: self.onboarding.postpone(),
                 on_dismiss=lambda: self.onboarding.dismiss(),
+                on_visibility_changed=self._set_onboarding_host_visible,
             ),
             config_manager=self.config_manager,
             targets={
@@ -228,16 +229,35 @@ class MainWindow:
         self.create_work_area(main_frame)
 
     def create_onboarding_host(self, parent):
-        """新手指导面板宿主：始终 pack，面板未显示时不占视觉空间。"""
+        """创建新手指导宿主；仅在引导显示时加入布局。"""
         self._onboarding_host = ttk.Frame(parent)
-        self._onboarding_host.pack(fill=tk.X, pady=(0, 6))
+
+    def _set_onboarding_host_visible(self, visible: bool) -> None:
+        """同步引导宿主的布局状态，让工作区在引导结束后立即恢复。"""
+        host = self._onboarding_host
+        if not visible:
+            host.pack_forget()
+            return
+
+        try:
+            if host.winfo_manager():
+                return
+        except (tk.TclError, AttributeError):
+            pass
+
+        pack_options = {"fill": tk.X, "pady": (0, 6)}
+        work_frame = getattr(self, "_work_frame", None)
+        if work_frame is not None:
+            pack_options["before"] = work_frame
+        host.pack(**pack_options)
 
     def create_toolbar(self, parent):
         toolbar_frame = ttk.Frame(parent)
         toolbar_frame.pack(fill=tk.X, pady=(0, 10))
+        toolbar_frame.grid_columnconfigure(1, weight=1)
 
         left_frame = ttk.Frame(toolbar_frame)
-        left_frame.pack(side=tk.LEFT)
+        left_frame.grid(row=0, column=0, sticky=tk.W)
         self.import_file_btn = ttk.Button(
             left_frame, text="导入文件", command=lambda: self.file_importer.import_file()
         )
@@ -259,19 +279,24 @@ class MainWindow:
         )
         self.queue_translate_btn.pack(side=tk.LEFT, padx=(7, 0))
 
-        middle_frame = ttk.Frame(toolbar_frame)
-        middle_frame.pack(side=tk.LEFT, expand=True)
+        # 项目名只占用中间的弹性空间。width=1 让长文件名服从网格分配，
+        # 内容不足时由 Label 自然裁切，不会把右侧关键操作挤出窗口。
+        self.project_label = ttk.Label(
+            toolbar_frame,
+            text="未打开项目",
+            width=1,
+            anchor=tk.W,
+        )
+        self.project_label.grid(row=0, column=1, sticky=tk.EW, padx=12)
 
         right_frame = ttk.Frame(toolbar_frame)
-        right_frame.pack(side=tk.RIGHT)
-        self.project_label = ttk.Label(right_frame, text="未打开项目")
-        self.project_label.pack(side=tk.LEFT, padx=(0, 12))
-        self.model_label = ttk.Label(right_frame, text="")
-        self.model_label.pack(side=tk.LEFT, padx=(0, 12))
-        self.save_status_label = ttk.Label(right_frame, text="保存: 未保存")
-        self.save_status_label.pack(side=tk.LEFT, padx=(0, 12))
+        right_frame.grid(row=0, column=2, sticky=tk.E)
         self.settings_btn = ttk.Button(right_frame, text="设置", command=self.open_settings)
         self.settings_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        self.save_status_label = ttk.Label(right_frame, text="保存: 未保存")
+        self.save_status_label.pack(side=tk.RIGHT, padx=(0, 12))
+        self.model_label = ttk.Label(right_frame, text="", width=24, anchor=tk.E)
+        self.model_label.pack(side=tk.RIGHT, padx=(0, 12))
 
     def create_menu(self):
         menu_bar = tk.Menu(self.root)
@@ -349,8 +374,9 @@ class MainWindow:
         self.root.config(menu=menu_bar)
 
     def create_work_area(self, parent):
-        work_frame = ttk.LabelFrame(parent, text="翻译内容对照表", padding=5)
-        work_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self._work_frame = ttk.LabelFrame(parent, text="翻译内容对照表", padding=5)
+        self._work_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        work_frame = self._work_frame
 
         review_bar = ttk.Frame(work_frame)
         review_bar.pack(fill=tk.X, pady=(0, 5))
@@ -948,6 +974,7 @@ class MainWindow:
         dialog = tk.Toplevel(self.root)
         dialog.title(f"校对第 {values[0]} 行")
         dialog.geometry("820x540")
+        dialog.minsize(500, 400)
         dialog.transient(self.root)
         frame = ttk.Frame(dialog, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -957,9 +984,10 @@ class MainWindow:
             if index + 1 < len(items)
             else None
         )
-        ttk.Label(frame, text=f"上一行: {before[1] if before else '无'}", wraplength=780).pack(
-            anchor=tk.W
-        )
+        # 上一行上下文标签：随对话框宽度动态调整折行宽度
+        prev_label = ttk.Label(frame, text=f"上一行: {before[1] if before else '无'}")
+        prev_label.pack(fill=tk.X, anchor=tk.W)
+        prev_label.bind("<Configure>", lambda e: prev_label.configure(wraplength=e.width - 4))
         ttk.Label(frame, text="原文").pack(anchor=tk.W, pady=(10, 2))
         source = tk.Text(frame, height=7, wrap=tk.WORD, state=tk.NORMAL)
         source.insert("1.0", values[1])
@@ -969,9 +997,10 @@ class MainWindow:
         target = tk.Text(frame, height=10, wrap=tk.WORD)
         target.insert("1.0", values[2])
         target.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text=f"下一行: {after[1] if after else '无'}", wraplength=780).pack(
-            anchor=tk.W, pady=(8, 0)
-        )
+        # 下一行上下文标签：随对话框宽度动态调整折行宽度
+        next_label = ttk.Label(frame, text=f"下一行: {after[1] if after else '无'}")
+        next_label.pack(fill=tk.X, anchor=tk.W, pady=(8, 0))
+        next_label.bind("<Configure>", lambda e: next_label.configure(wraplength=e.width - 4))
 
         def save_and_close():
             self._apply_cell_value(item, 2, target.get("1.0", tk.END).rstrip("\n"))
@@ -1060,7 +1089,6 @@ class MainWindow:
             model_name=str(api_config.get("model_name", "")),
             batch_size=int(app_config.get("batch_lines", 20)),
             temperature=float(api_config.get("temperature", 0.3)),
-            max_tokens=int(api_config.get("max_tokens", 2048)),
         )
         report = build_preflight_report(
             project,

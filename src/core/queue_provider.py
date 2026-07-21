@@ -481,7 +481,7 @@ def provider_runtime_key_for(api_config: dict) -> ProviderRuntimeKey:
         # invalid configurations look usable, that would preserve a remote
         # plain-HTTP endpoint next to credential-related runtime metadata.
         normalized_url = ""
-    config_version = f"{api_config.get('temperature', '')}:{api_config.get('max_tokens', '')}"
+    config_version = str(api_config.get("temperature", ""))
     return ProviderRuntimeKey(
         provider=provider,
         normalized_base_url=normalized_url,

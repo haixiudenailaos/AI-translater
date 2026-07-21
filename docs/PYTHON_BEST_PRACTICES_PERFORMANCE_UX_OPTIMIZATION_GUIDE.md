@@ -1,551 +1,536 @@
-# Python 最佳实践、应用性能与用户体验优化指导
+# Python 最佳实践与性能优化审查指导
 
-审查日期：2026-07-18（Asia/Shanghai）  
-审查对象：`D:\AI-translater-1.6` 当前工作区  
-文档性质：当前代码基线审查、优化优先级和实施验收指南  
-替代关系：本文件替代 `PYTHON_PERFORMANCE_UX_CURRENT_AUDIT_AND_IMPLEMENTATION_PLAN.md` 作为后续实施入口。旧文档中的多个 P0/P1 已被当前代码修复，不应直接照搬。
+审查日期：2026-07-20（Asia/Shanghai）
+审查基线：Git 提交 `f8d8128`（全量静态/测试结果）及 2026-07-20 工作区增量修复（定向回归）
+审查对象：`D:\米哈游项目\AI翻译V1.4\AI-translater-1.4`
+文档性质：当前代码基线审查、发布门禁、性能优化顺序与验收标准
+历史基线：`docs/PYTHON_PERFORMANCE_UX_CURRENT_AUDIT_AND_IMPLEMENTATION_PLAN.md` 保留为历史记录，不代表当前待办
 
 ## 1. 执行结论
 
-项目已经具备较成熟的桌面应用工程基础，不是简单的 Tkinter 脚本：已有组合根、分层、Protocol、原子写入、密钥环、后台任务、事件邮箱、自动保存状态机、队列调度器和较大规模的测试集。
+**总体判断：项目基本符合现代 Python 桌面应用的工程实践，但尚未形成发布级最佳实践闭环。**
 
-当前结论如下：
+项目已经具备清晰的组合根、领域与应用分层、Protocol/dataclass、原子写入、keyring、日志脱敏、后台任务、事件邮箱、检查点、资源边界和 1100 余项测试。当前主要问题不是“代码完全不可维护”，而是已有能力没有被 CI、类型门禁和发布契约持续证明，同时仍有少数并发正确性问题和大规模数据场景下的性能热点。
 
-| 维度 | 当前判断 | 核心原因 |
+| 维度 | 当前判断 | 主要依据 |
 | --- | --- | --- |
-| Python 工程实践 | 基本符合，但发布治理仍不完整 | 架构、原子写和测试基础较好；结果语义、类型覆盖、依赖锁、平台门禁和异常脱敏仍有确定缺口 |
-| 应用性能 | 主文本翻译链路较成熟，队列和 Full 图片链路仍有高风险热点 | UI 线程边界和流式合并已优化；队列锁内 I/O、活动任务上限失效、全量检查点、轮询调度和 Manga stderr 管道仍会造成停顿或卡死 |
-| 用户体验 | 基础工作流完整，但仍有违反用户选择和状态机失配的问题 | 新手引导、保存保护、取消入口和错误详情已有基础；关闭取消、翻译中切会话、导入控件恢复、不可重试错误重试等问题会破坏用户信任 |
+| 架构与 Python 用法 | 基本符合 | 有组合根、依赖注入、结构化结果、线程边界和持久化抽象 |
+| 代码质量门禁 | 基础门禁已恢复 | CI 已有 Python 3.10-3.13 的 Ruff、格式、pytest、coverage 与 wheel smoke；配置、项目仓库和图片请求边界已有阻断型 Pyright，余下全仓报告仍为迁移依据 |
+| 测试 | 基础较强，主套件已验证 | 当前隔离运行 1138 passed、39 skipped；3 个 Windows `.png` ACL 用例需在正常 Windows runner 复验 |
+| 依赖与打包 | Text 契约已对齐，锁仍未完整 | Windows Text 构建改用 Python 3.10 匹配 hash lock；macOS/Full 仍缺匹配 lock |
+| 并发正确性 | 主要内存、仓库与图片关闭事务已收敛 | 配置使用版本化密钥引用，项目/recent index 有进程内补偿事务；图片关闭使用共享 deadline；跨进程恢复仍需修复 |
+| 性能 | 中小文档可用，大规模场景仍有明确热点 | Tk 全量 drain、全文复制、检查点写放大、EPUB 多次全包处理 |
+| 安全与数据边界 | 基础良好但有缺口 | 项目 ID 路径、图片 endpoint 与 EPUB 缺章中止已校验；多文件代际恢复仍不完整 |
 
-在以下四项关闭前，不建议将当前快照标记为稳定发布版本：
+本轮没有发现需要直接定为 P0 的、可稳定复现的任意代码执行或不可恢复数据破坏问题。以下事项仍应在“稳定发布”前关闭：
 
-1. 配置保存失败后选择“取消退出”，应用窗口保留但核心资源已经被关闭。
-2. 翻译运行中仍可导入新会话，旧终态被丢弃后 `is_translating` 可能永久卡住，旧请求仍继续消耗额度。
-3. API 密钥保存成功但配置 JSON 写入失败时，UI 和关闭流程可能把失败当成成功。
-4. Manga worker 的 stderr 读取达到 500 行后停止 drain，子进程可能因管道写满而阻塞到 30 分钟静默超时。
+1. 将 Pyright 从报告升级为覆盖关键模块的阻断门禁。
+2. 生成 macOS/Full Edition 与 runner Python 完全匹配的 hash lock，并明确 Full 发布渠道。
+3. 为 EPUB、自动保存与检查点实现可崩溃恢复的 generation/commit manifest。
 
-## 2. 审查范围与验证结果
+## 2. 审查范围与证据
 
 ### 2.1 审查范围
 
-- 第一方 Python：`main.py`、`build.py`、`src/**`、`tests/**`、`tools/**`。
-- 工程配置：`pyproject.toml`、`requirements*.txt`、PyInstaller spec、GitHub Actions、README。
-- 用户链路：启动、配置、导入、翻译、流式预览、查漏、停止、队列、保存、导出、关闭和恢复。
-- Full Edition：只检查本项目与 Manga worker 的进程、依赖和 I/O 边界，不评价 `third_party` 上游代码风格。
+- 第一方代码：`main.py`、`build.py`、`src/**`、`tests/**`、`tools/**`。
+- 工程配置：`pyproject.toml`、`requirements*.txt`、PyInstaller spec、GitHub Actions 和 README。
+- 关键链路：启动、配置、导入、翻译、流式预览、队列、检查点、图片翻译、EPUB 导出和关闭。
+- Full Edition：只审查本项目对 Manga worker 的进程、I/O 和生命周期边界，不评价 `third_party` 上游代码风格。
 
-### 2.2 静态基线
+静态规模约为：
 
-- `src` 下约 96 个 Python 文件，测试目录约 67 个测试模块。
-- 最大模块包括：
-  - `src/core/queue_scheduler.py`：约 1900 行。
-  - `src/ui/main_window.py`：约 1780 行。
-  - `src/ui/settings_window.py`：约 1700 行。
-  - `src/ui/translation_controller.py`：约 1400 行。
-- 第一方源码约有 248 处宽泛 `except Exception/BaseException` 或裸 `except`，以及约 105 个独立 `pass`。很多位于 UI、线程和清理边界，不能机械删除，但最高风险模块尚未被类型门禁覆盖，后续维护成本较高。
+- `src` 下 95 个 Python 文件、25,570 行。
+- `tests` 下约 19,229 行，pytest 收集 1148 个测试项。
+- 宽泛 `except Exception/BaseException` 或裸捕获约 268 处。
+- 最大模块包括 `queue_scheduler.py` 2118 行、`main_window.py` 1839 行、`settings_window.py` 1750 行、`translation_controller.py` 1693 行。
 
-### 2.3 动态验证
+这些数字用于判断风险集中位置，不应机械地转化为“文件行数”或“异常捕获数量”KPI。
 
-- 当前解释器：CPython 3.10.9。
-- `import main` 五次约 238-248ms，说明导入基线尚可，但首帧前仍可继续延后 `bootstrap` 导入。
-- 重点性能/UI 测试：87 passed。
-- 配置、关闭分支、设置布局和新手引导测试：103 passed。
-- 运行时契约/SBOM 小集合：7 passed。
-- 全量收集约 1035 项，存在 3 个收集错误：
-  - `tests/test_queue_provider_limiter.py` 使用 Python 3.11 才提供的 `datetime.UTC`，这是确定的 Python 3.10 兼容缺陷。
-  - 另外两个错误来自当前机器缺少 `pydantic`，属于本地环境未按项目依赖重建。
-- 当前环境还安装了与项目约束不一致的 `EbookLib 0.20`、`httpx 0.24.1`，且 `pip check` 不通过。因此本轮不能宣称全量测试绿色，正式验证必须使用干净虚拟环境和锁定依赖。
-- 本机未安装 Ruff 和 Pyright，未复跑本地静态门禁；CI 配置存在，但当前 Python 3.10 测试收集问题会直接阻断质量任务。
-- 队列测试在当前 Windows 受控环境中暴露出两个问题：测试硬编码 POSIX `/tmp`，写入失败后检查点重试又在全局调度锁内等待，导致后续任务在 8 秒内未继续派发。这同时证明了平台测试缺口和生产环境 I/O 故障时的全队列停顿风险。
+### 2.2 动态验证结果
+
+本轮在临时隔离的 CPython 3.13.5 环境执行了静态检查和测试。结果以提交 `f8d8128` 为准：
+
+| 检查 | 结果 | 结论 |
+| --- | --- | --- |
+| Ruff lint | 通过 | 当前启用的 E/F/I/UP/B/SIM 规则无违规 |
+| Ruff format | 176 个文件均已格式化 | 格式基线可直接进入 CI |
+| Pyright | 84 个文件，244 errors / 1 warning | 类型配置存在，但尚不能作为绿色门禁 |
+| pytest 收集 | 1148 项 | 测试规模和可收集性良好 |
+| pytest 完整运行 | 5 failed, 1106 passed, 37 skipped, 40 warnings，64.19 秒 | 1 项为沙箱环境失败，4 项为真实契约漂移 |
+| CPython 编译检查 | 通过 | 第一方 Python 文件无语法级编译错误 |
+| `import main` 五次 | 493-572ms，中位数 537ms | 可作为同机冷启动优化基线 |
+
+后续实施验证：R0 契约回归 38 项通过；配置事务 68 项通过；项目仓库事务 49 项通过；图片 endpoint/取消/信任边界 89 项通过；图片关闭 deadline 回归 31 项通过；EPUB 缺章中止与队列取消回归 37 项通过。使用锁定的 Ruff 0.6.9 执行全仓 lint 通过。全仓格式检查当前仅被工作区已有的 `src/core/image_translator.py` 和 `tests/test_image_fixes.py` 格式差异阻断。最近一次完整 suite 基线（排除 3 个受控 Windows 环境中稳定复现的 `.png` 文件访问拒绝用例）为 1138 passed、39 skipped。
+
+Pytest 的 5 项失败应这样解释：
+
+- 1 项因受控环境无权访问真实 `%APPDATA%`，属于运行环境失败，不作为产品回归。
+- 1 项要求 CI 存在 Python 3.10-3.13 测试矩阵，但当前工作流不存在该矩阵。
+- 2 项仍要求 Text spec 使用 onedir，而 `translator_text.spec` 已改为 onefile。
+- 1 项 Manga hook 测试要求相对源路径，而实现返回绝对路径。
+
+`-X importtime` 显示 `src.bootstrap` 累计约 314ms、`main` 累计约 502ms。累计导入时间不能简单相加，但足以说明组合根和其传递依赖是启动优化的首要观察点。该结果依赖硬件和磁盘状态，只用于同机前后对比。
+
+### 2.3 静态检查解释
+
+Ruff 通过不等于“已全面符合 Python 最佳实践”。当前 Ruff 配置主动忽略了部分历史规则，Pyright 也关闭了多项 unknown/missing 诊断。正确做法是保留现有绿色 lint 基线，并逐步收紧高风险模块，而不是一次性开启所有规则后产生大量无行动价值的告警。
 
 ## 3. 已符合最佳实践的部分
 
-以下设计应保留，不建议在优化时回退：
+以下能力已经存在，优化时应保留：
 
-1. `src/bootstrap.py` 已承担组合根职责，路径、配置、密钥和 edition 能力集中组装。
-2. `domain/application/infrastructure/ui` 的依赖方向基本清晰，核心业务对象大量使用不可变 dataclass、Protocol 和结构化结果。
-3. `AppPaths` 分离资源、用户配置、工作区和日志，并支持测试注入。
-4. 配置、项目和映射写入使用同目录临时文件、`fsync`、`os.replace` 和 Windows 有限重试。
-5. API Key 通过 keyring 管理；远程自定义 API 强制 HTTPS；图片下载已有 SSRF、重定向和路径边界限制。
-6. 主翻译使用持久 `httpx.Client`、连接池、分项超时、HTTP/2、有限重试和 Provider 级限流。
-7. 翻译工作线程不直接操作 Tk；流式事件通过 mailbox 回主线程并按批次合并。
-8. 主表、详情表和术语表已有分块加载、缓存和增量更新，大列表体验明显优于直接全量写 Treeview。
-9. `TranslationDocument` 已成为业务状态来源，人工编辑保护和流式预览提交语义基本正确。
-10. 自动保存具备 debounce、generation、single-flight、后台 I/O 和失败状态。
-11. TXT/EPUB 主窗口导入和 EPUB 导出已经后台化，并有迟到回调隔离。
-12. CI 已包含 Ruff、格式化、Pyright、pytest、wheel smoke、SBOM、产物校验和 Windows/macOS 构建。
+1. [`src/bootstrap.py`](../src/bootstrap.py) 承担组合根职责，集中组装路径、配置、能力和主要服务。
+2. `domain/application/infrastructure/ui` 的依赖方向基本清晰，核心对象大量使用 dataclass、枚举、Protocol 和结构化结果。
+3. [`src/app_paths.py`](../src/app_paths.py) 将资源目录、用户数据、配置、日志和测试注入分离。
+4. 配置、项目、映射和图片资产使用同目录临时文件、`fsync`、`os.replace` 与有限重试完成原子发布；POSIX 发布后额外同步父目录，目录持久化失败会向调用方传播。
+5. API 密钥通过 keyring 保存；日志已有集中脱敏和 traceback 脱敏；远程下载包含 SSRF、重定向和路径边界防护。
+6. 文本 API 使用持久客户端、连接池、分项超时、有限重试和 Provider 级限流。
+7. Tk 工作线程不直接更新控件，流式翻译和后台结果通过 mailbox/event pump 回到主线程。
+8. 队列主列表已经消费轻量不可变快照，`max_active_tasks`、Future 完成唤醒和异步 finalizer 已实现。
+9. 检查点已经具备 debounce、single-flight 和终态保存；自动保存具备 generation 与迟到结果隔离。
+10. EPUB 导入已有 ZIP 成员数、解压大小、压缩比、路径穿越限制和协作式取消检查点。
+11. Manga worker 的 stderr 在达到日志保留上限后仍会持续 drain，不再因管道写满而死锁。
+12. 关闭取消、会话替换、保存结果语义、RUN 终态清理、损坏项目隔离等旧问题已有回归测试。
 
-## 4. 优先级定义
+这意味着后续工作应以增量修复和测量为主，不需要更换 GUI 框架或重写整个项目。
 
-| 优先级 | 定义 |
+## 4. 优先级和实施原则
+
+| 级别 | 含义 |
 | --- | --- |
-| P0 | 违反用户明确选择、导致核心状态永久失配、可能持续计费、稳定卡死或把失败当成功；发布前必须关闭 |
-| P1 | 主要性能、可靠性、安全边界或高频体验明显受损；应作为下一阶段主线 |
-| P2 | 平台一致性、长期维护、低频性能和产品完整性问题 |
+| R0 | 发布门禁或发布契约问题；不一定是运行时 P0，但未关闭前不能证明产物可靠 |
+| P1 | 并发正确性、数据边界、资源生命周期或大规模高频性能问题；下一阶段主线 |
+| P2 | 长期维护、低频性能、包布局和进一步收紧的工程治理 |
 
-## 5. P0：发布阻断项
+实施时遵守以下原则：
 
-### P0-1 关闭取消发生在不可逆 teardown 之后
+- 先修正确性，再做并发和缓存优化。
+- 先建立可重复基线，再宣称性能提升。
+- Tk 主线程只承担短小、可预测的状态转换和渲染。
+- 锁内只修改内存状态，不执行磁盘、网络、`join` 或资源关闭。
+- 所有设置都必须真实影响生产路径；否则隐藏设置或明确标记为实验项。
+- 不通过关闭 Pyright 规则、跳过测试或放宽断言制造“绿色”。
 
-**证据**
+## 5. R0：发布门禁
 
-- `main.py:118-128` 先调用 `MainWindow.close()`。
-- `main.py:130-133` 之后才保存配置，并允许用户取消关闭。
-- `src/ui/main_window.py:1681-1780` 已标记 `_closed`，停止翻译、关闭事件泵、队列、API、图片 Provider、导入器和 autosave。
+### R0-1 恢复 CI 质量任务
 
-**影响**
+已在 [`.github/workflows/build.yml`](../.github/workflows/build.yml) 增加 `quality` 矩阵：Python 3.10-3.13 运行 Ruff、格式、编译与 pytest，Python 3.11 额外保存 coverage 并输出 Pyright 报告；`wheel-smoke` 会在仓库外安装 wheel 后导入 `src.bootstrap`。README 已同步为 Text-only 构建事实。
 
-配置保存失败后用户选择“取消，返回应用”，`root.destroy()` 虽然没有执行，但窗口已经失去主要服务。界面仍存在，却无法可靠继续翻译、导入或保存。
+建议拆分为：
 
-**推荐实现**
+| Job | 平台/版本 | 必须执行 |
+| --- | --- | --- |
+| `quality` | Ubuntu，Python 3.10-3.13 | Ruff、format、Pyright、pytest、coverage、`pip check` |
+| `platform-smoke` | Windows/macOS，主支持 Python | 路径、keyring fallback、Tk 关键测试和启动 smoke |
+| `wheel-smoke` | 干净环境 | 构建 wheel、安装 wheel、从仓库外目录导入/启动 |
+| `build-text` | 明确支持的平台 | 使用与 runner Python 完全匹配的 hash lock 构建 |
+| `build-full` | 仅明确支持的平台 | Manga worker health check、模型外置策略和产物校验 |
+| `release` | tag | 汇总已通过的产物、校验和、SBOM 和发布说明 |
 
-采用两阶段关闭：
+剩余验收：
 
-1. `prepare_close()`：阻止新命令、完成文档 Save/Discard 决策、保存配置，但不关闭服务。
-2. 用户仍可取消时，只能停留在此阶段。
-3. `commit_close()`：一旦进入不可逆资源释放，不再提供“返回应用”；只允许“重试清理/强制退出”。
-4. 用 `CloseDecision` 枚举替代裸字符串，并让关闭结果显式返回成功、取消或强制退出。
+- 将 `quality` 和 `wheel-smoke` 设为分支保护 required checks。
+- Pyright 已阻断 `config_manager`、`project_repository` 与 `image_translator`；后续逐步扩大到 domain/application/queue。
+- 删除仓库跟踪的 `test_results*.txt`，以 CI JUnit、coverage 与 benchmark artifact 代替。
 
-**必须新增测试**
+### R0-2 统一 Python、依赖锁和产物契约
 
-- 配置保存失败 + Cancel：`MainWindow.close()` 调用次数为 0，应用仍可启动一次翻译命令。
-- 配置保存失败 + Retry 成功：只执行一次 teardown。
-- teardown 某阶段失败：仍按总 deadline 继续清理，不重新进入可交互状态。
+Windows Text runner 已改为 Python 3.10，以匹配 `requirements-text-win-py310.lock.txt`；`pip-tools` 已进入开发依赖，Text onefile、Full onedir、README 和契约测试也已对齐。macOS 仍直接安装浮动 `requirements.txt`，Full Edition 尚未进入 CI，因此发布锁仍不完整。
 
-### P0-2 翻译中切换会话会留下永久 busy 状态和继续计费的旧请求
+同时存在三套互相冲突的事实：
 
-**证据**
+- workflow 只构建 Text onefile；
+- README 仍描述 Text/Full onedir zip 与 tag 发布；
+- 测试仍要求两个 spec 都是 onedir。
 
-- `src/ui/translation_controller.py:220-224` 只禁用翻译/继续按钮，没有禁用导入入口。
-- `src/ui/file_importer.py:199-233` 导入前没有 active-run guard。
-- `src/ui/main_window.py:590-593` 新文档加载时仅调用 `invalidate_session()`。
-- `src/ui/translation_controller.py:174-187` 只使 `run_id` 失效，不停止 worker，也不重置 `is_translating`。
-- `src/ui/translation_controller.py:694-696` 旧终态随后被丢弃；`814-819` 又持续拒绝新任务。
+必须先作产品决策，再修改代码和测试：
 
-**影响**
+1. 明确 Text/Full 各自支持的平台、Python 版本、onefile/onedir 形式和发布渠道。
+2. 每个发布组合生成对应 lock，文件名包含 edition、平台、架构和 Python minor。
+3. CI 生成环境与 lock 的 Python minor 完全一致，并使用 `--require-hashes`。
+4. `pyproject.toml` 保留抽象依赖，lock 只负责可复现安装；不得让两者长期手工漂移。
+5. README、spec、契约测试和 workflow 在同一个变更中更新。
 
-新文件看似已打开，但应用可能永久显示“翻译任务正在运行”，旧 API 请求继续执行并可能产生费用，旧任务结果又不会提交到任何会话。
+### R0-3 当前测试红线已修复
 
-**推荐实现**
+以下真实契约漂移已关闭：
 
-- 所有会话替换命令先进入统一 guard：`IDLE -> CANCELLING -> IDLE -> REPLACING`。
-- 运行中导入时提供“停止当前翻译并切换 / 取消导入”。
-- 停止必须等待结构化终态或达到短超时；无论终态是否迟到，都由主线程 reducer 原子清理 `is_translating`、按钮、run_id、preview 和 pending result。
-- 不允许单独调用 `invalidate_session()` 来代替取消任务。
+- CI 质量矩阵声明 Python 3.10-3.13；
+- Text spec 明确 onefile，Full spec 保持 onedir；
+- hook data 验证真实存在的绝对源路径和受控目标路径；
+- README、spec、工作流与契约测试描述相同产物。
 
-**必须新增测试**
+剩余的 3 个 `.png` 文件访问拒绝只在当前受控 Windows pytest 路径复现，且正常文件读写对照并不一致；不得通过弱化资产安全断言制造全绿，应在 CI Windows runner 复验。
 
-- 全文、选中行、查漏三种模式运行中导入。
-- 用户取消切换、确认停止后切换、停止超时三条路径。
-- 旧 worker 最终返回时不污染新文档，且 pending result 不泄漏。
+### R0-4 建立可持续的类型门禁
 
-### P0-3 API 配置文件写入失败被当成成功
+CI 现已阻断 `src/config/config_manager.py`、`src/infrastructure/project_repository.py` 与 `src/core/image_translator.py` 的类型回归；全仓报告仍有历史错误，主要集中在：
 
-**证据**
+- `src/application/translator_provider.py`
+- `src/application/autosave.py`
+- `src/core/epub_processor.py`
+- `src/domain/project.py`
+- `src/application/image_translation_service.py`
 
-- `src/domain/secret.py:70-72` 的 `SecretSaveResult.failed` 只检查密钥状态，不检查 `config_saved`。
-- `src/domain/secret.py:85-92` 的 `__bool__` 又正确检查了 `config_saved`，两套成功语义不一致。
-- `src/ui/settings_window.py:1547-1556` 和 `1614-1631` 使用 `.failed` 分支。
-- `src/domain/secret.py:116-122` 的 `ConfigSaveResult.failed` 也只读取 `api.failed`。
+推荐顺序：
 
-**影响**
+1. 先修 Protocol 返回值、`Optional` 缩窄、回调签名和 Future 类型。
+2. 清理 `concurrent.futures.Future` 与 `asyncio.Future` 的错误混用。
+3. 让 domain/application 核心子集真正零错误，再逐步扩展到 infrastructure/core。
+4. UI 边界允许第三方 Tk 类型不完整，但业务对象不得退化为无约束 `Any`。
+5. 迁移期间可保留一个非阻断的全仓报告，但阻断子集必须持续扩大且不能回退。
 
-密钥成功进入 keyring，但 provider、模型或 endpoint JSON 写入失败时，设置窗口仍可能提示成功并关闭；重启后配置回退。退出流程也可能不阻断，造成“本次可用、下次丢失”的隐蔽故障。
+禁止通过继续关闭 unknown/missing 规则或批量添加 `type: ignore` 来伪造完成。
 
-**推荐实现**
+## 6. P1：正确性、安全与生命周期
 
-- 定义唯一成功契约：`succeeded = secret_status != FAILED and config_saved`。
-- `.failed` 必须等价于 `not succeeded`；`ConfigSaveResult.failed` 使用 `not bool(api)` 或 `api.failed` 的修正语义。
-- 火山密钥、文本 API 和 app config 先完整校验，再事务式提交；不能回滚时，必须逐项报告“已保存/未保存”。
-- 删除密钥时只有“确实不存在”可视为成功，keyring 后端异常必须返回失败并回读验证。
+### P1-1 已实现：配置与密钥版本化快照
 
-### P0-4 Manga worker stderr 停止读取可导致子进程管道死锁
+[`src/config/config_manager.py`](../src/config/config_manager.py) 现在先保存唯一版本化 secret reference，再原子发布引用它的 JSON，最后发布内存快照。JSON 写失败会删除未发布的引用；旧 JSON 继续指向旧密钥。`update_api_provider_config()`、provider 读取和 API/app/glossary 公共快照也已使用锁与深拷贝。
 
-**证据**
+回归覆盖 JSON 写失败后的重启、并发 provider 切换与嵌套快照隔离。后续应按同一代际模型处理多文件 app/glossary 保存，见 P1-8。
 
-- `src/infrastructure/image_translation/manga_worker_client.py:271-298` 使用 `stderr=subprocess.PIPE`。
-- `src/infrastructure/image_translation/manga_worker.py:140-143` 将第三方 stdout 重定向到 stderr。
-- `src/infrastructure/image_translation/manga_worker_client.py:424-450` 读取 500 行后直接 `break`。
-- 父进程的静默 deadline 可达 1800 秒，见 `manga_worker_client.py:192-205`。
+### P1-2 已实现进程内项目/recent index 补偿事务
 
-**影响**
+[`src/infrastructure/project_repository.py`](../src/infrastructure/project_repository.py) 现已限制项目 ID 为 `^[0-9a-f]{16}$`，并通过 `resolve()` 与直接子路径校验保护项目文件、检查点和隔离文件。save/delete 在同一仓库锁内暂存旧文件、更新 recent index；索引写失败会恢复项目/检查点并向调用方暴露失败。
 
-第三方继续输出时，Windows pipe 写满会阻塞子进程，图片翻译看似“随机卡死”，直到最长 30 分钟后才被静默超时终止。
+路径穿越、多线程保存和 recent index 故障注入均有回归。进程崩溃与多进程竞争仍需要 journal/文件锁或 SQLite，见 P1-8。
 
-**推荐实现**
+### P1-3 已修复：Future 绑定派发时的 Provider limiter
 
-- 达到日志上限后只停止记录，不能停止 drain；继续逐行读取并丢弃。
-- 使用固定大小环形缓冲保留最后 N 行诊断，而不是限制读取总行数。
-- 增加 worker heartbeat 和阶段 deadline，区分“仍有日志但无协议进度”与“进程完全静默”。
+[`src/core/queue_scheduler.py`](../src/core/queue_scheduler.py) 已使用不可变 `_InFlightBatch` 保存派发时的 limiter，并在提交失败、成功、异常、取消和关闭路径配对释放。同一 Provider 运行时切换后的 in-flight Future 不再依赖当前 UI 的 limiter。
 
-**必须新增测试**
+保持回归：两个 Provider 交错派发时，各自 `in_flight <= configured_max`；全部完成/取消后两者均归零；executor 提交失败也不得泄漏槽位。
 
-- fake worker 连续输出 1 万行 stderr 后仍能返回 JSON response。
-- 日志实际写入仍受行数/字节数限制。
-- 超时后 pipe、stdin/stdout/stderr 和进程句柄全部释放。
+### P1-4 队列和图片关闭 deadline 已实现
 
-## 6. P1：应用性能优化
+队列调度器已经使用单一绝对 deadline，将等待、检查点关闭和执行器关闭限制在剩余时间内。图片翻译关闭也遵循同一原则：所有 Provider 先接收取消，再等待 worker 的剩余预算，最后才以剩余预算释放资源。不得在后续重构中恢复“每个资源各自等待完整超时”的实现。
 
-### PERF-1 禁止在队列全局锁内做 I/O、等待和资源关闭
+保持回归：100 个异常队列任务不会产生 `N x timeout` 关闭时间；所有新资源的 `join`/`flush`/`close` 必须接收剩余时间，而非重新分配完整超时。
 
-**证据**
+### P1-5 已实现：EPUB 导入不能静默丢章节
 
-- `src/core/queue_scheduler.py:1355` 持有 `self._lock` 应用结果。
-- 暂停确认在 `1446` 调用最长 3 秒的 `flush_blocking()`。
-- 任务完成在 `1468` 调用最长 5 秒的 `flush_blocking()`。
-- 删除任务在 `1266-1281` 的锁内执行 flush、checkpoint close 和 engine close。
-- 终态清理在 `1506-1518` 的锁内关闭引擎；SiliconFlow close 会 join 心跳线程。
+[`src/core/epub_processor.py`](../src/core/epub_processor.py) 现在将正文节点和章节解析异常转换为 `EpubImportPartialError`，在写入三个映射文件前中止本次导入。不会再把“仍有部分章节”当成成功，也不会覆盖上一次完整 mapping。队列 `add_task()` 已把取消回调传给 `import_epub()`；窗口取消时，已在执行的 EPUB 会在 archive、chapter、image 和 write 安全点退出，并不会被报告为普通导入失败。
 
-**影响**
+回归覆盖第二章节解析失败时三份既有 mapping 字节保持不变，以及队列取消回调向 EPUB 处理器传递；当前相关套件为 37 passed。允许用户接受部分导入的审计清单尚未实现；在此之前，默认中止是唯一允许的语义。跨文件崩溃恢复仍由 P1-8 处理。
 
-一个慢磁盘、只读目录、网络盘或 keyring/HTTP 关闭异常，会同时阻塞命令、派发、完成结果应用和 UI 快照。多任务结束时停顿会串行累加。
+### P1-6 已实现：图片翻译关闭和 endpoint 校验统一
 
-**目标结构**
+图片 UI 现使用单一绝对 deadline：先取消所有 Provider，等待活动 worker 直到剩余时间耗尽，再向 Provider 传递剩余预算释放资源。worker 未退出或从自身线程调用关闭时，代码会保留 Provider、模型和 event loop，不会并发卸载资源。Manga worker 的 terminate/kill 和 reader 线程回收共享该预算；本地 runtime 只有在拥有它的线程退出后才关闭 event loop。火山 endpoint 已复用文本 API 的 HTTPS/loopback 校验，拒绝远程 HTTP、URL 用户信息、查询参数和锚点，并在创建 OpenAI/httpx 客户端前失败。
+
+回归覆盖关闭顺序、worker 超时不释放资源、worker terminate/kill 预算和 runtime 线程仍存活时不关闭 loop；当前定向套件为 31 passed。后续保持中央 `sanitize_for_log()`、关闭中回调和恶意 endpoint 覆盖，避免回退到弱化脱敏或竞态 teardown。
+
+### P1-7 已收敛：recent index 单进程并发更新
+
+`_touch_recent()` 与 save/delete 已在同一个仓库事务锁内执行，索引写失败不再吞掉，并有保存/删除补偿与并发保存回归。
+
+若未来允许多进程同时运行，则使用文件锁、SQLite，或把 recent index 设计成可由项目文件重建的派生数据。
+
+### P1-8 已实现：EPUB 映射的可恢复业务代际
+
+单个 JSON/TXT 的 `fsync + replace` 不能保证一组文件同时可见。EPUB 导入会连续写多个映射文件，自动保存和队列检查点也会先后写译文、映射和项目状态；进程在中间退出时可能留下互不匹配的代际。
+
+EPUB mapping 已通过 [`src/infrastructure/mapping_repository.py`](../src/infrastructure/mapping_repository.py) 实现 generation/manifest 协议：完整导入先将 `content_mapping.json`、`images.json` 和 `format_info.json` 写入 `.mapping_generations/<uuid>/`，最后原子发布唯一的 `mapping_manifest.json`。读取端统一使用 `resolve_mapping_file()`；manifest 存在时，缺失成员或损坏 manifest 会显式报错，绝不回退并混读顶层兼容副本。
+
+译文保存和旧图片资产迁移使用 `publish_mapping_file_update()` 只发布变更成员，并保留其余已发布成员的引用。导出、图片服务、两个图片 Provider 和 UI 预检查均已迁移到该解析接口；顶层 JSON 仅保留给旧版本集成的最佳努力兼容副本，不能再作为新代码的事实来源。
+
+故障注入覆盖完整 generation 成员写入失败时 manifest 仍指向上一完整版本，以及删除顶层 `images.json` 后的旧图片迁移仍能读取并发布新 generation。当前映射与图片定向回归为 `96 passed`。
+
+修复要求：
+
+- 每个关联文件携带同一 generation，写完后用原子 commit manifest 发布完整代际；EPUB 导入可先写入 staging 目录后一次切换。
+- 恢复只接受完整的 commit manifest：不完整新代际必须回退到上一完整代际或明确报告可恢复错误，不能悄悄混合读取。
+- 记录写入阶段、generation、字节数和故障原因，为清理与支持诊断提供证据。
+
+验收：在每个写入边界注入崩溃/异常，恢复结果只能是上一完整代际或新完整代际；已确认批次不得丢失，也不得将错配译文发布给用户。
+
+边界：该协议解决进程崩溃时的可见性和混读问题，但尚未为多个进程同时写入同一 mapping 目录提供串行化。若产品允许该场景，必须再引入跨进程文件锁、SQLite WAL 或 append-only journal，避免两个 writer 基于同一旧 manifest 发布而造成最后写入覆盖。
+
+## 7. P1/P2：性能优化点
+
+### PERF-1 Tk 事件邮箱增加单帧预算
+
+当前通用 callback 队列和 translation terminal deque 没有容量上限，`drain()` 每轮取出全部事件，pump 也在一轮内执行全部回调。多个窗口各自以固定 50ms 轮询。已有 keyed coalescing 是正确方向，但不能约束普通回调和突发终态。
+
+推荐实现：
+
+- root 级统一 pump，而不是每个组件独立常驻一个 pump。
+- 每帧最多处理 64 项或 8ms，任一先到即让出 Tk 主线程。
+- 有积压时用 `after_idle`/短间隔继续；空闲时退让到 250-500ms。
+- 进度、窗口尺寸等 keyed 状态保留最新值；终态、用户命令和错误保持 FIFO，不得丢弃。
+- 暴露 pending、coalesced、discarded、oldest-age 和单帧耗时指标。
+
+验收：1 万 callback burst 下 Tk heartbeat p99 不超过 50ms，最大停顿不超过 100ms。
+
+### PERF-2 大文档翻译前复用版本化快照
+
+点击翻译后，Tk 线程会：
+
+1. 从 `TranslationDocument` 多次生成原文/译文列表。
+2. 构造完整 `TranslationProject`。
+3. 在 preflight 中再次扫描。
+4. 在 controller 中重新取列表、查找缺失行并 `join`。
+5. worker 内再做分割和批次规划。
+
+100MB 或 10 万行文档会产生重复 O(N) 扫描和内存峰值。
+
+推荐引入不可变 `DocumentSnapshot(version, source_lines, target_lines, pending_indices, edit_flags)`。同一 version 的预检、费用估算和任务启动复用同一快照；token 估算和批次规划放到后台，并用 version 检查迟到结果。
+
+验收：100MB/10 万行 fixture 记录点击到 worker 启动时间、Tk 连续阻塞时间和峰值 RSS；Tk 单次不可中断工作低于 50ms。
+
+### PERF-3 任务详情页只消费增量数据
+
+队列主列表已使用轻量快照，但详情页每 500ms 分别刷新状态和译文，两次 `get_task()` 都会复制完整原文与译文，随后仍全行比较目标文本。
+
+推荐接口：
+
+- 打开窗口时只取一次不可变原文。
+- 状态栏读取 `QueueTaskSnapshot`。
+- Coordinator 发布 `generation + changed_ranges` 或按区间读取目标行。
+- 详情窗口只更新变化区间；关闭窗口后停止订阅。
+
+验收：10 万行任务空闲刷新不再创建 O(N) 列表，单行变化只读取并渲染该区间。
+
+### PERF-4 降低检查点全量写放大
+
+延迟到 debounce 后再构造快照已经实现，但到期后仍复制任务全量状态。TXT checkpoint 同时重写完整译文和项目 JSON，项目保存还更新 recent index；EPUB mapping 也会完整加载、排序和序列化。
+
+推荐分两步：
+
+1. 短期记录 generation、changed indices、写入字节、`fsync` 次数和耗时；recent index 不随每个 checkpoint 重写。
+2. 中期使用 SQLite WAL 或 append-only journal 增量保存译文、失败行和人工编辑；只在暂停、终态、显式导出时生成兼容 TXT/JSON。
+
+验收：50 个任务、每个 1 万行的固定基准中，运行期写入字节和 `fsync` 数量相较当前基线显著下降，崩溃恢复仍不丢已确认批次。
+
+### PERF-5 EPUB 导出改为逐章流水线
+
+当前导出会先保留全书章节解析结果和双 DOM，之后逐章改写；写包后还会再次重写 ZIP，最后 `testzip()` 全量读取并校验 CRC。大书会同时放大 RSS、CPU 和磁盘 I/O，取消也主要发生在阶段边界。
+
+推荐实现：
+
+- 逐章解析、校验、改写并释放 DOM。
+- 在首次写包前完成 spine/nav 属性处理，避免第二次全包重写。
+- 若库接口不支持流式写，至少限制同时驻留的 DOM 数量。
+- 将取消检查下传到章节、图片和压缩循环。
+- 完整 CRC 校验保留在发布/高可靠模式；交互导出可校验结构、关键成员和最终文件可读性，并允许用户选择完整验证。
+
+验收：200 章/500 图 fixture 的峰值 RSS 比当前下降至少 30%，不再发生第二次全包重写。
+
+### PERF-6 图片链路减少 Base64 和重复落盘
+
+在线图片路径中，已经编码的数据仍会解码验证、重新编码，并再次解码计算原图大小。图片资产的 checksum 命中路径现已直接复用已有文件和元数据，不再执行原子写或 `fsync`；端到端 Base64 往返仍有优化空间。
+
+推荐内部始终传递 `bytes + mime_type`，只在 HTTP JSON 边界编码一次 Base64；保存层在 checksum、大小和目标文件均命中时直接返回现有元数据。后者已实现并有回归，前者仍需基准测量后逐段迁移。
+
+验收：50 张 10MB 图片记录 CPU、分配量和峰值 RSS；去重命中时写入字节和 `fsync` 次数均为 0。
+
+### PERF-7 缓存增加全局字节预算和 single-flight
+
+[`src/core/smart_cache.py`](../src/core/smart_cache.py) 是每个 API 实例自己的内存 LRU，只限制条目数，不限制字节数，也没有同 key single-flight。队列中多个实例遇到相同文本时仍可能同时请求 Provider，既浪费时间也可能重复计费。
+
+推荐：
+
+- 以 provider、endpoint、model、prompt version、glossary version 和规范化输入构造完整 key。
+- 加入总字节、单项字节和 TTL 上限。
+- 同 key 并发只允许一个 owner 请求，其他调用等待相同 Future。
+- 失败、取消和超时不能写入成功缓存，等待者必须收到同一结构化终态。
+- 若做跨进程持久缓存，先解决加密、容量、迁移和用户清除语义。
+
+### PERF-8 长单行流式预览限频
+
+长响应尚未出现换行时，每个 chunk 都可能重新 `join` 未完成行并复制完整 preview，容易退化为近似 O(N²)。将普通预览限制到约 20Hz，只在换行、批次终态和运行终态立即发布；维护增量 buffer，避免每个 chunk 重建全部字符串。
+
+验收：1MB 无换行流式响应的 CPU 时间随输入近似线性，预览事件数量有明确上限。
+
+### PERF-9 启动导入按功能延迟
+
+`import main` 中位数约 537ms，`src.bootstrap` 是最大累计路径。用 `-X importtime` 和同机重复基准确认后，将仅设置窗口、Full Edition、EPUB 导出或图片翻译使用的重依赖延迟到第一次使用。
+
+不要为了数字把核心错误推迟到用户操作时才暴露。启动必需依赖仍应尽早验证，并通过启动状态明确报告。
+
+建议目标：同机冷启动导入中位数下降至少 25%，且首次打开延迟功能的额外等待有状态反馈。
+
+### PERF-10 清理“有设置、无行为”的参数
+
+`queue_adaptive_concurrency`、`max_batch_input_tokens` 和 `min_batch_input_tokens` 已进入配置/Policy，但生产调度路径没有完整消费这些值。可见但无效的设置比没有设置更危险，因为用户会基于错误假设调整性能。
+
+应为每项建立“配置变化 -> 运行时行为变化”契约测试。短期无法实现时，从 UI 隐藏并保留迁移兼容；实现后在队列快照中显示实际生效值。
+
+### PERF-11 补齐队列导入取消和 EPUB 快速复用
+
+队列批量导入已经后台化，但取消只阻止提交新文件，不能中止已经在线程池中解析的大 EPUB。将 cancel token 传入 `ConcurrentTranslationManager.add_task()` 和 `EPUBProcessor.import_epub()`。
+
+EPUB mapping 快速复用目前以 size+mtime 命中，虽然项目数据已保存 SHA-256，但该快速路径没有复核内容哈希。建议采用“size+mtime 快速拒绝，内容哈希最终确认”，或保存更强的文件标识并提供可配置的信任策略。
+
+## 8. P2：工程维护
+
+### 8.1 异常处理
+
+约 268 处宽泛异常捕获中，不少位于 UI 回调、清理和插件边界，不能机械删除。按风险处理：
+
+1. 持久化、密钥、路径和协议解析：捕获具体异常，返回结构化失败，禁止静默 `pass`。
+2. 线程和资源清理：允许 best-effort，但必须记录资源名、阶段和 correlation ID。
+3. UI 回调边界：阻止异常击穿事件循环，同时将安全摘要呈现给用户。
+4. EPUB 章节级处理：区分可跳过内容错误和必须中止的结构/编程错误。
+
+### 8.2 拆分超大协调模块
+
+按职责和可测试边界拆分，不以行数为唯一目标：
+
+- `queue_scheduler.py`：registry、dispatcher、limiter ownership、finalizer、checkpoint adapter、snapshot publisher。
+- `main_window.py`：layout、command policy、document workflow、preflight、save/close coordinator。
+- `settings_window.py`：provider form、image settings、queue settings、persistence transaction。
+- `translation_controller.py`：run state machine、event reducer、translation commands、export commands。
+
+拆分后的对象应通过 Protocol 注入，状态转换应能在无 Tk、无网络、无磁盘的单元测试中运行。
+
+### 8.3 包布局作为 2.0 迁移项
+
+当前发布的顶层包名是通用的 `src`，且没有标准 GUI entry point。长期迁移为标准 src-layout：
 
 ```text
-RUNNING/PARTIAL
-      |
-      | 锁内：摘取快照、记录 generation、切换状态
-      v
-FINALIZING
-      |
-      | 锁外：flush / close / repository save
-      v
-COMPLETED / PARTIAL / ERROR
+src/
+  ai_translater/
+    application/
+    domain/
+    infrastructure/
+    ui/
 ```
 
-- 锁内只做内存状态转换和引用 detach。
-- finalizer 使用独立 executor/future；完成后通过 coordinator event 回填终态。
-- 所有关闭操作使用一个绝对总 deadline，不能对每个任务重新给 3-5 秒。
-- 建立测试断言：持锁区不得调用 `flush_blocking`、文件 I/O、`join`、HTTP client close。
+并在 `[project.scripts]` 或 GUI scripts 中声明入口。该迁移会影响导入、PyInstaller、测试和恢复数据路径，不应与本轮 P1 修复混在一个发布中。
 
-### PERF-2 `queue_max_active_tasks` 设置目前没有生效
+### 8.4 删除静态测试结果文件
 
-**证据**
-
-- `QueuePolicy.max_active_tasks` 仅定义于 `src/core/queue_scheduler.py:130`。
-- `_cmd_start_all()` 在 `1049-1062` 对全部任务调用 prepare。
-- 每个 prepare 都会创建引擎、HTTP client、心跳线程并规划全部批次；仓库中没有用 `max_active_tasks` 限制激活数量的逻辑。
-
-**影响**
-
-用户界面提供了一个实际无效的性能控制。大队列会创建 O(总任务数) 的连接池、心跳线程和 BatchJob，增加首请求延迟和内存占用。
-
-**推荐实现**
-
-- 区分 `PENDING` 与 `ACTIVE`；只允许最多 `max_active_tasks` 个任务 prepare。
-- 活跃任务进入终态/暂停后，按公平顺序惰性激活下一个。
-- Provider runtime 可进一步按运行时 key 共享连接与心跳，而任务只持逻辑会话。
-- 增加 100 个任务、`max_active_tasks=4` 的测试：引擎实例、心跳线程和已规划批次数量均不得超过活动窗口。
-
-### PERF-3 检查点 debounce 减少了写盘次数，但没有减少每批全量复制
-
-**证据**
-
-- 每批结果在 `queue_scheduler.py:1432-1433` 调度检查点。
-- `1619-1644` 在全局锁内复制整篇 target、failed、manual、completed。
-- `1654-1674` 构造保存函数时再次复制。
-- TXT 保存又全量 join 并写译文和项目 JSON；EPUB 保存全量更新映射。
-
-**影响**
-
-大文档、小批次和多任务组合下产生明显内存抖动、锁竞争和 SSD 写放大。API 越快、缓存命中越多，应用自身开销越突出。
-
-**推荐实现**
-
-- 每批只记录 `generation + changed_indices`，不立即构造全量保存闭包。
-- debounce 真正到期时，才在短持锁区抓取一次版本化快照。
-- 中期使用 journal/SQLite 持久化增量；兼容 `_译文.txt` 只在显式保存、暂停、退出或终态生成。
-- 项目恢复仓储应避免每次保存重复持久化原文全量。
-
-### PERF-4 调度器需要事件驱动唤醒，不能固定 100ms 轮询 Future
-
-**证据**
-
-- 主循环在 `queue_scheduler.py:954-982` 每轮等待。
-- `_wait_for_events()` 在 `984-999` 先等待命令事件 100ms，再用零超时检查 Future。
-
-**影响**
-
-Future 完成不会唤醒调度器，下一波派发额外等待 0-100ms。远程慢 API 时不明显，但缓存、本地模型、Mock 或低延迟 endpoint 会被人为限制吞吐。
-
-**推荐实现**
-
-- Future `add_done_callback()` 只设置统一 wake event。
-- command、future、limiter cooldown 使用同一个 `Condition/Event`。
-- 无事件时指数退让，活跃时立即调度；快批次 dispatch gap 的 p95 目标小于 20ms。
-
-### PERF-5 主翻译进度聚合应从按批次扫描改为增量计数
-
-`src/core/translator.py:433-464` 和 `583-591` 在高频进度事件中重复扫描或求和所有批次，批次数增加后接近 O(B²)。维护 `completed_lines` 标量、每批已计入值和 `next_unfinished_batch` 指针，可将热点降为 O(1) 或 O(log B)。
-
-### PERF-6 队列批量导入必须后台化
-
-- `src/ui/concurrent_window.py:413-431` 在 Tk 主线程逐个调用 `manager.add_task()`。
-- `src/core/concurrent_manager.py:203-233` 同步读取 TXT/解析 EPUB。
-- `queue_scheduler.py:721-779` 还会同步计算 SHA-256 和读取恢复项目。
-
-建议使用 1-2 个 import worker，提供逐文件进度、取消和失败列表；解析成功后再在 coordinator 中原子注册。多个大 EPUB 不应冻结队列窗口。
-
-### PERF-7 UI 事件泵需要统一预算和空闲退让
-
-- `TranslationEventMailbox` 只合并 STREAM，`BATCH_COMPLETED` 进入无界 terminal deque。
-- `TkTranslationEventPump` 每轮一次性渲染全部 terminal。
-- 主窗口常驻 translation、file importer、image handler 三个 50ms pump，设置和队列窗口还会增加 pump。
-
-建议：
-
-- 每帧使用数量或耗时预算，例如最多 64 个事件或 8ms，余量留到下一帧。
-- 相邻 batch completed 可合并为连续 row-update block，但 RUN 终态必须在之前的 batch commit 后处理。
-- 多个 mailbox 复用一个 root 级 pump；空闲时将轮询间隔提高到 250-500ms，有事件时恢复 16-50ms。
-
-### PERF-8 手动保存和对照文件导出也应避免大文件同步阻塞
-
-`src/ui/translation_controller.py:1252-1321` 和 `1323-1348` 会在 Tk 线程构造整篇字符串并同步写盘。EPUB 导出已后台化，TXT/对照导出应复用相同 Job + mailbox 模式，并提供进度、取消和原子发布。
-
-## 7. P1：用户体验优化
-
-### UX-1 导入 busy 状态恢复会覆盖真实控件状态
-
-- `src/ui/file_importer.py:488-489` 创建进度对话框后递归禁用 root 子控件，进度窗本身也是子项，取消按钮可能被禁用。
-- `579-610` 结束后无条件把所有 Button 设为 normal、所有 Combobox 设为 readonly。
-
-这会错误启用停止按钮、非 EPUB 导出、Text Edition Manga 入口或其他本应禁用的命令。
-
-建议建立单一 `AppUiState`/command policy：控件状态由 `session_kind + api_ready + run_state + import_state + edition + image_busy` 推导。后台操作只修改状态，不直接递归改 widget。短期至少保存并精确恢复原状态、排除进度对话框，并在结束后调用统一 `refresh_action_state()`。
-
-### UX-2 EPUB 取消需要下传到真正的解析循环
-
-`file_importer.py:506-521` 只在整个 `_build_epub_import_result()` 前后检查取消；`src/core/epub_processor.py:129` 的 `import_epub()` 无 cancel/progress 参数。
-
-建议：
-
-- token 下传到 ZIP 检查、spine 遍历、DOM 解析、图片提取、映射写入等循环。
-- 每处理一章/若干图片检查一次，不需要每个节点检查。
-- 取消是独立 `CANCELLED` 结果，不得在 `file_importer.py:623-625` 显示为“导入错误”。
-- 取消按钮点击后 100ms 内更新状态；在下一个安全检查点退出。
-
-### UX-3 自动查漏必须尊重错误分类和可重试性
-
-- 全文 PARTIAL 在 `translation_controller.py:867-881` 无条件启动查漏。
-- 查漏 FAILED 在 `1241-1246` 无条件 1 秒后重试，最多两轮。
-- 队列已有 `application/error_handling.py` 的 category/retryable，但主翻译结果未复用。
-
-只对网络瞬断、429、暂时性 5xx 做带 jitter 的退避；401/403、余额不足、模型不存在、配置无效和本地权限错误应立即停止并展示动作按钮或明确下一步。
-
-### UX-4 运行终态必须清理整个 run 的流式状态
-
-`src/ui/translation_event_mailbox.py:43-56` 的 RUN 终态只按 `(run_id, batch_start)` 清理一个批次。多批次 worker 异常时，其他批次的 STREAM 仍会在 RUN_FAILED 后被 pump 渲染，形成失败后重新出现的幽灵预览。
-
-RUN_COMPLETED/RUN_FAILED/RUN_CANCELLED 应清除该 `run_id` 的全部 stream 状态；controller 在处理终态后应立刻使 run 失效并清理 `_pending_results`。新增多批次失败/取消测试。
-
-### UX-5 队列窗口关闭后需要持续可见的后台状态
-
-当前注入 manager 的队列窗口关闭后任务继续运行，但没有托盘或其他持续状态。用户可能误以为任务已停止，产生意外 API 消耗。
-
-可选方案：
-
-1. 关闭窗口时询问“继续后台运行 / 取消任务 / 返回”。
-2. 若继续后台运行，主窗口显示持续的队列状态和“重新打开队列”入口。
-3. 仓库中的 `install_tray_dependencies.bat` 声称存在托盘功能但实际没有对应实现和测试，应删除过时脚本，或完整实现托盘生命周期，不能保留半成品承诺。
-
-### UX-6 主编辑器应复用队列的可操作错误体系
-
-主翻译仍直接显示原始 `error_message`，而队列已经支持安全文案、建议动作和 correlation ID。两条链路应共用 `ActionableError`，并保持日志详情与 UI 摘要分离。
-
-### UX-7 修复默认配置迁移和 README 契约漂移
-
-- `config/app_config.json:6` 仍包含冗长、带“突破限制/无视约束”措辞的旧提示词。
-- 开发环境首次迁移会复制资源目录 config，见 `src/app_paths.py:250-254`。
-- `ConfigManager.load_app_config()` 浅合并后会把缺失 schema 的旧 prompt 与新的 schema version 混合，无法识别为待迁移默认值。
-- `README.md:62-74` 的 API 配置示例仍是旧的嵌套 provider schema，与当前扁平 `provider/model_name/base_url` 契约不一致。
-
-建议只在旧 prompt 与已知历史默认值完全相等时迁移到新短提示词，绝不覆盖用户自定义 prompt；删除打包 spec 中无用途的真实 `app_config.json/glossary.json`，只保留 sample；README 示例由配置 schema 测试生成或校验。
-
-### UX-8 平台键盘与滚轮交互需与支持声明一致
-
-README 声明 Windows/macOS/Linux，但主快捷键只绑定 Control，设置滚轮主要处理 `<MouseWheel>`。应补充 macOS Command、Linux X11 Button-4/5，并在三平台关键 UI 测试中验证。
-
-## 8. P1/P2：Python 工程与安全治理
-
-### ENG-1 修复 Python 3.10 质量矩阵
-
-`pyproject.toml:10` 和 CI 都声明支持 3.10，但 `tests/test_queue_provider_limiter.py:14` 导入 `datetime.UTC`。改用 `datetime.timezone.utc`，并要求 3.10 收集和测试全绿后再保留该支持声明。
-
-### ENG-2 生成可复现的分平台/edition 依赖锁
-
-- `requirements-image-manga.txt:18-25` 已明确承认尚无 hash lock。
-- `118-119` 从额外索引安装无版本约束的 Rust wheel。
-- 发布 CI 直接解析浮动依赖。
-
-建议：
-
-- `pyproject.toml` 作为抽象依赖唯一来源。
-- 生成 Text/Full、Windows/macOS、Python 版本对应的带 hash lock。
-- 发布使用 `--require-hashes`；自定义 wheel 使用固定版本、直接 URL 和 SHA-256。
-- CI 不要先安装 `.[dev]` 再重复安装 `requirements.txt`，避免双源解析漂移。
-
-### ENG-3 异常 traceback 也必须脱敏
-
-`src/utils/logger.py:27-36` 只处理 `record.getMessage()`，Formatter 后续追加的 traceback 不会经过 sanitizer。应提供自定义 Formatter 覆盖 `formatException()`，清理 `exc_text`，并让 manifest/provider 统一复用中央 `sanitize_for_log()`，避免复制多套不一致正则。
-
-### ENG-4 外部 EPUB 和远程 SVG 增加资源/主动内容边界
-
-- EPUB 导入前检查 ZIP 成员数、单成员解压大小、总解压大小、压缩比和路径穿越，防止压缩炸弹与内存耗尽。
-- 远程 SVG 不应仅凭 XML 前缀视为可信图片。优先安全栅格化；若保留 SVG，必须移除脚本、事件属性、`foreignObject` 和外部引用。
-
-### ENG-5 损坏恢复文件不得静默当作不存在并覆盖
-
-`ProjectRepository.load()` 应区分 `NotFound` 与 `Corrupt`。损坏项目先重命名隔离并提供恢复提示，再决定是否新建，不能直接返回 None 后覆盖同 ID 文件。
-
-### ENG-6 扩大类型和平台门禁
-
-- `pyproject.toml:174` 不包含 `src/core`、`src/api`、`src/config`。
-- CI `build.yml:54` 又显式只运行 domain/application。
-- 测试只在 Ubuntu 执行；Windows/macOS 仅做进程存活 smoke。
-
-建议分步执行：
-
-1. CI 直接运行无路径参数的 `python -m pyright`。
-2. 将 core/api/config 纳入 basic，优先覆盖 queue scheduler、API lifecycle、secret/result 和 file importer。
-3. Python 3.11 在 Windows、macOS、Ubuntu 跑关键路径测试；Full 产物增加 Manga worker health check。
-4. 覆盖率先建立当前基线和“不下降”门禁，再逐步设置 `--cov-fail-under`。
-
-### ENG-7 拆分上帝对象，但不需要更换 GUI 框架
-
-优先按职责拆分：
-
-- `queue_scheduler.py`：registry、state machine、dispatcher、finalizer、snapshot publisher。
-- `main_window.py`：layout、command state、document workflow、save/close coordinator。
-- `settings_window.py`：provider form、image settings、queue settings、persistence transaction。
-- `translation_controller.py`：run state machine、event reducer、commands、export jobs。
-
-拆分目标不是缩短文件本身，而是让状态转换、I/O 和渲染边界可以独立测试。现阶段没有证据要求从 Tkinter 迁移到其他 GUI 框架。
-
-### ENG-8 包布局作为 2.0 迁移项
-
-当前真正的顶层包名是通用的 `src`，`setuptools` 也发布 `src*`。长期建议改为标准 src-layout：`src/ai_translater/...`，增加 `[project.scripts]` 或 GUI entry point，并用 wheel 安装测试保证仓库路径不会掩盖安装包。该项不应与当前 P0/P1 修复混在同一发布中。
+仓库跟踪的 `test_results.txt` 到 `test_results4.txt` 只记录旧的“22 failed / 879 passed”，没有提交、环境或失败详情，已经误导当前状态。删除这些文件，由 CI 保存 JUnit、coverage、benchmark JSON 和日志 artifact。
 
 ## 9. 推荐实施顺序
 
-### 阶段 0：发布阻断修复
+### 阶段 0：建立可信基线
 
-1. 两阶段关闭，配置取消不得发生在 teardown 后。
-2. 会话替换与翻译 run 使用统一状态机。
-3. 统一 `SecretSaveResult` 成功语义并修复删除密钥结果。
-4. Manga stderr 始终 drain。
-5. 为以上四项补回归测试。
+1. 决定支持矩阵和 Text/Full 产物形式。
+2. 修复 4 个真实契约测试失败。
+3. 恢复 CI quality job，保存测试和覆盖率 artifact。
+4. 生成与 runner 完全匹配的依赖锁。
+5. 将本文动态结果保存为初始基线，不把沙箱权限失败混入产品失败。
 
-### 阶段 1：队列性能和可靠性
+### 阶段 1：并发和数据边界
 
-1. 引入 `FINALIZING`，所有 flush/close 移出全局锁。
-2. 真正执行 `max_active_tasks`，惰性创建引擎和批次计划。
-3. checkpoint 延迟取快照并减少全量写放大。
-4. Future 完成事件驱动调度。
-5. 队列文件导入后台化。
+1. 配置与密钥原子快照。
+2. 项目保存/删除与 recent index 的可观察事务结果。
+3. EPUB、自动保存和检查点的 generation/commit manifest 恢复策略。
+4. 为所有可见队列设置补齐“配置变化 -> 运行行为变化”的契约测试。
 
-### 阶段 2：取消、错误和 UI 状态
+### 阶段 2：高收益交互性能
 
-1. 用集中 command policy 替代递归启用/禁用控件。
-2. EPUB 协作取消和独立 CANCELLED 终态。
-3. 主翻译接入 ActionableError，查漏按 retryable 决策。
-4. RUN 终态清理全部 stream/pending 状态。
-5. 队列后台运行保持持续可见。
+1. root 级有预算事件泵。
+2. 版本化 `DocumentSnapshot` 和后台预检/批次规划。
+3. 任务详情轻量状态 + changed ranges。
+4. 长单行流式预览限频。
 
-### 阶段 3：发布治理
+### 阶段 3：I/O、内存和 API 成本
 
-1. 修复 Python 3.10 测试并建立 Text/Full 明确支持矩阵。
-2. 生成分平台 hash lock，固定额外索引包。
-3. 扩大 Pyright 和三平台关键测试。
-4. 修复 traceback/manifest 脱敏、EPUB 资源上限和 SVG 主动内容。
-5. 修正 README、默认 prompt 和打包资源。
+1. checkpoint journal/SQLite WAL。
+2. EPUB 逐章导出并移除二次全包重写。
+3. 图片 bytes 内部通路和命中免写。
+4. 全局字节预算缓存与同 key single-flight。
+5. EPUB 快速复用内容哈希确认。
 
-### 阶段 4：长期结构治理
+### 阶段 4：类型与结构治理
 
-1. 拆分四个超大协调模块。
-2. 迁移标准包布局和 GUI entry point。
-3. 评估持久化翻译缓存和 SQLite/Journal 项目存储。
+1. 按模块消除 244 个 Pyright 错误。
+2. 收紧 unknown/missing 诊断。
+3. 拆分四个超大协调模块。
+4. 规划 `ai_translater` 标准包布局和 GUI entry point。
 
-## 10. 性能与体验验收指标
+## 10. 性能基准与验收
 
-| 场景 | 建议指标 |
-| --- | --- |
-| Tk 主线程 | 常规命令不执行磁盘/网络 I/O；单次事件处理预算不超过 8-16ms |
-| 队列锁 | p99 持锁时间小于 5ms；持锁调用图中不存在 flush、join、文件写或 HTTP close |
-| 调度唤醒 | 快批次完成到下一批派发的 p95 小于 20ms |
-| 活动任务 | `max_active_tasks=4` 时引擎、心跳和已 prepare 任务不超过 4 |
-| 检查点 | 连续批次在 debounce 窗口内只构造一次全量快照；终态必须完成最后一次保存 |
-| UI 邮箱 | 每帧按数量/时间有界；1 万个快速事件不会产生超过 50ms 的单帧停顿 |
-| EPUB 取消 | 点击后 100ms 内显示取消中；在下一个章节/图片安全点退出；不显示错误弹窗 |
-| Manga worker | 超过 1 万行 stderr 仍可完成协议响应；日志存储有界但 pipe 持续 drain |
-| 关闭 | 用户仍可取消时没有资源被永久关闭；不可逆关闭使用一个全局 deadline |
-| 发布 | 干净环境 `pip check` 通过，Text 支持矩阵零收集错误，Full worker health check 通过 |
+没有固定数据集、采样方式和基线 artifact 时，不应声称“性能已经优化”。建议建立以下五组基准：
 
-## 11. 建议新增的测试文件/场景
+| 场景 | 规模 | 主要指标 |
+| --- | --- | --- |
+| 队列 | 50 个任务 x 10,000 行 | 吞吐、limiter 正确性、checkpoint bytes/fsync、关闭耗时 |
+| UI burst | 10,000 个 callback/terminal event | Tk heartbeat p50/p95/p99、最大停顿、积压年龄 |
+| 大 TXT | 100MB 或 100,000 行 | 点击到 worker、主线程最长阻塞、RSS、快照复制次数 |
+| 大 EPUB | 200 章、500 图 | 导入/导出分阶段耗时、RSS、ZIP 读写字节、取消延迟 |
+| 图片 | 50 张 x 10MB | Base64 CPU/分配、峰值 RSS、命中写入字节、Provider 调用数 |
 
-- `tests/test_close_transaction.py`
-  - 配置失败取消后服务仍可用。
-  - commit close 幂等且只执行一次。
-- `tests/test_session_switch_while_running.py`
-  - 三种翻译模式运行中切换会话。
-  - 旧终态、旧 stream、pending result 全部清理。
-- `tests/test_secret_result_semantics.py`
-  - `config_saved=False` 时 `.failed is True`、`bool(result) is False`。
-  - keyring 删除异常不假装成功。
-- `tests/test_manga_worker_stderr_drain.py`
-  - 大量 stderr 不阻塞 response。
-- `tests/test_queue_finalizer.py`
-  - 慢/失败 checkpoint 不阻塞其他任务派发和命令。
-  - finalizer 使用总 deadline。
-- `tests/test_queue_active_window.py`
-  - 100 个任务只激活配置数量。
-- `tests/test_queue_import_background.py`
-  - 大 EPUB 导入期间 Tk 心跳继续运行，可取消。
-- `tests/test_epub_resource_limits.py`
-  - 成员数、解压大小、压缩比和路径穿越。
-- `tests/test_translation_terminal_cleanup.py`
-  - 多批次 RUN_FAILED/RUN_CANCELLED 清除整个 run 的 stream。
-- `tests/test_cross_platform_shortcuts.py`
-  - Windows/Linux/macOS 快捷键映射。
+统一测量规则：
 
-## 12. 推荐验证命令
+- 固定 Python minor、依赖锁、操作系统、CPU 电源模式和数据集。
+- 每个场景至少 warm-up 1 次、正式运行 5 次，报告中位数和 p95。
+- 同时记录 wall time、CPU time、峰值 RSS、磁盘字节、`fsync` 次数和请求数。
+- 基准 JSON 包含 Git SHA、环境和参数，作为 CI artifact 保存。
+- 性能 PR 必须提供前后对比；功能测试绿色是性能改动的前置条件。
 
-在全新虚拟环境执行，不复用当前机器的全局 site-packages：
+## 11. 推荐验证命令
+
+在全新虚拟环境中执行，不复用全局 site-packages：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\.venv\Scripts\python.exe -m pip check
-.\.venv\Scripts\python.exe -m ruff check main.py build.py src tests tools
-.\.venv\Scripts\python.exe -m ruff format --check main.py build.py src tests tools
+
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m ruff format --check .
 .\.venv\Scripts\python.exe -m pyright
-.\.venv\Scripts\python.exe -m pytest -q --cov=src --cov-report=term-missing
+.\.venv\Scripts\python.exe -m compileall -q main.py build.py src tests tools
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pytest --cov=src --cov-branch --cov-report=term-missing --cov-report=xml
 ```
 
-Full Edition 还需在对应平台锁文件环境中执行：
+发布构建还应执行：
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-image-manga.lock.txt
-.\.venv\Scripts\python.exe -m pytest -q tests/test_image_translation_runtime.py tests/test_manga_worker_stderr_drain.py
-```
+1. 使用与 CI Python minor、平台和 edition 完全一致的 `--require-hashes` lock 安装。
+2. `python -m build --wheel` 后在第二个干净环境安装 wheel。
+3. 从仓库目录外执行 import/entry-point smoke，防止源码路径掩盖漏包。
+4. 对 PyInstaller 产物执行启动、关键资源、版本、edition 能力和关闭 smoke。
+5. Full Edition 额外执行 Manga worker health check；不下载模型的 smoke 与含模型集成测试分开。
+
+## 12. 旧问题状态对照
+
+旧指导文档中的以下结论已经过期，不应继续作为未完成 P0/P1：
+
+| 旧问题 | 当前状态 | 当前证据/剩余边界 |
+| --- | --- | --- |
+| 关闭取消发生在不可逆 teardown 后 | 已修复 | `tests/test_config_save_result.py` 有关闭取消回归 |
+| 翻译中替换会话永久 busy | 已修复 | `tests/test_translation_single_flight.py` 覆盖会话替换 |
+| 密钥保存语义把失败当成功 | 已修复 | 结构化保存结果已有测试；本轮新问题是并发快照一致性 |
+| Manga stderr 500 行后停止 drain | 已修复 | `tests/test_image_cancel_p1_8.py` 覆盖持续 drain |
+| `max_active_tasks` 不生效 | 已修复 | Coordinator 已按活动窗口惰性 prepare |
+| Future 完成只能等待固定轮询 | 已修复 | Future callback 会设置统一 wake event |
+| Provider 切换后 limiter 释放错配 | 已修复 | `_InFlightBatch` 固定持有派发时 limiter；定向回归覆盖切换、取消和 submit 失败 |
+| 队列关闭按任务数累加超时 | 已修复 | Coordinator 与图片翻译关闭均使用单一绝对 deadline；图片 worker 未退出时不并发释放 Provider/loop |
+| debounce 前构造全量 checkpoint | 已修复 | 到期后才构造快照；全量写放大仍是性能待办 |
+| 终态在全局锁内 flush/close | 已修复 | finalizer executor 已移出主要锁区 |
+| traceback 未脱敏 | 已修复 | `tests/test_log_sanitizer.py` 已覆盖 traceback |
+| EPUB 没有资源限制和取消 | 已修复 | 有 ZIP 上限和章节/图片安全点；队列在途导入取消已下传到处理器 |
+| 损坏项目静默覆盖与路径穿越 | 已修复 | 损坏文件隔离、项目 ID 正则和 resolve 后直接子路径校验均有回归；recent index 事务仍待补齐 |
+| 队列批量导入阻塞 Tk | 已修复 | 已使用后台 executor；在途 EPUB 解析可由取消令牌中止 |
+
+新增待办应以本文第 5-8 节为准。修复某个问题后，应同时更新状态表、回归测试和对应验收指标，避免指导文档再次变成过期快照。
 
 ## 13. 不建议采用的做法
 
-- 不要在修复 P0/P1 时同时更换 GUI 框架或重写全项目。
-- 不要通过提高线程数掩盖锁内 I/O；这只会放大连接、内存和写盘压力。
-- 不要把所有 `except Exception` 机械替换，先按“数据持久化、线程生命周期、网络边界、用户命令”收窄最高风险路径。
-- 不要让 UI 控件各自维护状态；应由单一应用状态推导 command availability。
-- 不要把浮动 `requirements.txt` 当发布锁文件。
-- 不要在取消路径显示通用错误，也不要在资源已经关闭后提供“返回应用”。
+- 不要为了 Pyright 绿色关闭更多规则或批量添加 `Any`/`type: ignore`。
+- 不要用提高线程数掩盖全量复制、锁竞争和写放大。
+- 不要把所有宽泛异常捕获机械替换；先处理数据、密钥、协议和线程生命周期边界。
+- 不要引入缓存而忽略 key 完整性、容量、取消和失败传播。
+- 不要在 UI 中保留生产代码不消费的性能设置。
+- 不要在当前 P1 修复期间同时迁移 GUI 框架或顶层包名。
+- 不要以一次本机运行替代 CI 支持矩阵，也不要把 mock 性能测试当作真实 RSS/I/O 基准。
 
-## 14. 总完成定义
+## 14. 完成定义
 
-完成本指导的核心目标，不是代码行数减少，而是满足以下条件：
+当以下条件全部满足时，才可判断项目形成发布级 Python 最佳实践闭环：
 
-1. 用户选择、内存状态、磁盘状态和后台任务状态一致。
-2. Tk 主线程不承担不可控 I/O，队列全局锁不包围阻塞操作。
-3. 配置、密钥、项目和检查点不会把部分失败伪装成成功。
-4. 取消、失败和切换会话都有单一结构化终态，旧事件无法污染新状态。
-5. `max_active_tasks`、并发、重试和超时等设置真实影响运行时行为。
-6. Text/Full、Windows/macOS/Linux 和 Python 版本支持矩阵有可重复的依赖与测试证据。
-
+1. CI 的 lint、format、类型、测试、coverage、wheel smoke 和打包检查是 required checks。
+2. 声明支持的 Python/平台/edition 组合都有匹配 lock 和可重复测试证据。
+3. pytest 全绿；环境限制被明确隔离，不与产品失败混淆。
+4. Pyright 阻断范围覆盖关键领域、配置、队列、Provider 和持久化路径，并持续扩大。
+5. 配置密钥、项目保存/删除、recent index、图片关闭和 endpoint 有并发/故障回归测试；已修复的 limiter 与队列 deadline 回归持续保留。
+6. Tk 主线程和全局锁内不存在不可控 I/O 或无界工作。
+7. 五组固定性能基准有同机前后数据，性能改动满足本文验收指标。
+8. README、workflow、spec、依赖锁、测试和实际发布产物描述一致。

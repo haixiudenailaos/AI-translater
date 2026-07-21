@@ -33,6 +33,7 @@ from ...domain.image_translation import (
 from ...domain.translation import OperationStatus
 from ...utils.logger import get_logger
 from ..image_asset_store import load_image_bytes
+from ..mapping_repository import resolve_mapping_file
 from .engine_loader import configure_engine_import_path, diagnose_manga_engine
 from .language_codes import stage_label, to_manga_lang
 from .runtime import MangaRuntime
@@ -115,7 +116,7 @@ class _LocalMangaImageTranslationProvider:
 
         # images.json 校验
         mapping_dir = Path(request.mapping_dir)
-        images_file = mapping_dir / "images.json"
+        images_file = resolve_mapping_file(mapping_dir, "images.json")
         if not images_file.exists():
             errors.append("缺少 images.json，请确认已正确导入 EPUB")
         else:
@@ -168,7 +169,7 @@ class _LocalMangaImageTranslationProvider:
         import json
 
         mapping_dir = Path(request.mapping_dir)
-        images_file = mapping_dir / "images.json"
+        images_file = resolve_mapping_file(mapping_dir, "images.json")
         try:
             images_data = json.loads(images_file.read_text(encoding="utf-8"))
         except Exception as exc:
@@ -302,7 +303,7 @@ class _LocalMangaImageTranslationProvider:
         """取消进行中的翻译，幂等。"""
         self._cancel_event.set()
 
-    def close(self) -> None:
+    def close(self, *, timeout_seconds: float | None = None) -> None:
         """释放资源，幂等。"""
         if self._closed:
             return
@@ -313,7 +314,9 @@ class _LocalMangaImageTranslationProvider:
         except Exception as exc:
             logger.warning("卸载 Manga 引擎失败: %s", exc)
         try:
-            self._runtime.shutdown()
+            self._runtime.shutdown(
+                timeout_seconds=10.0 if timeout_seconds is None else timeout_seconds
+            )
         except Exception as exc:
             logger.warning("关闭运行时失败: %s", exc)
 
@@ -592,5 +595,5 @@ class MangaImageTranslationProvider:
     def cancel(self) -> None:
         self._client.cancel()
 
-    def close(self) -> None:
-        self._client.close()
+    def close(self, *, timeout_seconds: float | None = None) -> None:
+        self._client.close(timeout_seconds=timeout_seconds)

@@ -531,9 +531,9 @@ class TestFailedIndicesRecovery:
             completed = _wait_for_completion(manager1, task1.task_id, timeout=5.0)
             assert completed is not None
             # 第 1 行应失败
-            assert 1 in completed.failed_indices, (
-                f"第 1 行应失败，实际 failed_indices={completed.failed_indices}"
-            )
+            assert (
+                1 in completed.failed_indices
+            ), f"第 1 行应失败，实际 failed_indices={completed.failed_indices}"
         finally:
             manager1.close()
         time.sleep(0.3)
@@ -545,9 +545,9 @@ class TestFailedIndicesRecovery:
             time.sleep(0.1)
             restored = manager2.get_task(task2.task_id)
             # 失败行索引应被恢复
-            assert 1 in restored.failed_indices, (
-                f"重启后应保留失败行索引 1，实际 failed_indices={restored.failed_indices}"
-            )
+            assert (
+                1 in restored.failed_indices
+            ), f"重启后应保留失败行索引 1，实际 failed_indices={restored.failed_indices}"
         finally:
             manager2.close()
 

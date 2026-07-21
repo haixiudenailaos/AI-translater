@@ -399,6 +399,7 @@ def test_api_retries_429_once_and_sends_system_message():
         assert len(client.requests) == 2
         assert client.requests[0]["messages"][0] == {"role": "system", "content": "翻译规则"}
         assert client.requests[0]["stream"] is True
+        assert "max_tokens" not in client.requests[0]
         assert metrics["retries"] == 1
         assert metrics["rate_limit_errors"] == 1
         assert metrics["successful_requests"] == 1
@@ -522,9 +523,9 @@ def test_run_context_constructed_once_not_per_batch():
     assert len(api.system_prompts) == 3
     # 运行上下文复用：所有批次的 system_prompt 应为同一对象
     first_prompt = api.system_prompts[0]
-    assert all(p is first_prompt for p in api.system_prompts), (
-        "system_prompt 在批次间未复用同一实例，说明运行上下文未被共享"
-    )
+    assert all(
+        p is first_prompt for p in api.system_prompts
+    ), "system_prompt 在批次间未复用同一实例，说明运行上下文未被共享"
 
 
 def test_run_context_temperature_and_versions_reused_across_batches():

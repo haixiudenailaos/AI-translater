@@ -45,7 +45,6 @@ class TranslationOptions:
         batch_size: 每批原文行数
         max_retries: 单批次最大重试次数
         temperature: 采样温度
-        max_tokens: 单次请求最大 token 数
     """
 
     target_language: str
@@ -53,7 +52,6 @@ class TranslationOptions:
     batch_size: int = 20
     max_retries: int = 5
     temperature: float = 0.3
-    max_tokens: int = 2048
 
 
 @dataclass(frozen=True)

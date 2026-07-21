@@ -132,3 +132,53 @@ class TestAtomicWriteUniqueTemp:
 
         assert target.read_text(encoding="utf-8") == "durable-content"
         assert fsync_calls, "原子写入必须调用 os.fsync 刷盘"
+
+    def test_posix_replace_syncs_parent_directory_after_rename(self, tmp_path):
+        """P2-7：POSIX replace 成功后必须同步父目录项。"""
+        from unittest.mock import patch
+
+        from src.infrastructure import atomic_file as atomic_mod
+
+        order: list[str] = []
+        source = tmp_path / "source.tmp"
+        target = tmp_path / "target.txt"
+
+        with (
+            patch.object(atomic_mod.os, "name", "posix"),
+            patch.object(
+                atomic_mod.os,
+                "replace",
+                side_effect=lambda _src, _dst: order.append("replace"),
+            ),
+            patch.object(
+                atomic_mod,
+                "_fsync_parent_directory",
+                side_effect=lambda _path: order.append("directory-fsync"),
+            ),
+        ):
+            atomic_mod._atomic_replace(source, target)
+
+        assert order == ["replace", "directory-fsync"]
+
+    def test_posix_directory_fsync_failure_propagates(self, tmp_path):
+        """目录 fsync 失败时不能把原子写入报告为成功。"""
+        from unittest.mock import patch
+
+        import pytest
+
+        from src.infrastructure import atomic_file as atomic_mod
+
+        source = tmp_path / "source.tmp"
+        target = tmp_path / "target.txt"
+
+        with (
+            patch.object(atomic_mod.os, "name", "posix"),
+            patch.object(atomic_mod.os, "replace"),
+            patch.object(
+                atomic_mod,
+                "_fsync_parent_directory",
+                side_effect=OSError("directory fsync failed"),
+            ),
+            pytest.raises(OSError, match="directory fsync failed"),
+        ):
+            atomic_mod._atomic_replace(source, target)

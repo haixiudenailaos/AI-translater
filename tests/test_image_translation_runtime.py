@@ -1,4 +1,5 @@
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from src.infrastructure.image_translation.engine_loader import (
     configure_engine_import_path,
     diagnose_manga_engine,
 )
+from src.infrastructure.image_translation.runtime import MangaRuntime
 from src.ui.image_translation_handler import ImageTranslationHandler
 
 
@@ -39,7 +41,41 @@ class EngineLoaderTests(unittest.TestCase):
         ):
             errors = diagnose_manga_engine()
 
-        self.assertTrue(any(sys.executable in error for error in errors))
+            self.assertTrue(any(sys.executable in error for error in errors))
+
+
+class MangaRuntimeShutdownTests(unittest.TestCase):
+    def test_shutdown_keeps_event_loop_open_while_thread_is_alive(self):
+        """超时后不能关闭仍由后台线程拥有的 event loop。"""
+
+        class _StoppedLoop:
+            def __init__(self):
+                self.close_called = False
+
+            def is_running(self):
+                return False
+
+            def close(self):
+                self.close_called = True
+
+        class _AliveThread:
+            def join(self, timeout=None):
+                self.timeout = timeout
+
+            def is_alive(self):
+                return True
+
+        runtime = MangaRuntime()
+        loop = _StoppedLoop()
+        thread = _AliveThread()
+        runtime._loop = loop
+        runtime._thread = thread
+        runtime._started = True
+
+        self.assertFalse(runtime.shutdown(timeout_seconds=0))
+        self.assertFalse(loop.close_called)
+        self.assertIs(runtime._loop, loop)
+        self.assertIs(runtime._thread, thread)
 
 
 class _FakeImageService:
@@ -65,7 +101,7 @@ class _FakeImageService:
     def cancel(self, provider_id):
         self.cancel_calls.append(provider_id)
 
-    def close_provider(self, provider_id):
+    def close_provider(self, provider_id, *, timeout_seconds=None):
         self.close_calls.append(provider_id)
 
 
@@ -98,6 +134,55 @@ class ImageHandlerLifecycleTests(unittest.TestCase):
             service.close_calls,
             list(ImageTranslationProviderId),
         )
+
+    def test_close_waits_for_cancelled_worker_before_releasing_providers(self):
+        """关闭必须先取消并等待 worker，避免与 Provider teardown 并发。"""
+
+        class _ClosingService(_FakeImageService):
+            def __init__(self):
+                super().__init__()
+                self.cancelled = threading.Event()
+                self.worker = None
+                self.worker_alive_when_closed = []
+
+            def cancel(self, provider_id):
+                super().cancel(provider_id)
+                self.cancelled.set()
+
+            def close_provider(self, provider_id, *, timeout_seconds=None):
+                self.worker_alive_when_closed.append(self.worker.is_alive())
+                super().close_provider(provider_id, timeout_seconds=timeout_seconds)
+
+        service = _ClosingService()
+        handler = self._make_handler(service)
+        worker = threading.Thread(target=lambda: service.cancelled.wait(), daemon=True)
+        service.worker = worker
+        handler._worker_thread = worker
+        worker.start()
+
+        handler.close(timeout_seconds=0.5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(service.close_calls, list(ImageTranslationProviderId))
+        self.assertEqual(service.worker_alive_when_closed, [False, False])
+
+    def test_close_does_not_release_provider_while_worker_is_still_running(self):
+        """超过 deadline 时保留资源，不能关闭仍被 worker 使用的 Provider。"""
+
+        service = _FakeImageService()
+        handler = self._make_handler(service)
+        release_worker = threading.Event()
+        worker = threading.Thread(target=release_worker.wait, daemon=True)
+        handler._worker_thread = worker
+        worker.start()
+
+        handler.close(timeout_seconds=0.01)
+
+        self.assertTrue(worker.is_alive())
+        self.assertEqual(service.close_calls, [])
+        release_worker.set()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
 
 
 if __name__ == "__main__":

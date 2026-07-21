@@ -145,7 +145,6 @@ class _MockConfigManager:
             "model_name": "deepseek-ai/DeepSeek-V3.2",
             "api_key": "sk-benchmark",
             "temperature": 0.3,
-            "max_tokens": 4000,
             "context_window_tokens": 32768,
         }
 

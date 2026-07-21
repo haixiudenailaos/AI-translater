@@ -33,19 +33,14 @@ python main.py
 
 ## 📦 预编译版本
 
-我们提供了两个分发的预编译版本，无需安装 Python 环境即可使用：
+当前 CI 只构建 **Text Edition**：包含 TXT/EPUB 文本翻译和在线图片翻译 Provider，不包含本地 Manga 推理依赖。
 
-- **Text Edition**：仅包含 TXT/EPUB 文本翻译，体积小、依赖少。
-- **Full Edition**：在 Text 基础上加入本地漫画图片翻译（manga-image-translator 深度学习栈）。
+- **Windows**: 单文件 `LightNovelTranslator-1.6-Windows-x64.exe`。
+- **macOS**: `LightNovelTranslator-1.6-macOS.app.zip`，解压后双击 `.app`。
 
-每个版本都是 **onedir 目录打包为 zip**（非单 exe），解压后运行目录内的可执行文件：
+Full Edition 仍保留 `translator.spec` 供本地构建，包含本地漫画图片翻译的深度学习栈；它尚未由 CI 发布。Text 产物会作为 V1.6 分支推送和 Pull Request 的 GitHub Actions artifact 保存 30 天。
 
-- **Windows**: `LightNovelTranslator-1.6-Windows-x64-Text.zip` / `...-Full.zip`
-- **macOS**: `LightNovelTranslator-1.6-macOS-Text.app.zip` / `...-Full.app.zip`（解压后双击 `.app`）
-
-> macOS 产物为当前架构（`macos-latest` runner），不是 Universal 二进制。
-
-从 [Releases](https://github.com/haixiudenailaos/AI-translater/releases) 页面下载对应平台与版本的 zip。
+> macOS 产物为当前 `macos-latest` runner 的架构，不是 Universal 二进制。
 
 ## 🔧 配置说明
 
@@ -64,7 +59,6 @@ python main.py
   "provider": "siliconflow",
   "model_name": "deepseek-ai/DeepSeek-V3.2",
   "base_url": "https://api.siliconflow.cn/v1",
-  "max_tokens": 8000,
   "temperature": 0.3
 }
 ```
@@ -127,7 +121,8 @@ LightNovelTranslator-V1.6/
 ### 本地构建
 
 ```bash
-# 安装 PyInstaller（固定版本，与 CI 一致）
+# 安装项目、开发工具和 PyInstaller（开发工具包含 Ruff、Pyright、pytest、build、pip-tools）
+pip install -e ".[dev]"
 pip install "pyinstaller==6.11.1"
 
 # 构建 Text Edition（仅文本翻译，体积小）
@@ -137,17 +132,19 @@ pyinstaller translator_text.spec --clean --noconfirm
 pyinstaller translator.spec --clean --noconfirm
 ```
 
-构建产物位于 `dist/LightNovelTranslatorV1.6-Text/` 与 `dist/LightNovelTranslatorV1.6/`（onedir 目录结构）。
+Text spec 生成单文件 `dist/LightNovelTranslatorV1.6[.exe]`；Full spec 生成 onedir 目录 `dist/LightNovelTranslatorV1.6/`。
+
+Windows Text 发布构建使用 Python 3.10 和 `requirements-text-win-py310.lock.txt`。修改发布依赖后，必须在对应平台与 Python 版本执行 `python tools/generate_dependency_locks.py <target>`，并提交更新后的 hash lock。
 
 ### 自动化构建
 
 项目配置了 GitHub Actions 自动化构建，支持：
 
-- ✅ 质量门禁（Ruff lint / format check / pytest）
-- ✅ 构建 Windows 与 macOS 的 Text / Full onedir 产物
-- ✅ 仅从版本 tag 发布 Release（V1.6 分支 push 不再复用固定 release tag）
+- ✅ Python 3.10-3.13 的 Ruff、格式、编译和 pytest 质量矩阵
+- ✅ Python 3.11 覆盖率报告、Pyright 迁移报告和 wheel 安装 smoke
+- ✅ Windows/macOS 的 Text Edition 构建与启动 smoke
 
-每次推送代码或创建 tag 时会自动触发构建。
+V1.6 分支推送、Pull Request 和手动触发都会执行工作流。Pyright 目前是迁移报告，待存量类型错误清零后升级为阻断门禁。
 
 ## 🤝 贡献指南
 

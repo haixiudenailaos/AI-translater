@@ -417,7 +417,7 @@ class TranslationProject:
         model_snap_raw = data.get("model_snapshot")
         translated_lines = list(data.get("translated_lines", []))  # type: ignore[arg-type]
         completed_raw = data.get("completed_indices")
-        if isinstance(completed_raw, (list, tuple, set)):
+        if isinstance(completed_raw, list | tuple | set):
             completed_indices = {int(index) for index in completed_raw}
         else:
             completed_indices = set(data.get("manually_edited_indices", []) or [])

@@ -23,6 +23,7 @@ from ...domain.image_translation import (
 )
 from ...domain.translation import OperationStatus
 from ...utils.logger import get_logger
+from ..mapping_repository import resolve_mapping_file
 
 logger = get_logger(__name__)
 
@@ -55,7 +56,7 @@ class VolcengineImageTranslationProvider:
         from pathlib import Path
 
         mapping_dir = Path(request.mapping_dir)
-        images_file = mapping_dir / "images.json"
+        images_file = resolve_mapping_file(mapping_dir, "images.json")
         if not images_file.exists():
             errors.append("缺少 images.json，请确认已正确导入 EPUB")
         else:
@@ -100,7 +101,9 @@ class VolcengineImageTranslationProvider:
                 import json
 
                 images_data = json.loads(
-                    (Path(request.mapping_dir) / "images.json").read_text(encoding="utf-8")
+                    resolve_mapping_file(request.mapping_dir, "images.json").read_text(
+                        encoding="utf-8"
+                    )
                 )
                 all_mappings = images_data.get("image_mappings", {})
                 selected = set(request.selected_images)
@@ -168,7 +171,7 @@ class VolcengineImageTranslationProvider:
         """取消进行中的翻译，幂等。"""
         self._cancel_event.set()
 
-    def close(self) -> None:
+    def close(self, *, timeout_seconds: float | None = None) -> None:
         """释放资源，幂等。"""
         if self._closed:
             return

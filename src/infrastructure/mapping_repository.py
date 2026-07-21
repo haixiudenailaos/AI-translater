@@ -17,6 +17,7 @@ import datetime
 import json
 from pathlib import Path
 from typing import Dict, List, Tuple
+from uuid import uuid4
 
 from ..utils.file_handler import write_json_atomic
 from ..utils.logger import get_logger
@@ -25,6 +26,180 @@ logger = get_logger(__name__)
 
 # 映射文件格式版本
 SCHEMA_VERSION = 1
+MAPPING_MANIFEST_FILENAME = "mapping_manifest.json"
+MAPPING_GENERATIONS_DIRNAME = ".mapping_generations"
+_MAPPING_FILENAMES = (
+    "content_mapping.json",
+    "images.json",
+    "format_info.json",
+)
+
+
+class MappingGenerationError(RuntimeError):
+    """Published mapping manifest is missing or points outside its generation root."""
+
+
+def _manifest_path(mapping_dir: Path) -> Path:
+    return Path(mapping_dir) / MAPPING_MANIFEST_FILENAME
+
+
+def _load_manifest(mapping_dir: Path) -> dict | None:
+    path = _manifest_path(mapping_dir)
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MappingGenerationError("映射 generation manifest 损坏，拒绝混合读取文件") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("files"), dict):
+        raise MappingGenerationError("映射 generation manifest 格式无效")
+    return raw
+
+
+def _resolve_generation_path(mapping_dir: Path, relative_path: str) -> Path:
+    root = Path(mapping_dir).resolve()
+    candidate = (root / relative_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise MappingGenerationError("映射 generation 文件逃逸出受控目录") from None
+    return candidate
+
+
+def resolve_mapping_file(mapping_dir: str | Path, filename: str) -> Path:
+    """Return the published generation file, falling back to legacy top-level JSON.
+
+    Once a manifest exists, missing or malformed generation members are a
+    recoverable error rather than permission to mix it with legacy files.
+    """
+    if filename not in _MAPPING_FILENAMES:
+        raise ValueError(f"不是受支持的映射文件: {filename}")
+    root = Path(mapping_dir)
+    manifest = _load_manifest(root)
+    if manifest is None:
+        return root / filename
+    relative_path = manifest["files"].get(filename)
+    if not isinstance(relative_path, str) or not relative_path:
+        raise MappingGenerationError(f"generation 缺少 {filename}")
+    path = _resolve_generation_path(root, relative_path)
+    if not path.is_file():
+        raise MappingGenerationError(f"已发布 generation 缺少 {filename}")
+    return path
+
+
+def _new_generation_directory(mapping_dir: Path) -> tuple[str, Path]:
+    generation = uuid4().hex
+    directory = mapping_dir / MAPPING_GENERATIONS_DIRNAME / generation
+    directory.mkdir(parents=True, exist_ok=False)
+    return generation, directory
+
+
+def _relative_generation_path(mapping_dir: Path, path: Path) -> str:
+    return path.relative_to(mapping_dir).as_posix()
+
+
+def _publish_manifest(mapping_dir: Path, generation: str, files: dict[str, str]) -> None:
+    write_json_atomic(
+        _manifest_path(mapping_dir),
+        {
+            "schema_version": SCHEMA_VERSION,
+            "generation": generation,
+            "published_at": datetime.datetime.now().isoformat(),
+            "files": files,
+        },
+    )
+
+
+def _write_legacy_compatibility_copy(path: Path, payload: dict) -> None:
+    """Best-effort copy for older integrations that still open top-level JSON.
+
+    The manifest is the commit point. A compatibility-copy failure must not
+    invalidate a successfully published generation or make new readers fall
+    back to potentially mixed files.
+    """
+    try:
+        write_json_atomic(path, payload)
+    except OSError as exc:
+        logger.warning("更新旧映射兼容副本失败（generation 已发布）: %s", exc)
+
+
+def publish_mapping_bundle(
+    mapping_dir: Path,
+    content_payload: dict,
+    images_payload: dict,
+    format_payload: dict,
+) -> dict[str, Path]:
+    """Write a complete EPUB mapping generation and atomically publish it.
+
+    All three members are durable before ``mapping_manifest.json`` is replaced.
+    Readers that observe the manifest therefore see either the previous full
+    generation or this full generation, never a partially written triple.
+    """
+    root = Path(mapping_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    generation, directory = _new_generation_directory(root)
+    payloads = {
+        "content_mapping.json": content_payload,
+        "images.json": images_payload,
+        "format_info.json": format_payload,
+    }
+    files: dict[str, str] = {}
+    paths: dict[str, Path] = {}
+    for filename, payload in payloads.items():
+        path = directory / filename
+        write_json_atomic(path, payload)
+        paths[filename] = path
+        files[filename] = _relative_generation_path(root, path)
+
+    _publish_manifest(root, generation, files)
+    for filename, payload in payloads.items():
+        _write_legacy_compatibility_copy(root / filename, payload)
+    return paths
+
+
+def publish_mapping_file_update(
+    mapping_dir: str | Path,
+    filename: str,
+    payload: dict,
+) -> Path:
+    """Publish one mapping member while retaining the other published members.
+
+    Legacy mapping directories have no manifest and continue to use their
+    top-level JSON file. Once a manifest exists, the new member is written to
+    its own durable generation directory before a replacement manifest makes
+    it visible. This prevents writers such as the image-asset migration from
+    updating only a legacy compatibility copy.
+    """
+    if filename not in _MAPPING_FILENAMES:
+        raise ValueError(f"Unsupported mapping filename: {filename}")
+
+    root = Path(mapping_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = _load_manifest(root)
+    if manifest is None:
+        path = root / filename
+        write_json_atomic(path, payload)
+        return path
+
+    # Validate every existing member before reusing its reference in a new
+    # manifest. This prevents an individual update from re-publishing a
+    # corrupt mixed generation.
+    files = dict(manifest["files"])
+    for existing_filename in _MAPPING_FILENAMES:
+        if existing_filename != filename:
+            resolve_mapping_file(root, existing_filename)
+    generation, directory = _new_generation_directory(root)
+    member_path = directory / filename
+    write_json_atomic(member_path, payload)
+    files[filename] = _relative_generation_path(root, member_path)
+    _publish_manifest(root, generation, files)
+    _write_legacy_compatibility_copy(root / filename, payload)
+    return member_path
+
+
+def _publish_content_update(mapping_dir: Path, content_payload: dict) -> Path:
+    """Publish a new content member while retaining the active image/format members."""
+    return publish_mapping_file_update(mapping_dir, "content_mapping.json", content_payload)
 
 
 def load_content_mapping(mapping_dir: str) -> Tuple[List[str], List[str]]:
@@ -36,7 +211,7 @@ def load_content_mapping(mapping_dir: str) -> Tuple[List[str], List[str]]:
     - 不依赖外部索引，只依赖内部 line_number 字段
     - 返回格式：([原文], [译文])
     """
-    md = Path(mapping_dir) / "content_mapping.json"
+    md = resolve_mapping_file(mapping_dir, "content_mapping.json")
     data = json.loads(md.read_text(encoding="utf-8"))
     items: Dict[str, Dict] = data.get("content_mappings", {})
 
@@ -78,7 +253,8 @@ def save_translations(mapping_dir: str, translated_lines: List[str]) -> None:
     - 自动更新 translated_at 时间戳
     - 未翻译的行保持空字符串
     """
-    md = Path(mapping_dir) / "content_mapping.json"
+    root = Path(mapping_dir)
+    md = resolve_mapping_file(root, "content_mapping.json")
     obj = json.loads(md.read_text(encoding="utf-8"))
     items = obj.get("content_mappings", {})
     now = datetime.datetime.now().isoformat()
@@ -94,7 +270,7 @@ def save_translations(mapping_dir: str, translated_lines: List[str]) -> None:
             items[key]["translated_at"] = now
 
     obj["project_info"]["updated_at"] = now
-    write_json_atomic(md, obj)
+    _publish_content_update(root, obj)
 
 
 def load_old_translations(mapping_dir: Path) -> Tuple[Dict, Dict, Dict]:
@@ -110,7 +286,7 @@ def load_old_translations(mapping_dir: Path) -> Tuple[Dict, Dict, Dict]:
     existing_by_locator: Dict[str, dict] = {}
     existing_by_chapter_seq: Dict[str, dict] = {}
 
-    content_file = mapping_dir / "content_mapping.json"
+    content_file = resolve_mapping_file(mapping_dir, "content_mapping.json")
     if not content_file.exists():
         return existing_translations, existing_by_locator, existing_by_chapter_seq
 
@@ -157,23 +333,20 @@ def save_content_mapping(
     content_mappings: Dict[str, Dict],
     project_info: Dict,
 ) -> None:
-    """保存 content_mapping.json（原子写入）。"""
-    content_file = mapping_dir / "content_mapping.json"
+    """Save content mappings through the active generation when present."""
     payload = {
         "project_info": project_info,
         "content_mappings": content_mappings,
     }
-    write_json_atomic(content_file, payload)
+    publish_mapping_file_update(mapping_dir, "content_mapping.json", payload)
 
 
 def save_images_mapping(mapping_dir: Path, images_mapping: Dict[str, Dict]) -> None:
-    """保存 images.json（原子写入）。"""
-    images_file = mapping_dir / "images.json"
+    """Save image mappings through the active generation when present."""
     payload = {"image_mappings": images_mapping}
-    write_json_atomic(images_file, payload)
+    publish_mapping_file_update(mapping_dir, "images.json", payload)
 
 
 def save_format_info(mapping_dir: Path, format_info: Dict) -> None:
-    """保存 format_info.json（原子写入）。"""
-    format_file = mapping_dir / "format_info.json"
-    write_json_atomic(format_file, format_info)
+    """Save format metadata through the active generation when present."""
+    publish_mapping_file_update(mapping_dir, "format_info.json", format_info)

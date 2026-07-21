@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 PyInstaller运行时钩子 - 资源路径修复
 BUG-001：路径解析已统一到 src/app_paths.py，此钩子仅保留最小兼容标记。
@@ -7,6 +6,7 @@ BUG-001：路径解析已统一到 src/app_paths.py，此钩子仅保留最小�
 
 import sys
 from pathlib import Path
+
 
 def setup_resource_paths() -> Path:
     """Return the bundled resource root without mutating process globals.

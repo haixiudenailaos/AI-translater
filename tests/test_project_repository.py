@@ -12,6 +12,7 @@
 - 保存失败不静默吞掉（UXF-003）
 """
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -139,7 +140,7 @@ class TestCreateAndLoad:
         assert repo.load("nonexistent-id") is None
 
     def test_load_corrupt_project_quarantines_instead_of_silently_overwriting(self, repo):
-        project_id = "corrupt-project"
+        project_id = "a" * 16
         original_path = repo.projects_dir / f"{project_id}.json"
         original_path.write_text("{not valid json", encoding="utf-8")
 
@@ -302,6 +303,116 @@ class TestCheckpoints:
 
         ckpts = repo.list_checkpoints(project.project_id)
         assert len(ckpts) <= MAX_CHECKPOINTS
+
+
+class TestPathAndConcurrencyBoundaries:
+    def test_untrusted_project_ids_cannot_escape_repository_root(self, repo):
+        outside = repo.projects_dir.parent / "outside.json"
+        outside.write_text("keep me", encoding="utf-8")
+        project_id = "b" * 16
+
+        assert repo.load("../outside") is None
+        assert repo.delete("../outside") is False
+        assert repo.list_checkpoints("../outside") == []
+        assert repo.restore_checkpoint(project_id, "../outside.json") is None
+        assert (
+            repo.restore_checkpoint(
+                project_id,
+                f"{project_id}.ckpt_20260720_120000/../outside.json",
+            )
+            is None
+        )
+
+        assert outside.read_text(encoding="utf-8") == "keep me"
+        assert not list(repo.projects_dir.glob("*.corrupt-*"))
+
+    def test_concurrent_saves_preserve_every_recent_project(self, repo):
+        projects = [
+            repo.create(
+                source_path=f"/tmp/concurrent-{index}.txt",
+                source_fingerprint=f"fingerprint-{index}",
+                file_type="txt",
+                mapping_dir="",
+                original_lines=[f"line-{index}"],
+            )
+            for index in range(16)
+        ]
+        start = threading.Event()
+        threads = [
+            threading.Thread(target=lambda project=project: (start.wait(), repo.save(project)))
+            for project in projects
+        ]
+        for thread in threads:
+            thread.start()
+        start.set()
+        for thread in threads:
+            thread.join(timeout=10.0)
+
+        assert all(not thread.is_alive() for thread in threads)
+        recent_ids = {entry["project_id"] for entry in repo.list_recent(limit=50)}
+        assert recent_ids == {project.project_id for project in projects}
+
+
+class TestRepositoryTransactions:
+    def test_save_rolls_back_project_when_recent_index_write_fails(self, repo, monkeypatch):
+        """recent index 失败不能让调用方看到保存成功或覆盖旧项目。"""
+        from src.infrastructure import project_repository as repository_module
+
+        project = repo.create(
+            source_path="/tmp/transaction-save.txt",
+            source_fingerprint="transaction-save",
+            file_type="txt",
+            mapping_dir="",
+            original_lines=["original"],
+        )
+        repo.save(project)
+        project.apply_translation(0, "new translation")
+
+        original_write = repository_module.write_json_atomic
+
+        def fail_recent_write(path, payload):
+            if path == repo.projects_dir / "recent_projects.json":
+                raise OSError("recent index is read-only")
+            return original_write(path, payload)
+
+        monkeypatch.setattr(repository_module, "write_json_atomic", fail_recent_write)
+
+        with pytest.raises(OSError, match="recent index"):
+            repo.save(project)
+
+        assert project.save_status == SaveStatus.UNSAVED
+        restored = repo.load(project.project_id)
+        assert restored is not None
+        assert restored.translated_lines == [""]
+        assert {entry["project_id"] for entry in repo.list_recent()} == {project.project_id}
+
+    def test_delete_rolls_back_files_when_recent_index_write_fails(self, repo, monkeypatch):
+        """删除事务失败后项目和 recent index 都必须保持原状。"""
+        from src.infrastructure import project_repository as repository_module
+
+        project = repo.create(
+            source_path="/tmp/transaction-delete.txt",
+            source_fingerprint="transaction-delete",
+            file_type="txt",
+            mapping_dir="",
+            original_lines=["original"],
+        )
+        repo.save(project)
+        repo.create_checkpoint(project, label="before-delete")
+
+        original_write = repository_module.write_json_atomic
+
+        def fail_recent_write(path, payload):
+            if path == repo.projects_dir / "recent_projects.json":
+                raise OSError("recent index is read-only")
+            return original_write(path, payload)
+
+        monkeypatch.setattr(repository_module, "write_json_atomic", fail_recent_write)
+
+        assert repo.delete(project.project_id) is False
+        assert repo.load(project.project_id) is not None
+        assert repo.list_checkpoints(project.project_id)
+        assert {entry["project_id"] for entry in repo.list_recent()} == {project.project_id}
 
 
 # ── 最近项目 ──────────────────────────────

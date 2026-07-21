@@ -39,6 +39,7 @@ from .image_rewriter import (
     rewrite_image_references,
     set_document_content,
 )
+from .mapping_repository import resolve_mapping_file
 from .segment_extractor import (
     BLOCK_TAGS,
     compute_source_checksum,
@@ -98,7 +99,7 @@ def export_epub(
         raise Exception("需要安装ebooklib和beautifulsoup4库来支持EPUB导出")
 
     mapping_dir_p = Path(mapping_dir)
-    content_file = mapping_dir_p / "content_mapping.json"
+    content_file = resolve_mapping_file(mapping_dir_p, "content_mapping.json")
     if not content_file.exists():
         raise Exception("缺少content_mapping.json，无法导出EPUB")
 
@@ -324,7 +325,7 @@ def _ensure_toc_link_ids(book, epub_module) -> None:
     def visit(items, path: tuple[int, ...] = ()) -> None:
         for index, item in enumerate(items):
             item_path = (*path, index)
-            if isinstance(item, (tuple, list)):
+            if isinstance(item, tuple | list):
                 if item:
                     visit((item[0],), (*item_path, 0))
                 if len(item) > 1:

@@ -7,6 +7,7 @@
 3. 显式参数优先级高于环境变量。
 """
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -83,6 +84,11 @@ class TestAppPathsEnvInjection:
 
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
+
+        # Windows 的生产默认值来自 APPDATA，而不是 Path.home()。显式替换
+        # 该平台变量，既不触碰真实用户目录，也验证实际的路径选择逻辑。
+        if os.name == "nt":
+            monkeypatch.setenv("APPDATA", str(fake_home / "AppData" / "Roaming"))
 
         with patch("src.app_paths.Path.home", return_value=fake_home):
             paths = AppPaths.create()

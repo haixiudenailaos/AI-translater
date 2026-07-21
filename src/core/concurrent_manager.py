@@ -200,7 +200,12 @@ class ConcurrentTranslationManager:
 
     # ── 任务添加与解析 ───────────────────────────────────
 
-    def add_task(self, file_path: str) -> TranslationTask:
+    def add_task(
+        self,
+        file_path: str,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> TranslationTask:
         """添加翻译任务：解析文件内容并注册到 Coordinator。"""
         from pathlib import Path
 
@@ -210,7 +215,10 @@ class ConcurrentTranslationManager:
 
         # 解析文件内容
         if file_type == "epub":
-            mapping_info = self._epub_processor.import_epub(file_path)
+            mapping_info = self._epub_processor.import_epub(
+                file_path,
+                cancel_requested=cancel_requested,
+            )
             mapping_dir = mapping_info["mapping_dir"]
             originals, translations = self._epub_processor.load_content_mapping(mapping_dir)
             source_lines = list(originals)

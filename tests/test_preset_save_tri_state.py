@@ -256,8 +256,9 @@ class TestPresetSaveIsolation:
         with open(api_config_file, encoding="utf-8") as f:
             disk_api_config = json.load(f)
         assert disk_api_config.get("model_name") == "main-model"
-        # 主密钥未被覆盖
-        assert store.stored["provider:siliconflow"] == "sk-main"
+        # 主密钥由当前配置的不透明版本引用定位，预设不得覆盖它。
+        main_secret_ref = disk_api_config["active_secret_ref"]
+        assert store.stored[main_secret_ref] == "sk-main"
         assert store.stored["preset:p1"] == "sk-preset"
 
 

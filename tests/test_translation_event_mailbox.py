@@ -291,9 +291,9 @@ def test_concurrent_publish_never_loses_terminal_events():
 
     # 每个 run 应该恰好有一个终结事件
     terminal_runs = [e.run_id for e in all_terminal if e.kind.is_terminal]
-    assert sorted(terminal_runs) == sorted(run_ids), (
-        f"终结事件丢失: 期望 {len(run_ids)} 个，实际 {len(terminal_runs)} 个"
-    )
+    assert sorted(terminal_runs) == sorted(
+        run_ids
+    ), f"终结事件丢失: 期望 {len(run_ids)} 个，实际 {len(terminal_runs)} 个"
 
 
 def test_concurrent_publish_from_same_run_keeps_one_stream_snapshot():

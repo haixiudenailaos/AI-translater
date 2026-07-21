@@ -19,6 +19,7 @@ from ..application.document_session import (
 from ..application.translation_document import TranslationDocument
 from ..core.epub_processor import EpubImportCancelled
 from ..domain.edition import EditionCapabilities, detect_edition_capabilities
+from ..infrastructure.mapping_repository import resolve_mapping_file
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 
 
@@ -571,7 +572,7 @@ class FileImporter:
         if widget is exclude_widget:
             return
         try:
-            if isinstance(widget, (ttk.Button, tk.Button, ttk.Combobox)):
+            if isinstance(widget, ttk.Button | tk.Button | ttk.Combobox):
                 self._disabled_control_states.append((widget, str(widget.cget("state"))))
                 widget.config(state=tk.DISABLED)
             for child in widget.winfo_children():
@@ -626,7 +627,7 @@ class FileImporter:
             return
 
         # 检查images.json是否有图片
-        images_file = self.current_mapping_dir / "images.json"
+        images_file = resolve_mapping_file(self.current_mapping_dir, "images.json")
         if not images_file.exists():
             return
 
@@ -642,6 +643,7 @@ class FileImporter:
         import json
 
         try:
+            images_file = resolve_mapping_file(self.current_mapping_dir, "images.json")
             images_data = json.loads(images_file.read_text(encoding="utf-8"))
             if not images_data.get("image_mappings"):
                 return

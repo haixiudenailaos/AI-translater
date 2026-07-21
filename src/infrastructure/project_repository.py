@@ -20,6 +20,9 @@
 import datetime
 import hashlib
 import json
+import re
+import threading
+import uuid
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -35,6 +38,7 @@ PROJECT_SCHEMA_VERSION = 2
 MAX_CHECKPOINTS = 5
 # 最近项目列表文件名
 RECENT_PROJECTS_FILE = "recent_projects.json"
+_PROJECT_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
 class ProjectCorruptError(RuntimeError):
@@ -93,8 +97,13 @@ class ProjectRepository:
         Args:
             projects_dir: 项目文件存放目录（通常为 data_dir/projects）
         """
-        self.projects_dir = Path(projects_dir)
+        self.projects_dir = Path(projects_dir).resolve()
         self.projects_dir.mkdir(parents=True, exist_ok=True)
+        # Project files and the recent index form one repository transaction.
+        # A single instance serializes their changes; process-wide durability is
+        # handled separately by the generation-recovery work.
+        self._transaction_lock = threading.RLock()
+        self._recent_lock = self._transaction_lock
 
     # ── 项目生命周期 ──────────────────────────────
 
@@ -142,7 +151,9 @@ class ProjectRepository:
 
     def load(self, project_id: str) -> TranslationProject | None:
         """Load a project, distinguishing absent and corrupted files."""
-        path = self._project_file(project_id)
+        path = self._project_file_or_none(project_id)
+        if path is None:
+            return None
         if not path.exists():
             return None
         try:
@@ -162,6 +173,9 @@ class ProjectRepository:
 
     def _quarantine_corrupt_project(self, path: Path) -> Path | None:
         """Move an unreadable project aside before any caller can recreate it."""
+        if not self._is_safe_direct_child(path):
+            logger.error("拒绝隔离项目根目录外的文件: %s", path)
+            return None
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         quarantined_path = path.with_name(f"{path.stem}.corrupt-{timestamp}{path.suffix}")
         try:
@@ -194,24 +208,28 @@ class ProjectRepository:
         return None
 
     def save(self, project: TranslationProject) -> None:
-        """原子保存项目状态（UXF-003：失败抛异常，不静默吞掉）。
+        """Save project and recent index as one compensating transaction.
 
-        保存成功后更新 last_saved_at 并标记为 SAVED。
-        保存失败时保持 UNSAVED 状态，由上层捕获异常并提示"重试保存"。
+        The project file is staged before replacing it. If the shared recent
+        index cannot be published, the previous file is restored and the
+        caller receives the original failure instead of a false success.
         """
-        project.last_saved_at = _now_iso()
-        project.mark_saved()
-        path = self._project_file(project.project_id)
-        payload = project.to_dict()
-        # write_json_atomic 失败会抛异常，不吞掉
-        try:
-            write_json_atomic(path, payload)
-        except Exception:
-            # 写入失败：回退为未保存状态
-            project.mark_unsaved()
-            raise
-        # 更新最近项目列表
-        self._touch_recent(project)
+        with self._transaction_lock:
+            path = self._project_file(project.project_id)
+            previous_saved_at = project.last_saved_at
+            backup_path = self._stage_existing_file(path, "save-backup")
+            try:
+                project.last_saved_at = _now_iso()
+                project.mark_saved()
+                write_json_atomic(path, project.to_dict())
+                self._touch_recent(project)
+            except Exception:
+                project.last_saved_at = previous_saved_at
+                project.mark_unsaved()
+                self._restore_staged_file(path, backup_path)
+                raise
+            else:
+                self._discard_staged_file(backup_path)
 
     # ── 检查点（UXF-001：覆盖前创建检查点，允许撤销） ──
 
@@ -228,7 +246,9 @@ class ProjectRepository:
             name += f"_{safe_label}"
         name += ".json"
 
-        path = self.projects_dir / name
+        path = self._checkpoint_file(project.project_id, name)
+        if path is None:
+            raise ValueError(f"非法项目 ID 或检查点名称: {project.project_id!r}")
         payload = project.to_dict()
         payload["checkpoint_label"] = label
         payload["checkpoint_created_at"] = _now_iso()
@@ -245,9 +265,14 @@ class ProjectRepository:
         Returns:
             [(文件名, 创建时间), ...] 按时间倒序
         """
+        if not self._is_valid_project_id(project_id):
+            return []
         prefix = f"{project_id}.ckpt_"
         results: List[Tuple[str, str]] = []
         for p in self.projects_dir.glob(f"{prefix}*.json"):
+            if not self._is_safe_direct_child(p):
+                logger.warning("忽略项目根目录外的检查点链接: %s", p)
+                continue
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
                 created = str(data.get("checkpoint_created_at", ""))
@@ -261,8 +286,8 @@ class ProjectRepository:
         self, project_id: str, checkpoint_name: str
     ) -> TranslationProject | None:
         """从检查点恢复项目状态。"""
-        path = self.projects_dir / checkpoint_name
-        if not path.exists() or not checkpoint_name.startswith(f"{project_id}.ckpt_"):
+        path = self._checkpoint_file(project_id, checkpoint_name)
+        if path is None or not path.exists():
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -273,9 +298,15 @@ class ProjectRepository:
 
     def _prune_checkpoints(self, project_id: str) -> None:
         """删除超出 MAX_CHECKPOINTS 的旧检查点。"""
+        if not self._is_valid_project_id(project_id):
+            return
         prefix = f"{project_id}.ckpt_"
         checkpoints = sorted(
-            self.projects_dir.glob(f"{prefix}*.json"),
+            (
+                path
+                for path in self.projects_dir.glob(f"{prefix}*.json")
+                if self._is_safe_direct_child(path)
+            ),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -289,97 +320,191 @@ class ProjectRepository:
 
     def list_recent(self, limit: int = 20) -> List[Dict[str, object]]:
         """列出最近打开的项目摘要，按 last_opened_at 倒序。"""
-        recent_file = self.projects_dir / RECENT_PROJECTS_FILE
-        if not recent_file.exists():
-            return []
-        try:
-            data = json.loads(recent_file.read_text(encoding="utf-8"))
-            entries = data.get("projects", []) if isinstance(data, dict) else []
-            # 过滤掉已不存在的项目文件
-            valid = []
-            for entry in entries:
-                pid = str(entry.get("project_id", ""))
-                if pid and self._project_file(pid).exists():
-                    valid.append(entry)
-            valid.sort(key=lambda x: str(x.get("last_opened_at", "")), reverse=True)
-            return valid[:limit]
-        except Exception as e:
-            logger.warning("读取最近项目列表失败: %s", e)
-            return []
+        with self._recent_lock:
+            try:
+                recent_file = self._recent_file()
+                if not recent_file.exists():
+                    return []
+                data = json.loads(recent_file.read_text(encoding="utf-8"))
+                entries = data.get("projects", []) if isinstance(data, dict) else []
+                # 过滤掉已不存在或 ID 非法的项目文件。
+                valid = []
+                for entry in entries:
+                    pid = str(entry.get("project_id", ""))
+                    project_file = self._project_file_or_none(pid)
+                    if project_file is not None and project_file.exists():
+                        valid.append(entry)
+                valid.sort(key=lambda x: str(x.get("last_opened_at", "")), reverse=True)
+                return valid[:limit]
+            except Exception as e:
+                logger.warning("读取最近项目列表失败: %s", e)
+                return []
 
     def _touch_recent(self, project: TranslationProject) -> None:
         """更新最近项目列表。"""
-        recent_file = self.projects_dir / RECENT_PROJECTS_FILE
-        entries: List[Dict[str, object]] = []
-        if recent_file.exists():
-            try:
+        if not self._is_valid_project_id(project.project_id):
+            raise ValueError(f"非法项目 ID: {project.project_id!r}")
+        with self._recent_lock:
+            recent_file = self._recent_file()
+            entries: List[Dict[str, object]] = []
+            if recent_file.exists():
                 data = json.loads(recent_file.read_text(encoding="utf-8"))
                 entries = list(data.get("projects", [])) if isinstance(data, dict) else []
-            except Exception:
-                entries = []
 
-        # 移除同 ID 旧条目
-        entries = [e for e in entries if e.get("project_id") != project.project_id]
+            # 移除同 ID 旧条目
+            entries = [e for e in entries if e.get("project_id") != project.project_id]
 
-        entries.append(
-            {
-                "project_id": project.project_id,
-                "source_path": project.source_path,
-                "file_type": project.file_type,
-                "status": project.status.value,
-                "total_lines": project.total_lines,
-                "translated_count": project.translated_count,
-                "failed_count": project.failed_count,
-                "last_opened_at": project.last_opened_at,
-                "last_saved_at": project.last_saved_at,
-            }
-        )
+            entries.append(
+                {
+                    "project_id": project.project_id,
+                    "source_path": project.source_path,
+                    "file_type": project.file_type,
+                    "status": project.status.value,
+                    "total_lines": project.total_lines,
+                    "translated_count": project.translated_count,
+                    "failed_count": project.failed_count,
+                    "last_opened_at": project.last_opened_at,
+                    "last_saved_at": project.last_saved_at,
+                }
+            )
 
-        # 只保留最近 50 条
-        entries.sort(key=lambda x: str(x.get("last_opened_at", "")), reverse=True)
-        entries = entries[:50]
+            # 只保留最近 50 条
+            entries.sort(key=lambda x: str(x.get("last_opened_at", "")), reverse=True)
+            entries = entries[:50]
 
-        try:
             write_json_atomic(recent_file, {"projects": entries})
-        except Exception as e:
-            logger.warning("更新最近项目列表失败: %s", e)
 
     # ── 删除 ──────────────────────────────
 
     def delete(self, project_id: str) -> bool:
-        """删除项目及其所有检查点。"""
-        deleted = False
-        path = self._project_file(project_id)
-        if path.exists():
-            try:
-                path.unlink()
-                deleted = True
-            except Exception as e:
-                logger.warning("删除项目文件失败 %s: %s", path, e)
+        """Delete a project and its index entry without silent partial failure."""
+        if not self._is_valid_project_id(project_id):
+            return False
+        with self._transaction_lock:
+            path = self._project_file(project_id)
+            if not path.exists():
+                return False
 
-        # 删除检查点
-        for ckpt in self.projects_dir.glob(f"{project_id}.ckpt_*.json"):
+            paths = [path]
+            paths.extend(
+                checkpoint
+                for checkpoint in self.projects_dir.glob(f"{project_id}.ckpt_*.json")
+                if self._is_safe_direct_child(checkpoint)
+            )
+            staged: list[tuple[Path, Path]] = []
             try:
-                ckpt.unlink()
-            except Exception:
-                pass
+                for item in paths:
+                    staged_path = self._stage_existing_file(item, "delete")
+                    if staged_path is not None:
+                        staged.append((item, staged_path))
+                self._remove_recent(project_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("删除项目 %s 的事务失败: %s", project_id, exc)
+                for original, staged_path in reversed(staged):
+                    self._restore_staged_file(original, staged_path)
+                return False
 
-        # 从最近列表移除
-        recent_file = self.projects_dir / RECENT_PROJECTS_FILE
-        if recent_file.exists():
-            try:
-                data = json.loads(recent_file.read_text(encoding="utf-8"))
-                entries = [e for e in data.get("projects", []) if e.get("project_id") != project_id]
-                write_json_atomic(recent_file, {"projects": entries})
-            except Exception:
-                pass
+            for _, staged_path in staged:
+                self._discard_staged_file(staged_path)
+            return True
 
-        return deleted
+    def _remove_recent(self, project_id: str) -> None:
+        """Remove an entry while the repository transaction lock is held."""
+        recent_file = self._recent_file()
+        if not recent_file.exists():
+            return
+        data = json.loads(recent_file.read_text(encoding="utf-8"))
+        entries = data.get("projects", []) if isinstance(data, dict) else []
+        if not isinstance(entries, list):
+            raise ValueError("recent_projects.json projects 字段必须为列表")
+        filtered = [entry for entry in entries if entry.get("project_id") != project_id]
+        write_json_atomic(recent_file, {"projects": filtered})
+
+    def _stage_existing_file(self, path: Path, operation: str) -> Path | None:
+        """Move an existing direct child aside for a compensating transaction."""
+        if not path.exists():
+            return None
+        if not self._is_safe_direct_child(path):
+            raise ValueError(f"拒绝暂存项目根目录外的文件: {path}")
+        staged_path = path.with_name(f".{path.name}.{operation}-{uuid.uuid4().hex}.staged")
+        path.replace(staged_path)
+        return staged_path
+
+    @staticmethod
+    def _restore_staged_file(path: Path, staged_path: Path | None) -> None:
+        """Restore an old file, or remove a newly written file with no backup."""
+        try:
+            if staged_path is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.unlink(missing_ok=True)
+                staged_path.replace(path)
+        except OSError as exc:
+            logger.error("恢复项目事务文件失败 %s: %s", path, exc)
+
+    @staticmethod
+    def _discard_staged_file(staged_path: Path | None) -> None:
+        if staged_path is None:
+            return
+        try:
+            staged_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("清理项目事务暂存文件失败 %s: %s", staged_path, exc)
 
     # ── 内部工具 ──────────────────────────────
 
     def _project_file(self, project_id: str) -> Path:
-        return self.projects_dir / f"{project_id}.json"
+        if not self._is_valid_project_id(project_id):
+            raise ValueError(f"非法项目 ID: {project_id!r}")
+        return self._safe_direct_child(f"{project_id}.json")
+
+    @staticmethod
+    def _is_valid_project_id(project_id: str) -> bool:
+        return isinstance(project_id, str) and _PROJECT_ID_PATTERN.fullmatch(project_id) is not None
+
+    def _project_file_or_none(self, project_id: str) -> Path | None:
+        if not self._is_valid_project_id(project_id):
+            return None
+        try:
+            return self._project_file(project_id)
+        except ValueError:
+            return None
+
+    def _checkpoint_file(self, project_id: str, checkpoint_name: str) -> Path | None:
+        if not self._is_valid_project_id(project_id):
+            return None
+        if not isinstance(checkpoint_name, str):
+            return None
+        prefix = f"{project_id}.ckpt_"
+        if (
+            not checkpoint_name.startswith(prefix)
+            or not checkpoint_name.endswith(".json")
+            or "/" in checkpoint_name
+            or "\\" in checkpoint_name
+            or ":" in checkpoint_name
+        ):
+            return None
+        try:
+            return self._safe_direct_child(checkpoint_name)
+        except ValueError:
+            return None
+
+    def _recent_file(self) -> Path:
+        return self._safe_direct_child(RECENT_PROJECTS_FILE)
+
+    def _safe_direct_child(self, name: str) -> Path:
+        if not name or Path(name).name != name:
+            raise ValueError(f"非法项目文件名: {name!r}")
+        path = (self.projects_dir / name).resolve()
+        if path.parent != self.projects_dir:
+            raise ValueError(f"项目文件越出根目录: {name!r}")
+        return path
+
+    def _is_safe_direct_child(self, path: Path) -> bool:
+        try:
+            return Path(path).resolve().parent == self.projects_dir
+        except OSError:
+            return False
 
 
 def _now_iso() -> str:

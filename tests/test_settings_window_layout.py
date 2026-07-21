@@ -52,14 +52,14 @@ class _DialogWindow:
 
 
 class SettingsWindowLayoutTests(unittest.TestCase):
-    def test_window_is_compact_and_centered(self):
+    def test_window_uses_expanded_default_size_and_is_centered(self):
         dialog = SettingsWindow.__new__(SettingsWindow)
         dialog.window = _GeometryWindow(1920, 1080)
 
         dialog.center_window()
 
-        self.assertEqual(dialog.window.geometry_value, "600x560+660+260")
-        # P2-3：大屏 minsize 等于默认 WINDOW_WIDTH/WINDOW_HEIGHT
+        self.assertEqual(dialog.window.geometry_value, "960x840+480+120")
+        # 默认打开尺寸增大，但用户仍可缩小到原有可用尺寸。
         self.assertEqual(dialog.window.minsize_value, (600, 560))
 
     def test_window_keeps_a_margin_on_a_small_screen(self):
@@ -80,13 +80,23 @@ class SettingsWindowLayoutTests(unittest.TestCase):
         # 640 - 32*2 = 576；480 - 32*2 = 416
         self.assertEqual(dialog.window.minsize_value, (576, 416))
 
-    def test_minsize_never_exceeds_default_on_large_screen(self):
-        """P2-3：大屏上 minsize 等于默认 600x560，不会被放大。"""
+    def test_minsize_does_not_grow_with_default_size_on_large_screen(self):
+        """大屏默认展示更多内容，但不会把可缩放下限同步放大。"""
         dialog = SettingsWindow.__new__(SettingsWindow)
         dialog.window = _GeometryWindow(3840, 2160)
 
         dialog.center_window()
 
+        self.assertEqual(dialog.window.minsize_value, (600, 560))
+
+    def test_default_height_uses_available_space_on_short_screen(self):
+        """常见小尺寸笔记本上尽量使用高度，同时保留四周安全边距。"""
+        dialog = SettingsWindow.__new__(SettingsWindow)
+        dialog.window = _GeometryWindow(1366, 768)
+
+        dialog.center_window()
+
+        self.assertEqual(dialog.window.geometry_value, "960x704+203+32")
         self.assertEqual(dialog.window.minsize_value, (600, 560))
 
     def test_confirm_button_saves_and_action_bar_is_reserved_at_bottom(self):

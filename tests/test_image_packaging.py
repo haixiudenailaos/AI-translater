@@ -110,16 +110,16 @@ class TestTextEditionSpec:
         """PERF §11.3：Text Edition 不声明 Manga 引擎 hiddenimports"""
         spec_text = (PROJECT_ROOT / "translator_text.spec").read_text(encoding="utf-8")
         # manga_provider 不应出现在 Text Edition 的 hiddenimports 中
-        assert "manga_provider" not in spec_text, (
-            "Text Edition 不应包含 manga_provider hiddenimport"
-        )
+        assert (
+            "manga_provider" not in spec_text
+        ), "Text Edition 不应包含 manga_provider hiddenimport"
 
     def test_text_spec_no_third_party_pathex(self):
         """PERF §11.3：Text Edition 不需要 third_party 路径（无 Manga 源码）"""
         spec_text = (PROJECT_ROOT / "translator_text.spec").read_text(encoding="utf-8")
-        assert "manga-image-translator" not in spec_text, (
-            "Text Edition 不应引用 third_party/manga-image-translator"
-        )
+        assert (
+            "manga-image-translator" not in spec_text
+        ), "Text Edition 不应引用 third_party/manga-image-translator"
 
     def test_text_spec_includes_text_translation_modules(self):
         """PERF §11.3：Text Edition 包含文本翻译性能修复新增模块"""
@@ -136,40 +136,44 @@ class TestTextEditionSpec:
             assert module in spec_text, f"Text Edition 未声明 {module}"
 
 
-class TestOnedirFormat:
-    """PERF §11.3：验证两个 spec 都使用 onedir 格式。
+class TestPackageFormats:
+    """发布契约：Full 使用 onedir，Text 使用单文件产物。"""
 
-    onedir 避免单文件启动时解包到临时目录的开销。
-    """
+    @pytest.fixture(
+        params=[
+            ("translator.spec", "onedir"),
+            ("translator_text.spec", "onefile"),
+        ]
+    )
+    def spec_contract(self, request):
+        spec_name, package_format = request.param
+        path = PROJECT_ROOT / spec_name
+        assert path.exists(), f"{spec_name} 不存在"
+        return path, package_format
 
-    @pytest.fixture(params=["translator.spec", "translator_text.spec"])
-    def spec_path(self, request):
-        path = PROJECT_ROOT / request.param
-        assert path.exists(), f"{request.param} 不存在"
-        return path
-
-    def test_spec_uses_onedir_exclude_binaries(self, spec_path):
-        """PERF §11.3：EXE 必须设置 exclude_binaries=True（onedir 标志）"""
+    def test_spec_declares_its_distribution_format(self, spec_contract):
+        spec_path, package_format = spec_contract
         spec_text = spec_path.read_text(encoding="utf-8")
-        assert "exclude_binaries=True" in spec_text, (
-            f"{spec_path.name} 未使用 exclude_binaries=True，不是 onedir 格式"
-        )
 
-    def test_spec_uses_collect(self, spec_path):
-        """PERF §11.3：spec 必须包含 COLLECT 段（onedir 目录收集）"""
-        spec_text = spec_path.read_text(encoding="utf-8")
-        assert "COLLECT(" in spec_text, f"{spec_path.name} 未声明 COLLECT，不是 onedir 格式"
+        if package_format == "onedir":
+            assert "exclude_binaries=True" in spec_text
+            assert "COLLECT(" in spec_text
+        else:
+            assert "exclude_binaries=True" not in spec_text
+            assert "COLLECT(" not in spec_text
 
-    def test_spec_no_src_data_duplicate(self, spec_path):
+    def test_spec_no_src_data_duplicate(self, spec_contract):
         """PERF §11.3：src 不作为重复 data 打包（由 Analysis/PYZ 收集）"""
+        spec_path, _ = spec_contract
         spec_text = spec_path.read_text(encoding="utf-8")
         # 不应出现 ('src', 'src') 形式的 data 声明
-        assert "('src', 'src')" not in spec_text, (
-            f"{spec_path.name} 仍将 src 作为 data 打包，与 PYZ 模块重复"
-        )
+        assert (
+            "('src', 'src')" not in spec_text
+        ), f"{spec_path.name} 仍将 src 作为 data 打包，与 PYZ 模块重复"
 
-    def test_spec_upx_disabled(self, spec_path):
+    def test_spec_upx_disabled(self, spec_contract):
         """PERF §11.3：UPX 默认关闭，实测后再决定是否启用"""
+        spec_path, _ = spec_contract
         spec_text = spec_path.read_text(encoding="utf-8")
         # EXE 段的 upx 应为 False
         assert "upx=False" in spec_text, f"{spec_path.name} 未关闭 UPX"
@@ -195,7 +199,8 @@ class TestPyInstallerHook:
         assert len(hook_module.datas) > 0
         for src, dst in hook_module.datas:
             assert isinstance(src, str) and isinstance(dst, str)
-            assert src.startswith("manga_translator/")
+            assert Path(src).is_file(), f"hook data 源文件不存在: {src}"
+            assert dst.startswith("manga_translator/")
 
     def test_hook_declares_hiddenimports(self, hook_module):
         """hook 应声明核心 manga_translator 子模块的 hiddenimports。"""
@@ -250,9 +255,9 @@ class TestRequirementsLock:
         """numpy 必须锁定 <2.0 以避免与 torch/opencv ABI 冲突。"""
         numpy_lines = [line for line in requirements_lines if "numpy" in line]
         assert numpy_lines, "未声明 numpy 依赖"
-        assert any("<2.0" in line or "==1." in line for line in numpy_lines), (
-            "numpy 必须锁定 <2.0（或 pin 到 1.x 版本），避免 ABI 冲突"
-        )
+        assert any(
+            "<2.0" in line or "==1." in line for line in numpy_lines
+        ), "numpy 必须锁定 <2.0（或 pin 到 1.x 版本），避免 ABI 冲突"
 
     def test_all_lines_valid_pin_format(self, requirements_lines):
         """所有依赖行格式合法（包名>=版本 或 包名>=版本,<上限）。

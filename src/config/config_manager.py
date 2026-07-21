@@ -4,11 +4,13 @@
 负责API密钥、术语库等配置的本地存储和管理
 """
 
+import copy
 import hashlib
 import hmac
 import json
 import os
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict
 
@@ -28,10 +30,8 @@ from .translation_profile import (
     DEFAULT_QUEUE_TPM_LIMIT,
     DEFAULT_QUEUE_TRANSLATION_BATCH_LINES,
     DEFAULT_QUEUE_TRANSLATION_CONCURRENCY,
-    DEFAULT_QUEUE_TRANSLATION_INPUT_TOKENS,
     DEFAULT_TRANSLATION_BATCH_LINES,
     DEFAULT_TRANSLATION_CONCURRENCY,
-    DEFAULT_TRANSLATION_INPUT_TOKENS,
     OPENAI_COMPATIBLE_PROVIDER,
     SILICONFLOW_DEEPSEEK_V32_MODEL,
     apply_text_translation_profile,
@@ -48,6 +48,8 @@ DEFAULT_PROMPT_SCHEMA_VERSION = 2
 _LEGACY_DEFAULT_PROMPT_HASHES = {
     "de50a67353d835b344f651912300ae93015f4b2f14d2f600e4712d4c6e475f2d",
 }
+_ACTIVE_SECRET_REF_KEY = "active_secret_ref"
+_PROVIDER_SECRET_REFS_KEY = "provider_secret_refs"
 
 
 class ConfigManager:
@@ -73,7 +75,6 @@ class ConfigManager:
             "provider": "siliconflow",
             "model_name": SILICONFLOW_DEEPSEEK_V32_MODEL,
             "base_url": "https://api.siliconflow.cn/v1",
-            "max_tokens": 8000,
             "temperature": 0.3,
             "context_window_tokens": 32768,
             "api_max_attempts": 3,
@@ -111,10 +112,8 @@ class ConfigManager:
             },
             "batch_max_input_characters": 8000,
             "batch_lines": DEFAULT_TRANSLATION_BATCH_LINES,
-            "batch_max_input_tokens": DEFAULT_TRANSLATION_INPUT_TOKENS,
             "translation_concurrency": DEFAULT_TRANSLATION_CONCURRENCY,
             "queue_batch_lines": DEFAULT_QUEUE_TRANSLATION_BATCH_LINES,
-            "queue_batch_max_input_tokens": DEFAULT_QUEUE_TRANSLATION_INPUT_TOKENS,
             "queue_translation_concurrency": DEFAULT_QUEUE_TRANSLATION_CONCURRENCY,
             # 队列翻译并发优化阶段 1（QUEUE_TRANSLATION_CONCURRENCY_OPTIMIZATION_PLAN.md §3）：
             # 全局公平调度器策略参数。详细说明见 translation_profile.py。
@@ -128,6 +127,7 @@ class ConfigManager:
             "ui_font_size": 10,
             "ui_font_family": "TkDefaultFont",
             "recent_files": [],
+            "window_state": {},
             "onboarding": {
                 "schema_version": 1,
                 "status": "not_started",
@@ -141,8 +141,13 @@ class ConfigManager:
 
         # Load non-sensitive API metadata synchronously. Accessing the Windows
         # credential backend is deferred until a caller actually needs the key.
-        self._api_key_lock = threading.Lock()
+        # API 运行时配置、已加载密钥和 provider marker 必须作为同一快照
+        # 读写。保存路径会重入读取/规范化逻辑，因此使用 RLock。
+        self._api_key_lock = threading.RLock()
+        self._app_config_lock = threading.RLock()
+        self._glossary_lock = threading.RLock()
         self._api_key_provider = None
+        self._api_key_reference = None
         self.api_config = self.load_api_config(load_secret=False)
         self.app_config = self.load_app_config()
         self.glossary = self.load_glossary()
@@ -168,6 +173,44 @@ class ConfigManager:
         self._secret_store = KeyringSecretStore()
         return self._secret_store
 
+    @staticmethod
+    def _legacy_secret_reference(provider: str) -> str:
+        """Return the pre-versioning key name used by existing installations."""
+        return f"provider:{provider}"
+
+    @classmethod
+    def _secret_reference_for_config(cls, config: Dict[str, Any]) -> str:
+        """Return the active opaque secret reference or the legacy fallback."""
+        reference = config.get(_ACTIVE_SECRET_REF_KEY)
+        if isinstance(reference, str) and reference:
+            return reference
+
+        provider = str(config.get("provider", "siliconflow"))
+        references = config.get(_PROVIDER_SECRET_REFS_KEY)
+        if isinstance(references, dict):
+            provider_reference = references.get(provider)
+            if isinstance(provider_reference, str) and provider_reference:
+                return provider_reference
+        return cls._legacy_secret_reference(provider)
+
+    @classmethod
+    def _secret_reference_for_provider(cls, config: Dict[str, Any], provider: str) -> str:
+        """Return a saved provider reference without exposing the secret itself."""
+        if config.get("provider") == provider:
+            return cls._secret_reference_for_config(config)
+
+        references = config.get(_PROVIDER_SECRET_REFS_KEY)
+        if isinstance(references, dict):
+            reference = references.get(provider)
+            if isinstance(reference, str) and reference:
+                return reference
+        return cls._legacy_secret_reference(provider)
+
+    @staticmethod
+    def _new_secret_reference(provider: str) -> str:
+        """Create a write-once secret key for a metadata generation."""
+        return f"provider:{provider}:v{uuid.uuid4().hex}"
+
     def load_api_config(self, *, load_secret: bool = True) -> Dict[str, Any]:
         """加载API配置（BUG-009：API Key 从密钥环读取，不持久化到 JSON）"""
         try:
@@ -177,16 +220,18 @@ class ConfigManager:
 
                 # BUG-009：迁移旧明文密钥到密钥环
                 config = self._migrate_plaintext_keys(config)
+                # 旧版本允许用户设置 max_tokens；当前版本交由模型/provider 决定。
+                config.pop("max_tokens", None)
 
                 # 合并默认配置
                 merged_config = self.default_api_config.copy()
                 merged_config.update(config)
 
                 # 从密钥环读取当前提供商的密钥，注入到运行时配置（不写回 JSON）
-                provider = merged_config.get("provider", "siliconflow")
+                secret_reference = self._secret_reference_for_config(merged_config)
                 # P1-4：通过注入的 SecretStore 读取，不调用全局 get_key
                 merged_config["api_key"] = (
-                    self._get_secret_store().retrieve(f"provider:{provider}") if load_secret else ""
+                    self._get_secret_store().retrieve(secret_reference) if load_secret else ""
                 )
 
                 merged_config = apply_text_translation_profile(merged_config)
@@ -204,24 +249,41 @@ class ConfigManager:
 
         # 即使配置文件不存在，也尝试从密钥环读取默认提供商的密钥
         result = self.default_api_config.copy()
-        provider = result.get("provider", "siliconflow")
+        secret_reference = self._secret_reference_for_config(result)
         # P1-4：通过注入的 SecretStore 读取
         result["api_key"] = (
-            self._get_secret_store().retrieve(f"provider:{provider}") if load_secret else ""
+            self._get_secret_store().retrieve(secret_reference) if load_secret else ""
         )
         return apply_text_translation_profile(result)
 
     def _ensure_api_key_loaded(self) -> None:
-        provider = self.api_config.get("provider", "siliconflow")
-        if self._api_key_provider == provider:
-            return
-        with self._api_key_lock:
-            if self._api_key_provider != provider:
-                # P1-4：通过注入的 SecretStore 读取
-                self.api_config["api_key"] = self._get_secret_store().retrieve(
-                    f"provider:{provider}"
-                )
+        """Lazily load a key without holding the state lock during keyring I/O."""
+        while True:
+            with self._api_key_lock:
+                config = self.api_config
+                provider = str(config.get("provider", "siliconflow"))
+                reference = self._secret_reference_for_config(config)
+                if self._api_key_reference == reference:
+                    return
+                # Compatibility for tests and callers that injected a complete
+                # legacy in-memory snapshot before versioned refs existed.
+                if self._api_key_provider == provider and config.get("api_key"):
+                    self._api_key_reference = reference
+                    return
+
+            key = self._get_secret_store().retrieve(reference)
+
+            with self._api_key_lock:
+                if self._secret_reference_for_config(self.api_config) != reference:
+                    # A writer published a newer generation while keyring I/O
+                    # was in flight; retry against the new immutable snapshot.
+                    continue
+                updated = copy.deepcopy(self.api_config)
+                updated["api_key"] = key
+                self.api_config = updated
                 self._api_key_provider = provider
+                self._api_key_reference = reference
+                return
 
     def _migrate_plaintext_keys(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """BUG-009 / R2-BUG-002：将旧版本 JSON 中的明文密钥迁移到密钥环，并从配置中删除密钥字段。
@@ -308,19 +370,23 @@ class ConfigManager:
         return config
 
     def save_api_config(self, config: Dict[str, Any]) -> SecretSaveResult:
-        """保存API配置（P1-2：返回 SecretSaveResult，区分密钥持久化状态）
+        """事务式保存并原子发布 API 运行时快照。"""
+        with self._api_key_lock:
+            return self._save_api_config_locked(config)
 
-        BUG-009：API Key 存入密钥环，JSON 不含密钥。
-        P1-2：不再忽略 store_key 返回的 StorageStatus。
-        - FAILED 时配置保存整体失败，不更新内存配置，返回 failed 结果。
-        - SESSION_ONLY 时允许继续会话，但结果标记为 session_only，UI 据此提示。
-        - PERSISTED 时正常成功。
-        向后兼容：SecretSaveResult 实现 __bool__，旧调用方 `if save_api_config(...)`
-        继续工作（PERSISTED/SESSION_ONLY → True，FAILED → False）。
+    def _save_api_config_locked(self, config: Dict[str, Any]) -> SecretSaveResult:
+        """Persist a versioned key, metadata reference, then runtime snapshot.
+
+        A key is never overwritten in place. If metadata persistence fails, the
+        new key has no reference and is discarded best-effort; the old metadata
+        and its key therefore remain a valid pair after a restart.
         """
-        provider = config.get("provider", "siliconflow")
-        api_key = (config.get("api_key", "") or "").strip()
-        config = dict(config)
+        config = copy.deepcopy(config)
+        config.pop("max_tokens", None)
+        provider = str(config.get("provider", "siliconflow"))
+        api_key = str(config.get("api_key", "") or "").strip()
+        old_provider = str(self.api_config.get("provider", "siliconflow"))
+        old_secret_reference = self._secret_reference_for_config(self.api_config)
         if provider == OPENAI_COMPATIBLE_PROVIDER:
             try:
                 config["base_url"] = normalize_openai_base_url(
@@ -334,10 +400,31 @@ class ConfigManager:
                     provider=provider,
                 )
 
-        # P1-2：先存储密钥，检查返回状态
+        # Build a candidate before mutating any durable state. The reference is
+        # opaque metadata, never the secret value itself.
+        config = apply_text_translation_profile(config)
+        merged_config = copy.deepcopy(self.default_api_config)
+        merged_config.update(copy.deepcopy(self.api_config))
+        merged_config.update(config)
+        merged_config.pop("max_tokens", None)
+
+        if provider == OPENAI_COMPATIBLE_PROVIDER:
+            provider_configs = copy.deepcopy(merged_config.get("provider_configs") or {})
+            provider_configs[provider] = {
+                "base_url": merged_config.get("base_url", ""),
+                "model_name": merged_config.get("model_name", ""),
+            }
+            merged_config["provider_configs"] = provider_configs
+
+        secret_reference = self._new_secret_reference(provider)
+        provider_references = copy.deepcopy(merged_config.get(_PROVIDER_SECRET_REFS_KEY) or {})
+        provider_references[provider] = secret_reference
+        merged_config[_PROVIDER_SECRET_REFS_KEY] = provider_references
+        merged_config[_ACTIVE_SECRET_REF_KEY] = secret_reference
+
         secret_store = self._get_secret_store()
         try:
-            secret_status = secret_store.store(f"provider:{provider}", api_key)
+            secret_status = secret_store.store(secret_reference, api_key)
         except Exception as e:
             logger.error("存储密钥失败 [%s]: %s", provider, e)
             return SecretSaveResult(
@@ -347,7 +434,6 @@ class ConfigManager:
                 provider=provider,
             )
 
-        # P1-2：FAILED 时配置保存整体失败，不继续写入 JSON，不更新内存配置
         if secret_status == StorageStatus.FAILED:
             logger.error("密钥存储失败 [%s]，配置保存中止", provider)
             return SecretSaveResult(
@@ -357,57 +443,48 @@ class ConfigManager:
                 provider=provider,
             )
 
-        # 密钥已存储（PERSISTED 或 SESSION_ONLY），继续保存配置文件
+        safe_config = {
+            key: value
+            for key, value in merged_config.items()
+            if key not in ("api_key", "provider_keys")
+        }
         try:
-            config = apply_text_translation_profile(config)
-
-            # 保留已有高级参数，设置窗口只更新用户实际修改的字段。
-            merged_config = self.default_api_config.copy()
-            merged_config.update(self.api_config)
-            merged_config.update(config)
-
-            # Keep the custom endpoint available after switching to a built-in provider.
-            if provider == OPENAI_COMPATIBLE_PROVIDER:
-                provider_configs = dict(merged_config.get("provider_configs") or {})
-                provider_configs[provider] = {
-                    "base_url": merged_config.get("base_url", ""),
-                    "model_name": merged_config.get("model_name", ""),
-                }
-                merged_config["provider_configs"] = provider_configs
-
-            # 从配置中移除密钥字段，仅保存非敏感信息到 JSON
-            safe_config = {
-                k: v for k, v in merged_config.items() if k not in ("api_key", "provider_keys")
-            }
-
-            # BUG-006：使用原子写入，失败时旧文件保持不变
             write_json_atomic(self.api_config_file, safe_config)
-
-            # 运行时配置保留 api_key 供下游使用
-            merged_config["api_key"] = api_key
-            self.api_config = merged_config
-            self._api_key_provider = provider
-
-            # P1-2：SESSION_ONLY 时仍返回成功（允许会话），但标记状态供 UI 提示
-            if secret_status == StorageStatus.SESSION_ONLY:
-                logger.warning(
-                    "密钥 [%s] 仅会话级保存，重启后需重新输入",
-                    provider,
-                )
-            return SecretSaveResult(
-                secret_status=secret_status,
-                config_saved=True,
-                provider=provider,
-            )
         except OSError as e:
             logger.error("保存API配置失败: %s", e)
-            # 密钥已存储但配置文件写入失败
+            try:
+                secret_store.delete(secret_reference)
+            except Exception as cleanup_error:  # noqa: BLE001
+                logger.warning("清理未发布密钥版本失败 [%s]: %s", provider, cleanup_error)
             return SecretSaveResult(
                 secret_status=secret_status,
                 config_saved=False,
                 error_message=f"配置文件写入失败: {e}",
                 provider=provider,
             )
+
+        published_config = copy.deepcopy(merged_config)
+        published_config["api_key"] = api_key
+        self.api_config = published_config
+        self._api_key_provider = provider
+        self._api_key_reference = secret_reference
+
+        # Replacing or clearing a key for the active provider leaves the old
+        # version unreachable. Delete it only after the new metadata has been
+        # atomically published; a cleanup failure cannot invalidate the pair.
+        if old_provider == provider and old_secret_reference != secret_reference:
+            try:
+                secret_store.delete(old_secret_reference)
+            except Exception as cleanup_error:  # noqa: BLE001
+                logger.warning("清理旧密钥版本失败 [%s]: %s", provider, cleanup_error)
+
+        if secret_status == StorageStatus.SESSION_ONLY:
+            logger.warning("密钥 [%s] 仅会话级保存，重启后需重新输入", provider)
+        return SecretSaveResult(
+            secret_status=secret_status,
+            config_saved=True,
+            provider=provider,
+        )
 
     def load_app_config(self) -> Dict[str, Any]:
         """加载应用配置"""
@@ -417,6 +494,9 @@ class ConfigManager:
                     config = json.load(f)
                     merged_config = self.default_app_config.copy()
                     merged_config.update(config)
+                    # token 预算改为内部自动策略，不再保留用户侧上限字段。
+                    merged_config.pop("batch_max_input_tokens", None)
+                    merged_config.pop("queue_batch_max_input_tokens", None)
                     # 图片翻译配置迁移：缺 image_translation 时补齐，
                     # default_provider 固定为 manga
                     merged_config["image_translation"] = self._migrate_image_translation_config(
@@ -537,7 +617,8 @@ class ConfigManager:
 
     def get_image_translation_config(self) -> Dict[str, Any]:
         """获取图片翻译配置段。"""
-        return self.app_config.get("image_translation", {}).copy()
+        with self._app_config_lock:
+            return copy.deepcopy(self.app_config.get("image_translation", {}))
 
     def get_default_image_translation_provider(self) -> str:
         """获取默认图片翻译 Provider id（始终为 manga）。"""
@@ -545,10 +626,14 @@ class ConfigManager:
 
     def save_app_config(self, config: Dict[str, Any]) -> bool:
         """保存应用配置"""
+        candidate = copy.deepcopy(config)
+        candidate.pop("batch_max_input_tokens", None)
+        candidate.pop("queue_batch_max_input_tokens", None)
         try:
-            # BUG-006：使用原子写入，失败时旧文件保持不变
-            write_json_atomic(self.app_config_file, config)
-            self.app_config = config
+            with self._app_config_lock:
+                # BUG-006：使用原子写入，失败时旧文件保持不变
+                write_json_atomic(self.app_config_file, candidate)
+                self.app_config = candidate
             return True
         except OSError as e:
             logger.error("保存应用配置失败: %s", e)
@@ -570,10 +655,12 @@ class ConfigManager:
 
     def save_glossary(self, glossary: Dict[str, Any]) -> bool:
         """保存术语库"""
+        candidate = copy.deepcopy(glossary)
         try:
-            # BUG-006：使用原子写入，失败时旧文件保持不变
-            write_json_atomic(self.glossary_file, glossary)
-            self.glossary = glossary
+            with self._glossary_lock:
+                # BUG-006：使用原子写入，失败时旧文件保持不变
+                write_json_atomic(self.glossary_file, candidate)
+                self.glossary = candidate
             return True
         except OSError as e:
             logger.error("保存术语库失败: %s", e)
@@ -591,14 +678,14 @@ class ConfigManager:
         / ``save_glossary`` 的布尔返回值。各阶段独立 try/except，避免
         一个宽捕获覆盖全部阶段。
         """
-        self._ensure_api_key_loaded()
-        api_result = self.save_api_config(self.api_config)
+        api_result = self.save_api_config(self.get_api_config(load_secret=True))
 
         # 应用配置：直接写入以捕获具体错误消息
         app_saved = True
         app_error = ""
         try:
-            write_json_atomic(self.app_config_file, self.app_config)
+            with self._app_config_lock:
+                write_json_atomic(self.app_config_file, copy.deepcopy(self.app_config))
         except OSError as e:
             app_saved = False
             app_error = str(e)
@@ -608,7 +695,8 @@ class ConfigManager:
         glossary_saved = True
         glossary_error = ""
         try:
-            write_json_atomic(self.glossary_file, self.glossary)
+            with self._glossary_lock:
+                write_json_atomic(self.glossary_file, copy.deepcopy(self.glossary))
         except OSError as e:
             glossary_saved = False
             glossary_error = str(e)
@@ -624,22 +712,97 @@ class ConfigManager:
 
     def is_api_configured(self) -> bool:
         """检查API是否已配置"""
-        self._ensure_api_key_loaded()
-        return bool(self.api_config.get("api_key", "").strip())
+        return bool(self.get_api_config(load_secret=True).get("api_key", "").strip())
 
     def get_api_config(self, *, load_secret: bool = True) -> Dict[str, Any]:
         """获取API配置"""
         if load_secret:
             self._ensure_api_key_loaded()
-        return self.api_config.copy()
+        with self._api_key_lock:
+            snapshot = copy.deepcopy(self.api_config)
+            # 无密钥读取用于预检、日志和 UI 元数据；即使之前已在内存加载过
+            # 密钥，也绝不能把它带入该公共快照。
+            if not load_secret:
+                snapshot["api_key"] = ""
+            return snapshot
 
     def get_app_config(self) -> Dict[str, Any]:
         """获取应用配置"""
-        return self.app_config.copy()
+        with self._app_config_lock:
+            return copy.deepcopy(self.app_config)
+
+    def get_window_state(self, window_name: str) -> Dict[str, Any]:
+        """读取已保存的窗口尺寸；无效或损坏的状态按未保存处理。"""
+        with self._app_config_lock:
+            all_states = self.app_config.get("window_state", {})
+            state = all_states.get(window_name, {}) if isinstance(all_states, dict) else {}
+            if not isinstance(state, dict):
+                return {}
+
+            width = state.get("width")
+            height = state.get("height")
+            if (
+                isinstance(width, bool)
+                or not isinstance(width, int)
+                or width <= 0
+                or isinstance(height, bool)
+                or not isinstance(height, int)
+                or height <= 0
+            ):
+                return {}
+            return {
+                "width": width,
+                "height": height,
+                "maximized": state.get("maximized") is True,
+            }
+
+    def update_window_state(
+        self,
+        window_name: str,
+        state: Dict[str, Any],
+        *,
+        persist: bool = False,
+    ) -> bool:
+        """更新窗口尺寸；设置窗口可选择立即持久化。"""
+        if not isinstance(window_name, str) or not window_name:
+            return False
+        width = state.get("width") if isinstance(state, dict) else None
+        height = state.get("height") if isinstance(state, dict) else None
+        if (
+            isinstance(width, bool)
+            or not isinstance(width, int)
+            or width <= 0
+            or isinstance(height, bool)
+            or not isinstance(height, int)
+            or height <= 0
+        ):
+            return False
+
+        with self._app_config_lock:
+            candidate = copy.deepcopy(self.app_config)
+            all_states = candidate.get("window_state", {})
+            all_states = {} if not isinstance(all_states, dict) else copy.deepcopy(all_states)
+            all_states[window_name] = {
+                "width": width,
+                "height": height,
+                "maximized": state.get("maximized") is True,
+            }
+            candidate["window_state"] = all_states
+            self.app_config = candidate
+
+            if not persist:
+                return True
+            try:
+                write_json_atomic(self.app_config_file, copy.deepcopy(candidate))
+                return True
+            except OSError as exc:
+                logger.error("保存窗口尺寸失败 [%s]: %s", window_name, exc)
+                return False
 
     def get_glossary(self) -> Dict[str, Any]:
         """获取术语库"""
-        return self.glossary.copy()
+        with self._glossary_lock:
+            return copy.deepcopy(self.glossary)
 
     def add_glossary_term(self, source_term: str, target_term: str, category: str = "通用") -> bool:
         """添加术语"""
@@ -650,15 +813,17 @@ class ConfigManager:
                 "category": category,
             }
 
-            # 检查是否已存在
-            for existing_term in self.glossary["terms"]:
-                if existing_term["source"] == term["source"]:
-                    existing_term.update(term)
-                    return self.save_glossary(self.glossary)
+            with self._glossary_lock:
+                glossary = copy.deepcopy(self.glossary)
+                # 检查是否已存在
+                for existing_term in glossary["terms"]:
+                    if existing_term["source"] == term["source"]:
+                        existing_term.update(term)
+                        return self.save_glossary(glossary)
 
-            # 添加新术语
-            self.glossary["terms"].append(term)
-            return self.save_glossary(self.glossary)
+                # 添加新术语
+                glossary["terms"].append(term)
+                return self.save_glossary(glossary)
 
         except OSError as e:
             logger.error("添加术语失败: %s", e)
@@ -667,46 +832,60 @@ class ConfigManager:
     def remove_glossary_term(self, source_term: str) -> bool:
         """删除术语"""
         try:
-            self.glossary["terms"] = [
-                term for term in self.glossary["terms"] if term["source"] != source_term
-            ]
-            return self.save_glossary(self.glossary)
+            with self._glossary_lock:
+                glossary = copy.deepcopy(self.glossary)
+                glossary["terms"] = [
+                    term for term in glossary["terms"] if term["source"] != source_term
+                ]
+                return self.save_glossary(glossary)
         except OSError as e:
             logger.error("删除术语失败: %s", e)
             return False
 
     def get_glossary_prompt(self) -> str:
         """获取术语库提示词"""
-        if not self.glossary["terms"]:
+        with self._glossary_lock:
+            terms = copy.deepcopy(self.glossary["terms"])
+        if not terms:
             return ""
 
         prompt = "\n\n【术语库】请在翻译时严格按照以下术语对照表进行翻译：\n"
-        for term in self.glossary["terms"]:
+        for term in terms:
             prompt += f"- {term['source']} → {term['target']}\n"
 
         return prompt
 
     def update_api_provider_config(self, provider: str, config: Dict[str, Any]):
-        """更新API提供商配置（为扩展性预留）"""
-        self.api_config["provider"] = provider
-        self.api_config.update(config)
-        self.save_api_config(self.api_config)
+        """Update a provider through the same snapshot transaction as the UI."""
+        candidate = self.get_api_config(load_secret=True)
+        candidate["provider"] = provider
+        candidate.update(copy.deepcopy(config))
+        if "api_key" not in config:
+            candidate["api_key"] = self.get_provider_key(provider)
+        return self.save_api_config(candidate)
 
     def get_provider_key(self, provider: str) -> str:
         """BUG-009：从密钥环读取指定提供商的 API Key
 
         P1-4：通过注入的 SecretStore 读取，不调用全局 get_key。
         """
-        return self._get_secret_store().retrieve(f"provider:{provider}")
+        with self._api_key_lock:
+            snapshot = copy.deepcopy(self.api_config)
+            reference = self._secret_reference_for_provider(snapshot, provider)
+            if snapshot.get("provider") == provider and snapshot.get("api_key"):
+                return str(snapshot["api_key"])
+        return self._get_secret_store().retrieve(reference)
 
     def get_provider_config(self, provider: str) -> Dict[str, Any]:
         """Return a provider's saved endpoint fields plus its runtime API key."""
-        provider_configs = self.api_config.get("provider_configs") or {}
+        with self._api_key_lock:
+            api_config = copy.deepcopy(self.api_config)
+        provider_configs = api_config.get("provider_configs") or {}
         saved_config = provider_configs.get(provider, {})
         result = dict(saved_config) if isinstance(saved_config, dict) else {}
-        if self.api_config.get("provider") == provider:
+        if api_config.get("provider") == provider:
             for field in ("base_url", "model_name"):
-                result.setdefault(field, self.api_config.get(field, ""))
+                result.setdefault(field, api_config.get(field, ""))
         result["api_key"] = self.get_provider_key(provider)
         return result
 

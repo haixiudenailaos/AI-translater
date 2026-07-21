@@ -144,7 +144,6 @@ def _preflight_window(project: TranslationProject, app_config: dict[str, object]
                 "provider": "test",
                 "model_name": "test-model",
                 "temperature": 0.3,
-                "max_tokens": 2048,
             }
 
     window = MainWindow.__new__(MainWindow)

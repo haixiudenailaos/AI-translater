@@ -125,7 +125,7 @@ class MangaWorkerClient:
             # already converging and there is nothing useful to propagate.
             logger.debug("Manga worker 取消请求未发送（进程正在关闭）")
 
-    def close(self) -> None:
+    def close(self, *, timeout_seconds: float | None = None) -> bool:
         """P1-8：关闭 worker，不阻塞读取 stdout。
 
         旧实现直接 ``stdout.readline()`` 等待 worker 响应，worker 卡死时
@@ -136,14 +136,17 @@ class MangaWorkerClient:
         # request startup.  Otherwise a request can pass its closed check,
         # observe the process, and write to stdin while close is tearing it
         # down.
+        deadline = (
+            time.monotonic() + max(0.0, timeout_seconds) if timeout_seconds is not None else None
+        )
         with self._process_lock:
             if self._closed:
-                return
+                return True
             self._closed = True
             process = self._process
             self._process = None
         if process is None:
-            return
+            return True
         # P1-8：发送 close 后不等待响应，直接进入收敛流程
         try:
             self._send_to(process, {"op": "close"})
@@ -153,17 +156,18 @@ class MangaWorkerClient:
         if process.poll() is None:
             process.terminate()
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=self._remaining_timeout(deadline, 5.0))
             except subprocess.TimeoutExpired:
                 process.kill()
                 try:
-                    process.wait(timeout=2)
+                    process.wait(timeout=self._remaining_timeout(deadline, 2.0))
                 except subprocess.TimeoutExpired:
                     logger.warning("Manga worker kill 后仍未退出")
         # P1-3：清空队列残留，避免内存泄漏
         self._close_process_streams(process)
-        self._join_reader_threads()
+        self._join_reader_threads(deadline=deadline)
         self._drain_stdout_queue()
+        return process.poll() is not None
 
     def _request(
         self,
@@ -346,12 +350,18 @@ class MangaWorkerClient:
                 except (OSError, ValueError):
                     pass
 
-    def _join_reader_threads(self) -> None:
+    @staticmethod
+    def _remaining_timeout(deadline: float | None, default: float) -> float:
+        if deadline is None:
+            return default
+        return max(0.0, min(default, deadline - time.monotonic()))
+
+    def _join_reader_threads(self, *, deadline: float | None = None) -> None:
         current = threading.current_thread()
         for attribute in ("_stdout_reader_thread", "_stderr_reader_thread"):
             thread = getattr(self, attribute, None)
             if thread is not None and thread is not current:
-                thread.join(timeout=1.0)
+                thread.join(timeout=self._remaining_timeout(deadline, 1.0))
             setattr(self, attribute, None)
 
     def _drain_stdout_queue(self) -> None:

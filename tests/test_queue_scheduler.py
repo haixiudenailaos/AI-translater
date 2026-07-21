@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import Future
 from typing import List
 from unittest.mock import MagicMock
 
@@ -28,6 +29,7 @@ from src.core.queue_scheduler import (
     QueuePolicy,
     QueueTaskState,
     QueueTranslationCoordinator,
+    _InFlightBatch,
     execute_batch_job,
     plan_batches,
 )
@@ -473,6 +475,159 @@ class TestCoordinatorLifecycle:
         coord.close()
 
         assert registry.get_or_create(key, configured_max=2, hard_cap=2) is limiter
+
+    def test_task_limiter_and_future_release_remain_stable_after_provider_switch(
+        self, tmp_config_manager
+    ):
+        """任务和 Future 必须释放派发时所属的 limiter，而不是当前全局值。"""
+        coord = self._make_coordinator(tmp_config_manager, _make_policy(hard_request_cap=4))
+        limiter_a = _make_limiter(configured_max=3, hard_cap=4)
+        limiter_b = ProviderLimiter(
+            ProviderRuntimeKey(
+                provider="deepseek",
+                normalized_base_url="https://api.deepseek.com/v1",
+                model_name="deepseek-chat",
+                credential_reference="different-account",
+                config_version="0.3:4000",
+            ),
+            configured_max=2,
+            hard_cap=4,
+        )
+        try:
+            assert coord.add_task(
+                "provider-a",
+                "/tmp/provider-a.txt",
+                "provider-a.txt",
+                "txt",
+                None,
+                ["one"],
+                [""],
+            )
+            assert coord.add_task(
+                "provider-b",
+                "/tmp/provider-b.txt",
+                "provider-b.txt",
+                "txt",
+                None,
+                ["two"],
+                [""],
+            )
+
+            with coord._lock:
+                for task_id, limiter, source in (
+                    ("provider-a", limiter_a, "one"),
+                    ("provider-b", limiter_b, "two"),
+                ):
+                    slot = coord._tasks[task_id]
+                    slot.attempt_id = f"attempt-{task_id}"
+                    slot.state = QueueTaskState.READY
+                    slot.engine = MockEngine()
+                    slot.limiter = limiter
+                    slot.pending_batches.append(
+                        BatchJob(
+                            task_id=task_id,
+                            attempt_id=slot.attempt_id,
+                            batch_id=0,
+                            source_indices=(0,),
+                            source_lines=(source,),
+                            estimated_input_tokens=1,
+                            run_context=_make_run_context(),
+                        )
+                    )
+                # 模拟用户在第一项开始后切换 Provider。新任务会成为当前
+                # UI limiter，但旧任务必须继续使用自己的 limiter。
+                coord._active_limiter = limiter_b
+
+            coord._dispatch()
+            submitted = tuple(coord._in_flight)
+            assert len(submitted) == 2
+            assert {meta.limiter for meta in coord._in_flight.values()} == {
+                limiter_a,
+                limiter_b,
+            }
+            for future in submitted:
+                future.result(timeout=2.0)
+
+            # 两个额外的非成功路径确保收割逻辑同样释放原始 limiter。
+            assert limiter_a.try_acquire()
+            failed = Future()
+            failed.set_exception(RuntimeError("provider worker failed"))
+            assert limiter_a.try_acquire()
+            cancelled = Future()
+            assert cancelled.cancel()
+            # Bare Future.cancel() stays in CANCELLED until an executor worker
+            # observes it. Mirror the executor transition so wait() can harvest
+            # this cancelled job in the same coordinator iteration.
+            assert cancelled.set_running_or_notify_cancel() is False
+            coord._in_flight[failed] = _InFlightBatch(
+                task_id="provider-a-error",
+                batch_id=1,
+                limiter=limiter_a,
+            )
+            coord._in_flight[cancelled] = _InFlightBatch(
+                task_id="provider-a-cancelled",
+                batch_id=2,
+                limiter=limiter_a,
+            )
+
+            coord._drain_completed_outcomes()
+            assert coord._in_flight == {}
+            assert limiter_a.metrics()["in_flight"] == 0
+            assert limiter_b.metrics()["in_flight"] == 0
+        finally:
+            coord.close()
+
+    def test_executor_submit_failure_releases_limiter_slot(self, tmp_config_manager):
+        """Executor 拒绝任务时不能留下 limiter 槽位或半派发批次。"""
+
+        class _RejectingExecutor:
+            def submit(self, *_args, **_kwargs):
+                raise RuntimeError("executor is shut down")
+
+            def shutdown(self, **_kwargs):
+                return None
+
+        coord = self._make_coordinator(tmp_config_manager)
+        original_executor = coord._executor
+        original_executor.shutdown(wait=False, cancel_futures=True)
+        coord._executor = _RejectingExecutor()
+        limiter = _make_limiter(configured_max=1, hard_cap=1)
+        try:
+            assert coord.add_task(
+                "submit-error",
+                "/tmp/submit-error.txt",
+                "submit-error.txt",
+                "txt",
+                None,
+                ["one"],
+                [""],
+            )
+            with coord._lock:
+                slot = coord._tasks["submit-error"]
+                slot.attempt_id = "submit-attempt"
+                slot.state = QueueTaskState.READY
+                slot.engine = MockEngine()
+                slot.limiter = limiter
+                slot.pending_batches.append(
+                    BatchJob(
+                        task_id=slot.task_id,
+                        attempt_id=slot.attempt_id,
+                        batch_id=0,
+                        source_indices=(0,),
+                        source_lines=("one",),
+                        estimated_input_tokens=1,
+                        run_context=_make_run_context(),
+                    )
+                )
+                assert not coord._try_dispatch_one_locked(slot, limiter)
+
+            assert coord._in_flight == {}
+            assert slot.in_flight_batches == {}
+            assert not slot.pending_batches
+            assert slot.state == QueueTaskState.ERROR
+            assert limiter.metrics()["in_flight"] == 0
+        finally:
+            coord.close()
 
     def test_close_releases_engines(self, tmp_config_manager):
         coord = self._make_coordinator(tmp_config_manager)

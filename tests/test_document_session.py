@@ -148,9 +148,9 @@ def test_import_result_user_message_distinct_per_failure_type():
     ]
     for failure_type, expected_prefix in cases:
         result = ImportResult.failure(failure_type, "x")
-        assert result.user_message.startswith(expected_prefix), (
-            f"{failure_type} 应以前缀 '{expected_prefix}' 开头，实际：{result.user_message}"
-        )
+        assert result.user_message.startswith(
+            expected_prefix
+        ), f"{failure_type} 应以前缀 '{expected_prefix}' 开头，实际：{result.user_message}"
 
 
 def test_import_result_user_message_handles_missing_path():

@@ -90,12 +90,11 @@ def _setup_mapping_dir(tmpdir: Path, image_count: int = 3) -> Path:
     assets_dir = mapping_dir / "assets"
     assets_dir.mkdir()
 
-    # 最小 1x1 PNG
+    # Ark 要求输入图片宽高均大于 14px。
     png_bytes = bytes.fromhex(
-        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
-        "890000000d49444154789c63000100000005000100"
-        "0d0a2db4000000004945"
-        "4e44ae426082"
+        "89504e470d0a1a0a0000000d494844520000001000000010080200000090916836"
+        "000000144944415478da63f84f226018d530aa61f86a0000afadfd1f6de8a0ca"
+        "0000000049454e44ae426082"
     )
 
     image_mappings = {}
@@ -571,6 +570,39 @@ class MangaWorkerClientCloseTests(unittest.TestCase):
         self.assertEqual(hung._wait_count, 2)
         # close 应快速返回（mock 立即抛 TimeoutExpired，实际不等待）
         self.assertLess(elapsed, 2.0)
+
+    def test_close_consumes_the_caller_deadline_across_terminate_and_kill(self):
+        """调用方传入的剩余预算不能在 terminate/kill 阶段重新开始计时。"""
+        client = MangaWorkerClient(SimpleNamespace(get_api_config=lambda: {}))
+
+        class _HungProcess:
+            def __init__(self):
+                self.stdin = SimpleNamespace(write=lambda _: None, flush=lambda: None)
+                self.stdout = []
+                self.stderr = None
+                self.wait_timeouts = []
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired(cmd="mock", timeout=timeout)
+
+        process = _HungProcess()
+        client._process = process
+
+        client.close(timeout_seconds=0.05)
+
+        self.assertEqual(len(process.wait_timeouts), 2)
+        self.assertLessEqual(process.wait_timeouts[0], 0.05)
+        self.assertLessEqual(process.wait_timeouts[1], process.wait_timeouts[0])
 
     def test_repeated_close_is_idempotent(self):
         """重复 close 幂等。"""

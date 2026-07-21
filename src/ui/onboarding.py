@@ -100,11 +100,13 @@ class OnboardingPanel:
         on_next: Callable[[], None],
         on_postpone: Callable[[], None],
         on_dismiss: Callable[[], None],
+        on_visibility_changed: Callable[[bool], None] | None = None,
     ):
         self._on_back = on_back
         self._on_next = on_next
         self._on_postpone = on_postpone
         self._on_dismiss = on_dismiss
+        self._on_visibility_changed = on_visibility_changed
 
         self._visible = False
         self._closed = False
@@ -223,6 +225,7 @@ class OnboardingPanel:
         if self._closed:
             return
         if not self._visible:
+            self._notify_visibility_changed(True)
             self._frame.pack(fill=tk.X, pady=(0, 8))
             self._visible = True
         self._bind_shortcuts()
@@ -231,17 +234,28 @@ class OnboardingPanel:
         if self._visible:
             self._frame.pack_forget()
             self._visible = False
+        self._notify_visibility_changed(False)
         self._unbind_shortcuts()
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._notify_visibility_changed(False)
         self._unbind_shortcuts()
         try:
             self._frame.destroy()
         except Exception as exc:
             logger.debug("销毁新手指导面板失败: %s", exc)
+
+    def _notify_visibility_changed(self, visible: bool) -> None:
+        callback = self._on_visibility_changed
+        if callback is None:
+            return
+        try:
+            callback(visible)
+        except Exception as exc:
+            logger.debug("更新新手指导布局失败: %s", exc)
 
     # ── 内部回调 ──────────────────────────────────
 
@@ -263,7 +277,7 @@ class OnboardingPanel:
         except Exception:
             focused = None
         # 不抢占正在编辑的文本焦点
-        if isinstance(focused, (tk.Entry, ttk.Entry, tk.Text)):
+        if isinstance(focused, tk.Entry | ttk.Entry | tk.Text):
             return
         try:
             self._primary_btn.focus_set()

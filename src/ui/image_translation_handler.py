@@ -11,6 +11,7 @@
 """
 
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox
@@ -26,6 +27,7 @@ from ..domain.image_translation import (
     ImageTranslationProviderId,
 )
 from ..domain.translation import OperationStatus
+from ..infrastructure.mapping_repository import resolve_mapping_file
 from ..utils.logger import get_logger
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 
@@ -40,6 +42,7 @@ class ImageTranslationHandler:
         "当前为 Text Edition，未打包本地 Manga 推理依赖。\n\n"
         "如需使用本地模块图片翻译，请下载 Full Edition。"
     )
+    _CLOSE_TIMEOUT_SECONDS = 10.0
 
     def __init__(
         self,
@@ -174,7 +177,7 @@ class ImageTranslationHandler:
             return
 
         # 检查 images.json 是否存在且有图片
-        images_file = current_mapping_dir / "images.json"
+        images_file = resolve_mapping_file(current_mapping_dir, "images.json")
         if not images_file.exists():
             messagebox.showwarning("图片翻译", "当前EPUB没有图片数据")
             return
@@ -190,6 +193,7 @@ class ImageTranslationHandler:
         import json
 
         try:
+            images_file = resolve_mapping_file(current_mapping_dir, "images.json")
             images_data = json.loads(images_file.read_text(encoding="utf-8"))
         except Exception:
             messagebox.showwarning("图片翻译", "images.json 解析失败")
@@ -407,8 +411,14 @@ class ImageTranslationHandler:
         """
         self.start_image_translation()
 
-    def close(self) -> None:
-        """取消当前任务并释放所有已初始化的图片翻译 Provider。"""
+    def close(self, *, timeout_seconds: float = _CLOSE_TIMEOUT_SECONDS) -> None:
+        """在单一 deadline 内取消任务并释放已初始化的 Provider。
+
+        Provider 可能仍被图片工作线程使用。必须先取消并等待工作线程结束；
+        若 deadline 到期，保留资源让 daemon worker 自行收敛，不能在并发运行时
+        卸载模型、关闭 HTTP 客户端或关闭 event loop。
+        """
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
         self._closed = True
         # P1-1：关闭 UI 回调事件泵
         pump = getattr(self, "_ui_pump", None)
@@ -423,6 +433,19 @@ class ImageTranslationHandler:
         for provider_id in ImageTranslationProviderId:
             try:
                 service.cancel(provider_id)
-                service.close_provider(provider_id)
+            except Exception:
+                logger.warning("取消图片翻译 Provider 失败: %s", provider_id)
+
+        worker = self._worker_thread
+        if worker is not None and worker is not threading.current_thread() and worker.is_alive():
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if worker is threading.current_thread() or (worker is not None and worker.is_alive()):
+            logger.warning("图片翻译 worker 未在关闭 deadline 内退出，跳过 Provider 资源释放")
+            return
+
+        for provider_id in ImageTranslationProviderId:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                service.close_provider(provider_id, timeout_seconds=remaining)
             except Exception:
                 logger.warning("关闭图片翻译 Provider 失败: %s", provider_id)

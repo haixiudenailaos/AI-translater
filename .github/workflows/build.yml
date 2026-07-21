@@ -10,10 +10,102 @@ on:
 env:
   APP_NAME: LightNovelTranslator
   APP_VERSION: "1.6"
-  PYTHON_VERSION: "3.11"
+  # Windows release builds consume the checked-in Python 3.10 hash lock.
+  PYTHON_VERSION: "3.10"
   PYINSTALLER_VERSION: "6.11.1"
 
 jobs:
+  quality:
+    name: Quality (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install runtime and development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Check formatting
+        run: python -m ruff format --check .
+
+      - name: Compile first-party Python
+        run: python -m compileall -q main.py build.py src tests tools
+
+      - name: Run tests
+        if: matrix.python-version != '3.11'
+        run: python -m pytest -q
+
+      - name: Run tests with coverage
+        if: matrix.python-version == '3.11'
+        run: python -m pytest --cov=src --cov-branch --cov-report=term-missing --cov-report=xml
+
+      # Block regressions in the transactional configuration, project
+      # persistence, and image request-boundary modules while legacy typing is
+      # migrated incrementally through the non-blocking full-repository report.
+      - name: Type check enforced core modules
+        if: matrix.python-version == '3.11'
+        run: >
+          python -m pyright
+          src/config/config_manager.py
+          src/infrastructure/project_repository.py
+          src/core/image_translator.py
+
+      # Existing legacy annotations still produce errors. Keep the report
+      # visible on every PR while the blocking scope is expanded incrementally.
+      - name: Type check report
+        if: matrix.python-version == '3.11'
+        continue-on-error: true
+        run: python -m pyright
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py311
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 30
+
+  wheel-smoke:
+    name: Wheel installation smoke test
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Build and install wheel outside the repository
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m build --wheel
+          python -m venv /tmp/ai-translater-wheel-smoke
+          /tmp/ai-translater-wheel-smoke/bin/python -m pip install dist/*.whl
+          cd /tmp
+          /tmp/ai-translater-wheel-smoke/bin/python -c "import src; import src.bootstrap; print('wheel-import-ok')"
+
   build-windows:
     runs-on: windows-latest
     steps:

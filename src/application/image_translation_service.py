@@ -37,6 +37,7 @@ from ..domain.image_translation import (
     ImageTranslationResult,
 )
 from ..domain.translation import OperationStatus
+from ..infrastructure.mapping_repository import resolve_mapping_file
 from ..utils.logger import get_logger
 from .ports import ImageManifestRepository, ImageProviderRegistry
 
@@ -91,7 +92,7 @@ class ImageTranslationService:
             errors.append(f"映射目录不存在: {mapping_dir}")
             return errors
 
-        images_file = mapping_dir / "images.json"
+        images_file = resolve_mapping_file(mapping_dir, "images.json")
         if not images_file.exists():
             errors.append("缺少 images.json，请确认已正确导入 EPUB")
             return errors
@@ -231,12 +232,17 @@ class ImageTranslationService:
             except Exception as exc:
                 logger.warning("取消 Provider 失败: %s", exc)
 
-    def close_provider(self, provider_id: ImageTranslationProviderId) -> None:
+    def close_provider(
+        self,
+        provider_id: ImageTranslationProviderId,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         """关闭指定 Provider，释放资源。"""
         provider = self._registry.get(provider_id)
         if provider is not None:
             try:
-                provider.close()
+                provider.close(timeout_seconds=timeout_seconds)
             except Exception as exc:
                 logger.warning("关闭 Provider 失败: %s", exc)
 

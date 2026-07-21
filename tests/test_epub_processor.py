@@ -22,6 +22,10 @@ from src.core.epub_processor import (
     EPUBProcessor,
 )
 from src.domain.errors import EpubFingerprintMismatchError
+from src.infrastructure.mapping_repository import (
+    publish_mapping_file_update,
+    resolve_mapping_file,
+)
 
 # ── 辅助函数 ──────────────────────────────────────────
 
@@ -33,7 +37,14 @@ def _make_processor(tmp_app_paths) -> EPUBProcessor:
 
 def _load_content_mapping(mapping_dir: Path) -> dict:
     """读取 content_mapping.json"""
-    return json.loads((Path(mapping_dir) / "content_mapping.json").read_text(encoding="utf-8"))
+    return json.loads(
+        resolve_mapping_file(mapping_dir, "content_mapping.json").read_text(encoding="utf-8")
+    )
+
+
+def _publish_content_mapping(mapping_dir: Path, payload: dict) -> None:
+    """Publish test changes through the same generation contract as production."""
+    publish_mapping_file_update(mapping_dir, "content_mapping.json", payload)
 
 
 # ── R2-BUG-001：字符串 spine ID 解析 ─────────────────
@@ -180,9 +191,7 @@ class TestPositionalMatchValidation:
         mappings1[first_key]["translated_text"] = "这是测试译文"
         mappings1[first_key]["translated_at"] = "2026-01-01T00:00:00"
         # 写回时保留 source_checksum 为旧原文的校验和
-        (Path(result1["mapping_dir"]) / "content_mapping.json").write_text(
-            json.dumps(data1, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _publish_content_mapping(result1["mapping_dir"], data1)
 
         # 第二次导入：修改第一个段落的原文内容
         # 构造一个修改了原文的 EPUB
@@ -230,9 +239,7 @@ class TestPositionalMatchValidation:
         first_key = sorted(mappings1.keys(), key=lambda k: mappings1[k]["line_number"])[0]
         mappings1[first_key]["translated_text"] = "测试译文保留"
         mappings1[first_key]["translated_at"] = "2026-01-01T00:00:00"
-        (Path(result1["mapping_dir"]) / "content_mapping.json").write_text(
-            json.dumps(data1, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _publish_content_mapping(result1["mapping_dir"], data1)
 
         # 第二次导入同一文件（原文未变化）
         proc2 = _make_processor(tmp_app_paths)
@@ -265,9 +272,7 @@ class TestExportFingerprint:
         # 更新 mapping 中的 original_file 指向修改后的文件
         data = _load_content_mapping(result["mapping_dir"])
         data["project_info"]["original_file"] = str(modified_path)
-        (Path(result["mapping_dir"]) / "content_mapping.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _publish_content_mapping(result["mapping_dir"], data)
 
         # 导出应抛出 EpubFingerprintMismatchError
         output_path = tmp_path / "output.epub"
@@ -337,9 +342,7 @@ class TestInlineFormatPreservation:
         for _key, m in data["content_mappings"].items():
             m["translated_text"] = "translated text"
             m["translated_at"] = "2026-01-01"
-        (Path(result["mapping_dir"]) / "content_mapping.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _publish_content_mapping(result["mapping_dir"], data)
 
         # 导出
         output_path = tmp_path / "output.epub"
@@ -398,9 +401,7 @@ class TestInlineFormatPreservation:
         for _key, m in data["content_mappings"].items():
             m["translated_text"] = "translated content"
             m["translated_at"] = "2026-01-01"
-        (Path(result["mapping_dir"]) / "content_mapping.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _publish_content_mapping(result["mapping_dir"], data)
 
         # 导出
         output_path = tmp_path / "output.epub"

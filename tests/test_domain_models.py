@@ -63,7 +63,6 @@ class TestTranslationOptions:
         assert opts.batch_size == 20
         assert opts.max_retries == 5
         assert opts.temperature == 0.3
-        assert opts.max_tokens == 2048
 
     def test_immutable(self):
         """不可变 dataclass：赋值抛 FrozenInstanceError"""
@@ -79,14 +78,12 @@ class TestTranslationOptions:
             batch_size=10,
             max_retries=3,
             temperature=0.7,
-            max_tokens=4096,
         )
         assert opts.target_language == "English"
         assert opts.model_name == "deepseek-chat"
         assert opts.batch_size == 10
         assert opts.max_retries == 3
         assert opts.temperature == 0.7
-        assert opts.max_tokens == 4096
 
 
 # ── TranslationProgress ──────────────────────────────

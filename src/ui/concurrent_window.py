@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from ..application.error_handling import format_diagnostic_info
 from ..core.concurrent_manager import ConcurrentTranslationManager
+from ..core.epub_processor import EpubImportCancelled
 from ..domain.edition import EditionCapabilities, detect_edition_capabilities
 from .task_detail_window import TaskDetailWindow
 from .theme import COLORS, FONT_APP_SMALL
@@ -529,7 +530,13 @@ class ConcurrentWindow:
                     path = next(path_iter)
                 except StopIteration:
                     return False
-                in_flight[executor.submit(self.manager.add_task, path)] = path
+                in_flight[
+                    executor.submit(
+                        self.manager.add_task,
+                        path,
+                        cancel_requested=self._import_cancel_event.is_set,
+                    )
+                ] = path
                 return True
 
             try:
@@ -544,6 +551,9 @@ class ConcurrentWindow:
                             path = in_flight.pop(future)
                             try:
                                 future.result()
+                            except EpubImportCancelled:
+                                # 取消是可预期的终态，不显示为导入失败。
+                                pass
                             except Exception as exc:  # noqa: BLE001
                                 failures.append((path, str(exc)))
                             completed += 1

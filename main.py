@@ -18,6 +18,7 @@ from tkinter import messagebox, ttk
 
 from src._version import display_version
 from src.bootstrap import create_app_context
+from src.ui.window_geometry import WindowGeometryTracker
 from src.ui.windows_dpi import enable_per_monitor_dpi_awareness
 from src.utils.logger import get_logger
 
@@ -31,6 +32,7 @@ class TranslatorApp:
         self.app_context = None
         self.main_window = None
         self._loading_frame = None
+        self._main_window_geometry_tracker = None
         self.setup_app()
 
     def setup_app(self):
@@ -59,6 +61,16 @@ class TranslatorApp:
             self.app_context = create_app_context()
             app_paths = self.app_context.app_paths
             config_manager = self.app_context.config_manager
+
+            self._main_window_geometry_tracker = WindowGeometryTracker(
+                self.root,
+                config_manager,
+                "main",
+                default_size=(1000, 700),
+                minimum_size=(800, 600),
+            )
+            self._main_window_geometry_tracker.restore()
+            self._main_window_geometry_tracker.bind()
 
             try:
                 icon_path = app_paths.resource_dir / "assets" / "icon.ico"
@@ -118,8 +130,12 @@ class TranslatorApp:
         # 阶段 2：保存配置（ENG-1：聚合结果 + 重试/不保存退出/取消）。
         # 所有仍允许用户取消关闭的操作必须发生在资源 teardown 之前；否则
         # “取消退出”会留下看似可用、实际已关闭服务的主窗口。
-        if self.app_context is not None and not self._save_config_with_retry():
-            return  # 用户取消关闭
+        if self.app_context is not None:
+            tracker = getattr(self, "_main_window_geometry_tracker", None)
+            if tracker is not None:
+                tracker.save()
+            if not self._save_config_with_retry():
+                return  # 用户取消关闭
 
         # 阶段 3：关闭主窗口资源。配置保存已完成或用户已明确选择不保存，
         # 因此从这里开始不再提供返回应用的分支。

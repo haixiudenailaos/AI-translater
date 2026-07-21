@@ -9,6 +9,5 @@
   "image_text_translation_enabled": true,
   "image_gen_provider": "volcengine",
   "batch_lines": 10,
-  "batch_max_input_tokens": 6000,
   "translation_concurrency": 1
 }

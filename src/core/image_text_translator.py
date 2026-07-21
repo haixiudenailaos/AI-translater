@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 
 from ..infrastructure.image_asset_store import load_image_bytes
+from ..infrastructure.mapping_repository import resolve_mapping_file
 from ..utils.file_handler import write_json_atomic
 
 logger = logging.getLogger(__name__)
@@ -146,7 +147,7 @@ class ImageTextTranslator:
                     避免旧文件被误用。
         """
         mapping_path = Path(mapping_dir)
-        images_file = mapping_path / "images.json"
+        images_file = resolve_mapping_file(mapping_path, "images.json")
 
         if not images_file.exists():
             return {}

@@ -72,9 +72,11 @@ def test_missing_worker_accepts_run_id_argument():
     sig = inspect.signature(TranslationController._translate_missing_worker)
     params = list(sig.parameters.keys())
     # 第一个参数是 self，后续应为 content, run_id
-    assert params == ["self", "content", "run_id"], (
-        f"_translate_missing_worker 签名应为 (self, content, run_id)，实际为 {params}"
-    )
+    assert params == [
+        "self",
+        "content",
+        "run_id",
+    ], f"_translate_missing_worker 签名应为 (self, content, run_id)，实际为 {params}"
 
 
 # ── 成功路径：run_id 通过闭包绑定到回调 ─────────────────
@@ -260,9 +262,9 @@ def test_three_workers_share_same_callback_signature_pattern():
 
     expected = ["self", "content", "run_id"]
     assert full_params == expected, f"全文 worker 签名应为 {expected}，实际为 {full_params}"
-    assert selected_params == expected, (
-        f"选中行 worker 签名应为 {expected}，实际为 {selected_params}"
-    )
+    assert (
+        selected_params == expected
+    ), f"选中行 worker 签名应为 {expected}，实际为 {selected_params}"
     assert missing_params == expected, f"查漏 worker 签名应为 {expected}，实际为 {missing_params}"
 
 
@@ -327,6 +329,6 @@ def test_missing_worker_thread_safe_run_id_binding():
     translator.progress_cb(50, {"batch_start": 0, "streaming": False, "translated_lines": ["x"]})
 
     assert len(mailbox.events) == 1
-    assert mailbox.events[0].run_id == old_run_id, (
-        "旧 worker 回调应携带启动时的 run_id，而非可变的 self._current_run_id"
-    )
+    assert (
+        mailbox.events[0].run_id == old_run_id
+    ), "旧 worker 回调应携带启动时的 run_id，而非可变的 self._current_run_id"

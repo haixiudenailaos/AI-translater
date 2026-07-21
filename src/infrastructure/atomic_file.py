@@ -20,6 +20,23 @@ _REPLACE_RETRY_COUNT = 8
 _REPLACE_RETRY_BASE_DELAY = 0.005  # 5ms 起步，指数退避
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    """Persist the directory entry created by ``os.replace`` on POSIX.
+
+    Syncing the temporary file alone does not make the rename durable after a
+    power loss. Windows does not support opening directory handles through the
+    same stdlib API, so it retains the existing file-level durability behavior.
+    """
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(str(path.parent), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _atomic_replace(src: Path, dst: Path) -> None:
     """执行 os.replace，并在 Windows 瞬态 PermissionError 上有限重试。
 
@@ -29,7 +46,6 @@ def _atomic_replace(src: Path, dst: Path) -> None:
     for attempt in range(_REPLACE_RETRY_COUNT):
         try:
             os.replace(str(src), str(dst))
-            return
         except PermissionError as exc:
             # Windows：目标文件被其他线程/进程短暂占用
             last_exc = exc
@@ -38,6 +54,13 @@ def _atomic_replace(src: Path, dst: Path) -> None:
             # 源临时文件被其他写入者删除，属于冲突，不重试
             last_exc = exc
             break
+        try:
+            _fsync_parent_directory(dst)
+        except OSError:
+            # The content is already visible, but durability is unproven. The
+            # caller must observe this and decide whether retry/recovery is safe.
+            raise
+        return
     # 重试耗尽，抛出最后一次异常
     raise last_exc  # type: ignore[misc]
 

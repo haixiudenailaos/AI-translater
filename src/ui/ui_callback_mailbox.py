@@ -23,13 +23,20 @@
 
 from __future__ import annotations
 
+from collections import deque
 import queue
+import time
 from threading import Lock
 from typing import Callable, List
 
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_DEFAULT_MAX_CALLBACKS_PER_POLL = 64
+_DEFAULT_MAX_FRAME_MS = 8.0
+_DEFAULT_IDLE_INTERVAL_MS = 250
+_BACKLOG_FALLBACK_INTERVAL_MS = 1
 
 
 class UICallbackMailbox:
@@ -42,12 +49,14 @@ class UICallbackMailbox:
     - ``close`` 后迟到的 ``submit`` 被安全丢弃，``discarded_count`` 提供可观测计数。
     """
 
-    def __init__(self) -> None:
-        self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
+        self._queue: queue.Queue[tuple[float, Callable[[], None]]] = queue.Queue()
         self._keyed_callbacks: dict[str, Callable[[], None]] = {}
         self._closed = False
         self._lock = Lock()
+        self._clock = clock or time.monotonic
         self._discarded_count = 0
+        self._coalesced_count = 0
         self._total_submitted = 0
         self._total_drained = 0
 
@@ -61,7 +70,7 @@ class UICallbackMailbox:
                 self._discarded_count += 1
                 return
             self._total_submitted += 1
-        self._queue.put(callback)
+        self._queue.put((self._clock(), callback))
 
     def submit_keyed(self, key: str, callback: Callable[[], None]) -> None:
         """Submit at most one pending callback for a coalescing key.
@@ -77,6 +86,8 @@ class UICallbackMailbox:
             already_pending = key in self._keyed_callbacks
             self._keyed_callbacks[key] = callback
             self._total_submitted += 1
+            if already_pending:
+                self._coalesced_count += 1
         if already_pending:
             return
 
@@ -86,17 +97,20 @@ class UICallbackMailbox:
             if latest is not None:
                 latest()
 
-        self._queue.put(run_latest)
+        self._queue.put((self._clock(), run_latest))
 
-    def drain(self) -> List[Callable[[], None]]:
+    def drain(self, max_callbacks: int = _DEFAULT_MAX_CALLBACKS_PER_POLL) -> List[Callable[[], None]]:
         """主线程排空邮箱，返回待执行回调列表（保持提交顺序）。
 
         只由 Tk 主线程调用（与 pump 轮询同步）。排空后邮箱为空。
         """
+        if max_callbacks <= 0:
+            raise ValueError("max_callbacks must be positive")
         callbacks: List[Callable[[], None]] = []
-        while True:
+        while len(callbacks) < max_callbacks:
             try:
-                callbacks.append(self._queue.get_nowait())
+                _submitted_at, callback = self._queue.get_nowait()
+                callbacks.append(callback)
             except queue.Empty:
                 break
         with self._lock:
@@ -120,9 +134,23 @@ class UICallbackMailbox:
         return self._discarded_count
 
     @property
+    def coalesced_count(self) -> int:
+        """Number of stale keyed renders replaced before reaching Tk."""
+        return self._coalesced_count
+
+    @property
     def pending_count(self) -> int:
         """当前待处理的回调数。"""
         return self._queue.qsize()
+
+    @property
+    def oldest_pending_age_seconds(self) -> float:
+        """Age of the oldest queued callback, or zero when the mailbox is empty."""
+        with self._queue.mutex:
+            if not self._queue.queue:
+                return 0.0
+            submitted_at = self._queue.queue[0][0]
+        return max(0.0, self._clock() - submitted_at)
 
     @property
     def total_submitted(self) -> int:
@@ -154,7 +182,17 @@ class TkUICallbackPump:
         mailbox: UICallbackMailbox,
         interval_ms: int = 50,
         on_error: Callable[[Exception], None] | None = None,
+        max_callbacks_per_poll: int = _DEFAULT_MAX_CALLBACKS_PER_POLL,
+        max_frame_ms: float = _DEFAULT_MAX_FRAME_MS,
+        idle_interval_ms: int = _DEFAULT_IDLE_INTERVAL_MS,
+        clock: Callable[[], float] | None = None,
     ) -> None:
+        if max_callbacks_per_poll <= 0:
+            raise ValueError("max_callbacks_per_poll must be positive")
+        if max_frame_ms <= 0:
+            raise ValueError("max_frame_ms must be positive")
+        if idle_interval_ms <= 0:
+            raise ValueError("idle_interval_ms must be positive")
         self._root = root
         self._mailbox = mailbox
         # 默认 50ms 对应 20 次/秒，满足 UI 响应需求且不过度消耗 CPU。
@@ -162,8 +200,17 @@ class TkUICallbackPump:
         self._after_id: str | None = None
         self._closed = False
         self._on_error = on_error
+        self._max_callbacks_per_poll = max_callbacks_per_poll
+        self._max_frame_seconds = max_frame_ms / 1000.0
+        self._idle_interval_ms = idle_interval_ms
+        self._clock = clock or time.monotonic
+        self._deferred_callbacks: deque[Callable[[], None]] = deque()
         self._executed_count = 0
         self._error_count = 0
+        self._last_frame_callback_count = 0
+        self._last_frame_duration_ms = 0.0
+        self._max_frame_duration_ms = 0.0
+        self._over_budget_frame_count = 0
 
     def start(self) -> None:
         """启动事件泵。幂等：已启动或已关闭时不再调度。"""
@@ -171,17 +218,45 @@ class TkUICallbackPump:
             return
         self._after_id = self._root.after(self._interval_ms, self._poll)
 
+    def _schedule_backlog_poll(self) -> None:
+        """Yield to Tk before continuing an accumulated callback backlog."""
+        if self._closed or self._after_id is not None:
+            return
+        after_idle = getattr(self._root, "after_idle", None)
+        if callable(after_idle):
+            self._after_id = after_idle(self._poll)
+        else:
+            self._after_id = self._root.after(_BACKLOG_FALLBACK_INTERVAL_MS, self._poll)
+
+    def _schedule_idle_poll(self) -> None:
+        if self._closed or self._after_id is not None:
+            return
+        self._after_id = self._root.after(self._idle_interval_ms, self._poll)
+
+    def _take_callbacks_for_frame(self) -> list[Callable[[], None]]:
+        callbacks: list[Callable[[], None]] = []
+        while self._deferred_callbacks and len(callbacks) < self._max_callbacks_per_poll:
+            callbacks.append(self._deferred_callbacks.popleft())
+        remaining = self._max_callbacks_per_poll - len(callbacks)
+        if remaining:
+            callbacks.extend(self._mailbox.drain(remaining))
+        return callbacks
+
     def _poll(self) -> None:
         """排空邮箱并执行回调。只在 Tk 主线程执行。"""
         self._after_id = None
         if self._closed:
             return
-        callbacks = self._mailbox.drain()
-        for callback in callbacks:
+        started_at = self._clock()
+        callbacks = self._take_callbacks_for_frame()
+        executed_this_frame = 0
+        for index, callback in enumerate(callbacks):
             try:
                 callback()
                 self._executed_count += 1
+                executed_this_frame += 1
             except Exception as exc:
+                executed_this_frame += 1
                 self._error_count += 1
                 # 记录异常但不中断后续回调
                 logger.debug("UI 回调执行异常: %s", exc, exc_info=True)

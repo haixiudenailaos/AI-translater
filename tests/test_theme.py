@@ -67,9 +67,9 @@ class TestContrastTokens:
         fg = COLORS[fg_token]
         bg = COLORS[bg_token]
         ratio = _contrast_ratio(fg, bg)
-        assert ratio >= 4.5, (
-            f"{fg_token}({fg}) on {bg_token}({bg}) 对比度仅 {ratio:.2f}:1，未达到 WCAG AA 4.5:1"
-        )
+        assert (
+            ratio >= 4.5
+        ), f"{fg_token}({fg}) on {bg_token}({bg}) 对比度仅 {ratio:.2f}:1，未达到 WCAG AA 4.5:1"
 
     def test_old_low_contrast_green_replaced(self):
         """旧 #0a0 (2.55:1) 不应再出现在 success token。"""
@@ -182,7 +182,7 @@ class TestApplyTheme:
         # ttk 实现可能返回 list of tuples
         flat = []
         for entry in selected_bg:
-            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            if isinstance(entry, list | tuple) and len(entry) == 2:
                 flat.append(entry[1])
             else:
                 flat.append(entry)

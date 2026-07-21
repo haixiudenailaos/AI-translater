@@ -48,12 +48,18 @@ from src.infrastructure.image_rewriter import (
     match_and_get_new_path,
     set_document_content,
 )
+from src.infrastructure.mapping_repository import publish_mapping_file_update
 
 
 def _png_bytes(width: int = 1, height: int = 1) -> bytes:
     buffer = BytesIO()
     Image.new("RGB", (width, height), "white").save(buffer, "PNG")
     return buffer.getvalue()
+
+
+def _publish_content_mapping(mapping_dir: str | Path, payload: dict) -> None:
+    """Publish test edits through the production mapping generation contract."""
+    publish_mapping_file_update(mapping_dir, "content_mapping.json", payload)
 
 
 # ── 8.1 原文残留 ──────────────────────────────────────
@@ -196,7 +202,7 @@ class TestResolveLocalImagePath:
 
         # 传入相对路径：优先按相对路径解析
         result = _resolve_local_image_path(tmp_path, "translated_images/manga/x.png")
-        assert result.read_bytes() == b"manga"
+        assert result == manga_dir / "x.png"
 
     def test_empty_value_returns_none(self, tmp_path):
         assert _resolve_local_image_path(tmp_path, "") is None
@@ -848,9 +854,7 @@ class TestImageContainerSegmentAlignment:
             else:
                 m["translated_text"] = "这是正常段落的译文。"
             m["translated_at"] = "2026-01-01"
-        (Path(result["mapping_dir"]) / "content_mapping.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _publish_content_mapping(result["mapping_dir"], data)
 
         # 导出应成功（不应因段落计数不一致而硬失败）
         output_path = tmp_path / "output.epub"
@@ -913,9 +917,7 @@ class TestImageContainerSegmentAlignment:
         for i, k in enumerate(data["content_mappings"].keys()):
             data["content_mappings"][k]["line_number"] = i + 1
             data["content_mappings"][k]["block_index"] = i
-        (Path(result["mapping_dir"]) / "content_mapping.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _publish_content_mapping(result["mapping_dir"], data)
 
         output_path = tmp_path / "output.epub"
         # 应抛出 SegmentCountMismatchError，因为 DOM 有 2 段但 mapping 只有 1 段
@@ -989,9 +991,7 @@ class TestImageContainerSegmentAlignment:
         for m in mappings:
             m["translated_text"] = "译文" + m["original_text"]
             m["translated_at"] = "2026-01-01"
-        (Path(result["mapping_dir"]) / "content_mapping.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _publish_content_mapping(result["mapping_dir"], data)
 
         output_path = tmp_path / "output.epub"
         proc.export_epub(result["mapping_dir"], str(output_path))
@@ -1046,9 +1046,7 @@ class TestEndToEndNoResidualOriginal:
         for m in data["content_mappings"].values():
             m["translated_text"] = "这是华恋的台词译文。"
             m["translated_at"] = "2026-01-01"
-        (Path(result["mapping_dir"]) / "content_mapping.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _publish_content_mapping(result["mapping_dir"], data)
 
         output_path = tmp_path / "output.epub"
         proc.export_epub(result["mapping_dir"], str(output_path))

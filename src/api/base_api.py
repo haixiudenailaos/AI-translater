@@ -63,7 +63,6 @@ class BaseAPI:
         self.base_url = normalize_openai_base_url(raw_base_url) if raw_base_url else ""
         self.api_key = config.get("api_key", "").strip()
         self.model_name = config.get("model_name", self.DEFAULT_MODEL)
-        self.max_tokens = config.get("max_tokens", 2048)
         self.temperature = config.get("temperature", 0.3)
         self._cancel_event = threading.Event()
         self._current_client: httpx.Client | None = None
@@ -263,7 +262,6 @@ class BaseAPI:
                     json={
                         "model": self.model_name,
                         "messages": [{"role": "user", "content": "ping"}],
-                        "max_tokens": 1,
                         "temperature": 0.0,
                         "stream": False,
                     },
@@ -345,7 +343,6 @@ class BaseAPI:
         request_data = {
             "model": context.get("model", self.model_name),
             "messages": messages,
-            "max_tokens": context.get("max_tokens", self.max_tokens),
             "temperature": context.get("temperature", self.temperature),
             "stream": False,
         }
@@ -474,7 +471,6 @@ class BaseAPI:
                         json={
                             "model": self.model_name,
                             "messages": messages,
-                            "max_tokens": self.max_tokens,
                             "temperature": self.temperature,
                             "stream": True,
                         },
@@ -610,7 +606,6 @@ class BaseAPI:
                 request_data = {
                     "model": model_override or self.model_name,
                     "messages": messages,
-                    "max_tokens": self.max_tokens,
                     "temperature": 0.3,
                     "stream": False,
                 }

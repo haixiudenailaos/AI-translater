@@ -57,9 +57,9 @@ class ValidateIntRangeTests(unittest.TestCase):
         self.assertIsNone(validate_int_range(5, 1, 10, "字段"))
 
     def test_below_lo_returns_message(self):
-        msg = validate_int_range(0, 1, 10, "最大令牌数")
+        msg = validate_int_range(0, 1, 10, "批次 token 数")
         self.assertIsNotNone(msg)
-        self.assertIn("最大令牌数", msg)
+        self.assertIn("批次 token 数", msg)
         self.assertIn("1", msg)
 
     def test_above_hi_returns_message(self):
@@ -213,6 +213,7 @@ class _StubConfigManager:
             "api_key": "",
             "base_url": "https://api.siliconflow.cn/v1",
             "model_name": "deepseek-ai/DeepSeek-V3.2",
+            # 旧配置字段：设置页必须忽略且不再保存。
             "max_tokens": 4000,
             "temperature": 0.3,
         }
@@ -322,12 +323,10 @@ class SettingsWindowValidationTests(unittest.TestCase):
     def test_form_validator_registered_for_all_spinboxes(self):
         """所有 spinbox 都应注册到 form_validator。"""
         dialog = self._make_dialog()
-        # 13 个整数 spinbox，以及火山 API 地址和模型两个必填文本字段。
+        # 10 个整数 spinbox，以及火山 API 地址和模型两个必填文本字段。
         registered_names = [f.name for f in dialog._form_validator._fields]
         expected = {
-            "max_tokens",
             "batch_lines",
-            "batch_token_budget",
             "translation_concurrency",
             "ui_font_size",
             "queue_max_in_flight",
@@ -335,7 +334,6 @@ class SettingsWindowValidationTests(unittest.TestCase):
             "queue_max_active",
             "queue_per_task_soft",
             "queue_batch_lines",
-            "queue_batch_tokens",
             "queue_rpm",
             "queue_tpm",
             "volc_base_url",
@@ -343,6 +341,14 @@ class SettingsWindowValidationTests(unittest.TestCase):
         }
         self.assertEqual(set(registered_names), expected)
         self.assertEqual(len(registered_names), len(expected))
+
+    def test_api_form_does_not_expose_or_submit_max_tokens(self):
+        dialog = self._make_dialog()
+
+        self.assertFalse(hasattr(dialog, "max_tokens_var"))
+        self.assertNotIn("max_tokens", dialog._current_api_form_config())
+        self.assertFalse(hasattr(dialog, "batch_token_budget_var"))
+        self.assertFalse(hasattr(dialog, "queue_batch_tokens_var"))
 
     def test_volc_fields_render_without_image_client_dependencies(self):
         """设置页不得因 OpenAI 图片客户端依赖缺失而只渲染上半截。"""
@@ -368,39 +374,38 @@ class SettingsWindowValidationTests(unittest.TestCase):
 
     def test_validate_form_catches_out_of_range_int(self):
         dialog = self._make_dialog()
-        # 把 max_tokens 设为越界值（>32768）
-        dialog.max_tokens_var.set(999999)
+        dialog.batch_lines_var.set(999999)
         ok, msg, widget = dialog._validate_form()
         self.assertFalse(ok)
-        self.assertIn("最大令牌数", msg)
-        # 首错聚焦到 max_tokens_spin
+        self.assertIn("批次翻译行数", msg)
         self.assertIs(widget, dialog._form_validator._fields[0].widget)
 
     def test_validate_form_first_error_focuses_earliest_failed_field(self):
         dialog = self._make_dialog()
         # 同时让两个字段越界，首错应聚焦到注册顺序靠前的那个
-        dialog.max_tokens_var.set(-1)  # 越界
-        dialog.batch_lines_var.set(99999)  # 越界
+        dialog.batch_lines_var.set(-1)
+        dialog.translation_concurrency_var.set(99999)
         ok, msg, widget = dialog._validate_form()
         self.assertFalse(ok)
-        # max_tokens 是第一个注册的，应作为首错
-        self.assertIn("最大令牌数", msg)
-        # widget 应是 max_tokens 的 spinbox（第一个注册的）
-        max_tokens_spec = next(f for f in dialog._form_validator._fields if f.name == "max_tokens")
-        self.assertIs(widget, max_tokens_spec.widget)
+        self.assertIn("批次翻译行数", msg)
+        batch_lines_spec = next(
+            field for field in dialog._form_validator._fields if field.name == "batch_lines"
+        )
+        self.assertIs(widget, batch_lines_spec.widget)
 
     def test_focus_out_clamps_out_of_range_spinbox(self):
         """P2-5：``<FocusOut>`` 时自动收敛越界值。"""
         dialog = self._make_dialog()
-        dialog.max_tokens_var.set(999999)
-        # 触发 FocusOut 事件
-        max_tokens_spec = next(f for f in dialog._form_validator._fields if f.name == "max_tokens")
-        dialog._form_validator.clamp_field(max_tokens_spec)
-        self.assertEqual(dialog.max_tokens_var.get(), 32768)
+        dialog.batch_lines_var.set(999999)
+        batch_lines_spec = next(
+            field for field in dialog._form_validator._fields if field.name == "batch_lines"
+        )
+        dialog._form_validator.clamp_field(batch_lines_spec)
+        self.assertEqual(dialog.batch_lines_var.get(), 20)
 
-        dialog.max_tokens_var.set(0)
-        dialog._form_validator.clamp_field(max_tokens_spec)
-        self.assertEqual(dialog.max_tokens_var.get(), 1000)
+        dialog.batch_lines_var.set(0)
+        dialog._form_validator.clamp_field(batch_lines_spec)
+        self.assertEqual(dialog.batch_lines_var.get(), 1)
 
     # ── testing busy 状态 ──
 
@@ -548,8 +553,7 @@ class SettingsWindowValidationTests(unittest.TestCase):
     def test_save_settings_blocks_when_form_invalid(self):
         """P2-5：表单校验失败时 save_settings 不应触发持久化。"""
         dialog = self._make_dialog()
-        # 让 max_tokens 越界
-        dialog.max_tokens_var.set(-999)
+        dialog.batch_lines_var.set(-999)
 
         with patch("src.ui.settings_window.messagebox.showwarning"):
             dialog.save_settings()
@@ -558,6 +562,19 @@ class SettingsWindowValidationTests(unittest.TestCase):
         self.assertEqual(self.config_manager.save_volc_calls, [])
         self.assertEqual(self.config_manager.save_api_calls, [])
         self.assertEqual(self.config_manager.save_app_calls, [])
+
+    def test_save_settings_drops_legacy_token_limit_fields(self):
+        dialog = self._make_dialog()
+        dialog.app_config["batch_max_input_tokens"] = 6000
+        dialog.app_config["queue_batch_max_input_tokens"] = 16000
+
+        with patch("src.ui.settings_window.messagebox.showinfo"):
+            dialog.save_settings()
+
+        self.assertNotIn("max_tokens", self.config_manager.save_api_calls[-1])
+        saved_app = self.config_manager.save_app_calls[-1]
+        self.assertNotIn("batch_max_input_tokens", saved_app)
+        self.assertNotIn("queue_batch_max_input_tokens", saved_app)
 
 
 if __name__ == "__main__":

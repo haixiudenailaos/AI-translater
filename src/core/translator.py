@@ -15,6 +15,7 @@ from ..api.deepseek_api import DeepseekAPI
 from ..api.openai_compatible_api import OpenAICompatibleAPI
 from ..api.siliconflow_api import SiliconFlowAPI
 from ..config.translation_profile import (
+    DEFAULT_OUTPUT_TOKEN_RESERVE,
     DEFAULT_QUEUE_TRANSLATION_BATCH_LINES,
     DEFAULT_QUEUE_TRANSLATION_CONCURRENCY,
     DEFAULT_QUEUE_TRANSLATION_INPUT_TOKENS,
@@ -205,8 +206,7 @@ class TranslatorEngine:
         if callable(budget_recommendation):
             configured = budget_recommendation(configured)
         context_window = max(4096, int(api_config.get("context_window_tokens", 32768)))
-        output_reserve = max(256, int(api_config.get("max_tokens", 4000)))
-        context_safe_budget = max(512, context_window - output_reserve - 1024)
+        context_safe_budget = max(512, context_window - DEFAULT_OUTPUT_TOKEN_RESERVE - 1024)
         return min(configured, context_safe_budget)
 
     def _get_shared_limiter(self, api_config: dict) -> ProviderLimiter | None:
@@ -366,8 +366,7 @@ class TranslatorEngine:
         if callable(budget_recommendation):
             configured_input_budget = budget_recommendation(configured_input_budget)
         context_window = max(4096, int(api_config.get("context_window_tokens", 32768)))
-        output_reserve = max(256, int(api_config.get("max_tokens", 4000)))
-        context_safe_budget = max(512, context_window - output_reserve - 1024)
+        context_safe_budget = max(512, context_window - DEFAULT_OUTPUT_TOKEN_RESERVE - 1024)
         input_token_budget = min(configured_input_budget, context_safe_budget)
         if concurrency_override is None:
             concurrency = max(

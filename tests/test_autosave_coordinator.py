@@ -543,9 +543,9 @@ def test_cancel_debounce_actually_invokes_after_cancel():
     coordinator.mark_dirty(source="edit")
 
     # 第一次的 debounce after_id 必须出现在 cancelled 列表中
-    assert first_debounce_ids[0] in root.cancelled, (
-        "连续 mark_dirty 时未通过 after_cancel 取消旧 debounce after_id，PERF §8 D-1 修正未生效"
-    )
+    assert (
+        first_debounce_ids[0] in root.cancelled
+    ), "连续 mark_dirty 时未通过 after_cancel 取消旧 debounce after_id，PERF §8 D-1 修正未生效"
 
 
 def test_closed_coordinator_rejects_debounce_callbacks():
@@ -665,9 +665,9 @@ def test_discard_pending_dirty_state_does_not_save():
     # 没有任何写入发生
     assert file_handler.writes == []
     # 所有已调度的 debounce/max_delay 应被取消
-    assert all(aid in root.cancelled for aid in scheduled_ids), (
-        "discard_pending 必须取消所有已调度的 after 回调"
-    )
+    assert all(
+        aid in root.cancelled for aid in scheduled_ids
+    ), "discard_pending 必须取消所有已调度的 after 回调"
 
 
 def test_discard_pending_save_failed_state_clears_without_save():

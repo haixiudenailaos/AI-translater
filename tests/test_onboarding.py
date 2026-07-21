@@ -9,7 +9,7 @@ target 和 action 验证开始、前进、后退、稍后、跳过、完成以�
 import copy
 import unittest
 
-from src.ui.onboarding import STEPS, OnboardingController
+from src.ui.onboarding import STEPS, OnboardingController, OnboardingPanel
 
 # ── 测试替身 ────────────────────────────────────────
 
@@ -52,6 +52,22 @@ class _FakePanel:
 
     def close(self):
         self.closed = True
+
+
+class _FakePanelFrame:
+    def __init__(self):
+        self.pack_calls = []
+        self.hidden = False
+        self.destroyed = False
+
+    def pack(self, **kwargs):
+        self.pack_calls.append(kwargs)
+
+    def pack_forget(self):
+        self.hidden = True
+
+    def destroy(self):
+        self.destroyed = True
 
 
 class _FakeConfigManager:
@@ -154,6 +170,24 @@ class ConfigNormalizationTests(unittest.TestCase):
             }
         )
         self.assertEqual(controller._state["completed_steps"], ["welcome", "api"])
+
+
+class OnboardingPanelVisibilityTests(unittest.TestCase):
+    def test_show_and_hide_notify_host_visibility(self):
+        visibility = []
+        panel = OnboardingPanel.__new__(OnboardingPanel)
+        panel._closed = False
+        panel._visible = False
+        panel._frame = _FakePanelFrame()
+        panel._on_visibility_changed = visibility.append
+        panel._bind_shortcuts = lambda: None
+        panel._unbind_shortcuts = lambda: None
+
+        panel.show()
+        panel.hide()
+
+        self.assertEqual(visibility, [True, False])
+        self.assertTrue(panel._frame.hidden)
 
 
 # ── 自动展示规则 ────────────────────────────────────

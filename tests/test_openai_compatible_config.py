@@ -52,6 +52,18 @@ def test_normalize_openai_base_url_rejects_remote_http(value):
         normalize_openai_base_url(value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://token@example.com/v1",
+        "https://user:password@example.com/v1",
+    ],
+)
+def test_normalize_openai_base_url_rejects_embedded_credentials(value):
+    with pytest.raises(ValueError, match="用户名或密码"):
+        normalize_openai_base_url(value)
+
+
 def test_save_api_config_rejects_remote_http_outside_settings_ui(tmp_config_manager):
     """Endpoint policy must hold for programmatic/config-file callers too."""
     from src.domain.secret import StorageStatus
@@ -116,6 +128,7 @@ def test_custom_provider_config_is_saved_without_plaintext_key(
             "base_url": "https://api.example.com/v1",
             "api_key": "sk-custom-secret",
             "model_name": "example-chat-model",
+            "max_tokens": 999999,
         }
     )
 
@@ -126,11 +139,14 @@ def test_custom_provider_config_is_saved_without_plaintext_key(
     disk_config = json.loads(tmp_config_manager.api_config_file.read_text(encoding="utf-8"))
     assert "api_key" not in disk_config
     assert "provider_keys" not in disk_config
+    assert "max_tokens" not in disk_config
+    assert "max_tokens" not in tmp_config_manager.get_api_config()
     assert disk_config["provider_configs"][OPENAI_COMPATIBLE_PROVIDER] == {
         "base_url": "https://api.example.com/v1",
         "model_name": "example-chat-model",
     }
-    assert stored_keys[f"provider:{OPENAI_COMPATIBLE_PROVIDER}"] == "sk-custom-secret"
+    secret_reference = disk_config["active_secret_ref"]
+    assert stored_keys[secret_reference] == "sk-custom-secret"
 
     saved_custom = tmp_config_manager.get_provider_config(OPENAI_COMPATIBLE_PROVIDER)
     assert saved_custom == {
@@ -145,9 +161,7 @@ def test_custom_provider_config_is_saved_without_plaintext_key(
     # P1-2：reloaded_manager 也注入相同的 FakeSecretStore
     reloaded_manager._secret_store = FakeSecretStore()
     # 恢复已存储的密钥到新实例（模拟 keyring 持久化）
-    reloaded_manager._secret_store.store(
-        f"provider:{OPENAI_COMPATIBLE_PROVIDER}", "sk-custom-secret"
-    )
+    reloaded_manager._secret_store.store(secret_reference, "sk-custom-secret")
     assert reloaded_manager.get_api_config()["provider"] == OPENAI_COMPATIBLE_PROVIDER
     assert reloaded_manager.get_provider_config(OPENAI_COMPATIBLE_PROVIDER) == saved_custom
 

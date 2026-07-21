@@ -106,6 +106,8 @@ a = Analysis(
         'requests',
         'aiohttp',
         'openai',
+        'volcenginesdkarkruntime',
+        'volcenginesdkcore',
         'keyring',
         'tkinter',
         'tkinter.ttk',

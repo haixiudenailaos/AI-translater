@@ -14,6 +14,7 @@ ImageTranslationProvider.translate() 协议内执行。
 
 import asyncio
 import threading
+import time
 from typing import Awaitable, TypeVar
 
 from ...utils.logger import get_logger
@@ -41,17 +42,18 @@ class MangaRuntime:
         with self._lock:
             if self._started:
                 return
-            self._loop = asyncio.new_event_loop()
+            loop = asyncio.new_event_loop()
+            self._loop = loop
 
             def _run() -> None:
-                asyncio.set_event_loop(self._loop)
-                self._loop.run_forever()
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
 
             self._thread = threading.Thread(target=_run, name="manga-runtime", daemon=True)
             self._thread.start()
             self._started = True
 
-    def run(self, coro: Awaitable[T]) -> T:
+    def run(self, coro: Awaitable[T], *, timeout_seconds: float | None = None) -> T:
         """在后台 loop 中运行协程并阻塞等待结果。
 
         Raises:
@@ -62,7 +64,11 @@ class MangaRuntime:
             self.start()
         assert self._loop is not None
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)  # type: ignore[arg-type]
-        return future.result()
+        try:
+            return future.result(timeout=timeout_seconds)
+        except TimeoutError:
+            future.cancel()
+            raise
 
     def schedule(self, coro: Awaitable[T]) -> "asyncio.Future[T]":
         """在后台 loop 中调度协程，不阻塞等待。"""
@@ -71,7 +77,7 @@ class MangaRuntime:
         assert self._loop is not None
         return asyncio.run_coroutine_threadsafe(coro, self._loop)  # type: ignore[return-value]
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, timeout_seconds: float = 10.0) -> bool:
         """停止 loop 并等待线程退出（幂等）。
 
         P1-3：修正关闭顺序——必须先在 loop 仍在运行时调度取消所有 pending
@@ -80,17 +86,15 @@ class MangaRuntime:
         取消请求不会被处理，async generator 也不会运行 ``aclose``，
         造成资源泄漏和 "Task was destroyed but it is pending!" 警告。
         """
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
         with self._lock:
             if not self._started:
-                return
+                return True
             loop = self._loop
             thread = self._thread
-            self._started = False
-            self._loop = None
-            self._thread = None
 
         if loop is None or thread is None:
-            return
+            return True
 
         if loop.is_running():
             # P1-3：在 loop 仍在运行时调度 graceful shutdown 协程
@@ -112,8 +116,8 @@ class MangaRuntime:
 
             try:
                 future = asyncio.run_coroutine_threadsafe(_graceful_shutdown(), loop)
-                # 等待 graceful shutdown 完成，但限制总时长
-                future.result(timeout=10)
+                # 所有清理步骤共享同一个绝对 deadline，不能各自再等完整超时。
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
             except Exception as exc:
                 logger.warning("调度 graceful shutdown 失败: %s", exc)
             # graceful shutdown 完成后停止 loop
@@ -122,13 +126,22 @@ class MangaRuntime:
             except Exception as exc:
                 logger.warning("停止 event loop 失败: %s", exc)
 
-        # 等待 loop 线程退出
-        thread.join(timeout=10)
+        # 等待 loop 线程退出。线程仍存活时不能关闭其 event loop；否则会与
+        # 正在执行的协程竞争并产生 pending-task 警告。
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if thread.is_alive():
             logger.warning("MangaRuntime 线程在 shutdown 后仍未退出")
+            return False
 
-        # 关闭 loop（此时已停止，可安全 close）
+        # 此时线程已经退出，可安全关闭 loop 并发布“已关闭”的状态。
         try:
             loop.close()
         except Exception as exc:
             logger.warning("关闭 event loop 失败: %s", exc)
+            return False
+        with self._lock:
+            if self._loop is loop:
+                self._started = False
+                self._loop = None
+                self._thread = None
+        return True

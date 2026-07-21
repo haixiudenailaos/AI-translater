@@ -98,7 +98,7 @@ class FormValidator:
     用法::
 
         validator = FormValidator()
-        validator.register_int("max_tokens", "最大令牌数", var, spin_widget, 1000, 32768)
+        validator.register_int("batch_lines", "批次翻译行数", var, 1, 200, spin_widget)
         result = validator.validate_all()
         if not result.ok:
             messagebox.showwarning("配置无效", result.first_message)

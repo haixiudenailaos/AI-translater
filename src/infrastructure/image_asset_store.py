@@ -19,15 +19,20 @@ import base64
 import binascii
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Dict
 
 from ..utils.logger import get_logger
-from .atomic_file import write_bytes_atomic, write_json_atomic
+from .atomic_file import write_bytes_atomic
+from .mapping_repository import publish_mapping_file_update, resolve_mapping_file
 
 logger = get_logger(__name__)
 
 _ASSETS_DIR = "assets"
+_READ_RETRY_COUNT = 8
+_READ_RETRY_BASE_DELAY = 0.01
+IMAGE_MAPPING_SCHEMA_VERSION = 2
 
 # 文件名安全的扩展名提取
 _EXT_MAP = {
@@ -43,6 +48,18 @@ _EXT_MAP = {
 
 class ImagePathValidationError(Exception):
     """P1-9：图片 local_path 信任边界校验失败。"""
+
+
+def _read_asset_bytes(path: Path) -> bytes:
+    """Read an asset with a bounded retry for transient Windows file locks."""
+    for attempt in range(_READ_RETRY_COUNT):
+        try:
+            return path.read_bytes()
+        except PermissionError:
+            if attempt + 1 == _READ_RETRY_COUNT:
+                raise
+            time.sleep(_READ_RETRY_BASE_DELAY * (2**attempt))
+    raise RuntimeError("unreachable")
 
 
 def _validate_local_path(mapping_dir: Path, local_path: str) -> Path:
@@ -105,7 +122,11 @@ def save_image_binary(
     image_data: bytes,
     mime_type: str,
 ) -> Dict:
-    """PERF-004：将图片以二进制写入 assets/ 目录，返回不含 Base64 的元数据。
+    """将图片写入 assets/，并保留 V1.5 风格的 Base64 原图作为回退。
+
+    某些 Windows 透明加密系统会在图片落盘后改写 JPG/PNG 字节。Base64
+    保存在 JSON 中，不会经过图片文件过滤器，因此可作为 API 调用和解码的
+    可靠来源。
 
     Args:
         mapping_dir: 映射目录
@@ -115,26 +136,26 @@ def save_image_binary(
         mime_type: MIME 类型
 
     Returns:
-        元数据字典（不含 base64_data）
+        包含本地资产元数据和 Base64 原图的字典
     """
     assets_dir = mapping_dir / _ASSETS_DIR
     assets_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = _safe_filename(index, mime_type, image_name)
+    checksum = hashlib.md5(image_data).hexdigest()
+    base_filename = _safe_filename(index, mime_type, image_name)
+    filename = f"{Path(base_filename).stem}_{checksum[:8]}{Path(base_filename).suffix}"
     file_path = assets_dir / filename
 
-    # 同一项目内按 checksum 去重
-    checksum = hashlib.md5(image_data).hexdigest()
+    # 文件名已包含原图 checksum，存在即代表同一份缓存，无需重新读取可能
+    # 被透明加密系统锁住的图片内容。
     if file_path.exists():
-        existing = file_path.read_bytes()
-        if hashlib.md5(existing).hexdigest() == checksum:
-            logger.debug("图片去重命中: %s -> %s", image_name, filename)
-        else:
-            # checksum 冲突，追加序号
-            filename = f"{index:06d}_{checksum[:8]}{Path(filename).suffix}"
-            file_path = assets_dir / filename
-
-    write_bytes_atomic(file_path, image_data)
+        logger.debug("图片去重命中: %s -> %s", image_name, filename)
+    else:
+        try:
+            write_bytes_atomic(file_path, image_data)
+        except OSError as e:
+            # Base64 是 V1.5 兼容的主数据；本地缓存失败不能丢弃有效图片。
+            logger.warning("图片缓存写入失败，保留 Base64 原图: %s", e)
 
     return {
         "original_path": image_name,
@@ -142,13 +163,29 @@ def save_image_binary(
         "mime_type": mime_type,
         "file_size": len(image_data),
         "checksum": checksum,
+        "base64_data": (f"data:{mime_type};base64," + base64.b64encode(image_data).decode("ascii")),
     }
+
+
+def _decode_embedded_base64(image_info: Dict) -> bytes | None:
+    """Decode the V1.5-compatible Base64 fallback from image metadata."""
+    b64_data = image_info.get("base64_data", "")
+    if not b64_data:
+        return None
+    if "," in b64_data:
+        b64_data = b64_data.split(",", 1)[1]
+    try:
+        return base64.b64decode(b64_data)
+    except (binascii.Error, ValueError) as e:
+        logger.warning("Base64 解码失败: %s", e)
+        return None
 
 
 def load_image_base64(mapping_dir: Path, image_info: Dict) -> str:
     """PERF-004：按需加载图片并返回 Base64 data URI。
 
-    优先从 local_path 读取二进制文件，回退到 base64_data（旧格式）。
+    优先读取 V1.5 风格的 base64_data，回退到 local_path。优先 Base64
+    可绕过会改写落盘图片的透明加密系统。
 
     P1-9：local_path 必须通过信任边界校验，拒绝绝对路径、``..`` 和
     符号链接逃逸。校验失败时记录警告并回退到 base64_data。
@@ -161,7 +198,13 @@ def load_image_base64(mapping_dir: Path, image_info: Dict) -> str:
         Base64 data URI 字符串（如 "data:image/png;base64,..."），
         如果加载失败返回空字符串。
     """
-    # 优先从二进制文件加载
+    embedded = _decode_embedded_base64(image_info)
+    if embedded is not None:
+        mime = image_info.get("mime_type", "image/png")
+        b64 = base64.b64encode(embedded).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+
+    # Base64 不存在或损坏时，回退到二进制文件。
     local_path = image_info.get("local_path", "")
     if local_path:
         try:
@@ -171,22 +214,21 @@ def load_image_base64(mapping_dir: Path, image_info: Dict) -> str:
             return ""
         if file_path.exists():
             try:
-                data = file_path.read_bytes()
+                data = _read_asset_bytes(file_path)
                 mime = image_info.get("mime_type", "image/png")
                 b64 = base64.b64encode(data).decode("ascii")
                 return f"data:{mime};base64,{b64}"
             except OSError as e:
                 logger.warning("读取图片二进制失败: %s", e)
 
-    # 回退到旧格式 base64_data
-    b64_data = image_info.get("base64_data", "")
-    return b64_data
+    return ""
 
 
 def load_image_bytes(mapping_dir: Path, image_info: Dict) -> bytes | None:
     """PERF-004：按需加载图片二进制数据。
 
-    优先从 local_path 读取，回退解码 base64_data。
+    优先解码 V1.5 风格的 base64_data，回退到 local_path。这样即使
+    透明加密系统改写了 assets 下的图片，图片翻译仍使用导入时的原始字节。
 
     P1-9：local_path 必须通过信任边界校验，拒绝绝对路径、``..`` 和
     符号链接逃逸。校验失败时记录警告并回退到 base64_data。
@@ -198,6 +240,10 @@ def load_image_bytes(mapping_dir: Path, image_info: Dict) -> bytes | None:
     Returns:
         原始二进制数据，加载失败返回 None。
     """
+    embedded = _decode_embedded_base64(image_info)
+    if embedded is not None:
+        return embedded
+
     local_path = image_info.get("local_path", "")
     if local_path:
         try:
@@ -207,28 +253,18 @@ def load_image_bytes(mapping_dir: Path, image_info: Dict) -> bytes | None:
             file_path = None
         if file_path is not None and file_path.exists():
             try:
-                return file_path.read_bytes()
+                return _read_asset_bytes(file_path)
             except OSError as e:
                 logger.warning("读取图片二进制失败: %s", e)
-
-    # 回退解码 base64_data
-    b64_data = image_info.get("base64_data", "")
-    if b64_data:
-        if "," in b64_data:
-            b64_data = b64_data.split(",", 1)[1]
-        try:
-            return base64.b64decode(b64_data)
-        except (binascii.Error, ValueError) as e:
-            logger.warning("Base64 解码失败: %s", e)
 
     return None
 
 
 def migrate_legacy_images(mapping_dir: Path) -> bool:
-    """PERF-004：迁移旧格式 images.json，将 Base64 解码为二进制文件。
+    """为旧 images.json 补充本地资产，同时保留 Base64 原图。
 
     检测 images.json 中是否含有 base64_data 字段，如果有则逐张解码
-    到 assets/ 目录，生成新元数据，原子写入新 schema。
+    到 assets/ 目录。Base64 不再删除，以兼容会改写落盘图片的透明加密系统。
 
     Args:
         mapping_dir: 映射目录
@@ -236,7 +272,7 @@ def migrate_legacy_images(mapping_dir: Path) -> bool:
     Returns:
         True 表示执行了迁移，False 表示无需迁移。
     """
-    images_file = mapping_dir / "images.json"
+    images_file = resolve_mapping_file(mapping_dir, "images.json")
     if not images_file.exists():
         return False
 
@@ -250,7 +286,7 @@ def migrate_legacy_images(mapping_dir: Path) -> bool:
     if not image_mappings:
         return False
 
-    migrated = False
+    changed = False
     for idx, (image_path, info) in enumerate(image_mappings.items()):
         # 已有 local_path 且文件存在，跳过
         local_path = info.get("local_path", "")
@@ -284,10 +320,16 @@ def migrate_legacy_images(mapping_dir: Path) -> bool:
             if k in info:
                 new_info[k] = info[k]
         image_mappings[image_path] = new_info
-        migrated = True
+        changed = True
 
-    if migrated:
-        write_json_atomic(images_file, {"image_mappings": image_mappings})
-        logger.info("PERF-004: 迁移完成，%d 张图片已转为二进制存储", len(image_mappings))
+    has_embedded_fallbacks = all(bool(info.get("base64_data")) for info in image_mappings.values())
+    if has_embedded_fallbacks and images_data.get("schema_version") != IMAGE_MAPPING_SCHEMA_VERSION:
+        images_data["schema_version"] = IMAGE_MAPPING_SCHEMA_VERSION
+        changed = True
 
-    return migrated
+    if changed:
+        images_data["image_mappings"] = image_mappings
+        publish_mapping_file_update(mapping_dir, "images.json", images_data)
+        logger.info("图片映射兼容迁移完成，共 %d 张图片", len(image_mappings))
+
+    return changed

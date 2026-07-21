@@ -133,8 +133,9 @@ class TestSaveApiConfigSecretStatus:
         assert bool(result) is True
         # 内存配置已更新
         assert tmp_config_manager.api_config["api_key"] == "sk-test-key"
-        # 密钥已存储
-        assert store.stored["provider:siliconflow"] == "sk-test-key"
+        # 密钥由配置中的不透明版本引用定位
+        reference = tmp_config_manager.api_config["active_secret_ref"]
+        assert store.stored[reference] == "sk-test-key"
 
     def test_failed_does_not_update_config(self, tmp_config_manager):
         """P1-2：FAILED 时不更新内存配置，不写入 JSON"""
@@ -156,7 +157,7 @@ class TestSaveApiConfigSecretStatus:
         # 内存配置未被更新（保持原样）
         assert tmp_config_manager.api_config == original_config
         # 密钥未存储
-        assert "provider:siliconflow" not in store.stored
+        assert store.stored == {}
 
     def test_session_only_allows_session(self, tmp_config_manager):
         """P1-2：SESSION_ONLY 允许继续会话，但标记为 session_only"""
@@ -178,8 +179,9 @@ class TestSaveApiConfigSecretStatus:
         assert "未持久化" in result.user_message
         # 内存配置已更新（允许会话使用）
         assert tmp_config_manager.api_config["api_key"] == "sk-session-key"
-        # 密钥已存储到环境变量（FakeSecretStore 模拟）
-        assert store.stored["provider:siliconflow"] == "sk-session-key"
+        # 密钥由当前会话的版本引用定位（FakeSecretStore 模拟环境变量）。
+        reference = tmp_config_manager.api_config["active_secret_ref"]
+        assert store.stored[reference] == "sk-session-key"
 
     def test_store_exception_returns_failed(self, tmp_config_manager):
         """P1-2：SecretStore.store 抛异常时返回 FAILED"""

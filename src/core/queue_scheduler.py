@@ -63,6 +63,8 @@ from .translator import TranslationRunContext, TranslatorEngine
 
 logger = get_logger(__name__)
 
+_QUEUE_CLOSE_TIMEOUT_SECONDS = 10.0
+
 
 # ── 数据结构（不可变） ─────────────────────────────────
 
@@ -190,6 +192,20 @@ class BatchOutcome:
     recommended_action: str | None = None
     error_retryable: bool = False
     correlation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _InFlightBatch:
+    """Future 的资源所有权记录。
+
+    ``_active_limiter`` 仅用于当前 UI/默认视图，不能决定已经派发请求的
+    资源回收。每个 Future 固定持有提交时获取槽位的 limiter，保证配置在
+    运行中切换时仍能成对 acquire/release。
+    """
+
+    task_id: str
+    batch_id: int
+    limiter: ProviderLimiter
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,6 +522,9 @@ class _TaskSlot:
     state: QueueTaskState = QueueTaskState.PENDING
     attempt_id: str = ""
     engine: TranslatorEngine | None = None
+    # 一个 attempt 在准备完成时固定其 Provider limiter。后续设置切换只会
+    # 影响新 attempt，不能改变旧批次的并发归属。
+    limiter: ProviderLimiter | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
     # 批次队列（未提交）
     pending_batches: deque = field(default_factory=deque)
@@ -611,7 +630,7 @@ class QueueTranslationCoordinator:
             max_workers=max(1, policy.hard_request_cap),
             thread_name_prefix="queue-batch",
         )
-        self._in_flight: Dict[Future, Tuple[str, int]] = {}  # future -> (task_id, batch_id)
+        self._in_flight: Dict[Future, _InFlightBatch] = {}
         self._finalizer_executor = ThreadPoolExecutor(
             max_workers=2,
             thread_name_prefix="queue-finalizer",
@@ -659,10 +678,11 @@ class QueueTranslationCoordinator:
             self._scheduler_thread.start()
 
     def close(self) -> None:
-        """关闭调度器：停止派发，等待在途请求结束（带超时），关闭引擎和执行池。
+        """关闭调度器：在单一 deadline 内停止派发并释放资源。
 
         幂等可安全多次调用。关闭后命令被忽略。
         """
+        deadline = time.monotonic() + _QUEUE_CLOSE_TIMEOUT_SECONDS
         engines_to_stop: list[TranslatorEngine] = []
         with self._lock:
             if self._closed:
@@ -678,28 +698,62 @@ class QueueTranslationCoordinator:
             self._stop_engine(engine)
         # 等待调度线程退出（它会 drain 在途并关闭引擎）
         if self._scheduler_thread is not None:
-            self._scheduler_thread.join(timeout=10.0)
+            self._scheduler_thread.join(timeout=self._remaining_close_time(deadline))
         # 兜底关闭执行池
         self._executor.shutdown(wait=False, cancel_futures=True)
-        if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
-            self._finalizer_executor.shutdown(wait=False, cancel_futures=True)
-        else:
+        scheduler_alive = self._scheduler_thread is not None and self._scheduler_thread.is_alive()
+        if scheduler_alive:
             logger.warning("队列调度线程在关闭 deadline 后仍在清理资源")
         # 关闭所有检查点协调器（触发最后一次关键保存）
         for slot in list(self._tasks.values()):
+            remaining = self._remaining_close_time(deadline)
+            if remaining <= 0:
+                logger.warning("队列关闭 deadline 已耗尽，跳过剩余检查点关闭")
+                break
             if slot.checkpoint is not None:
                 try:
-                    slot.checkpoint.close()
-                except Exception:
-                    pass
-        # 关闭所有引擎
+                    slot.checkpoint.close(timeout=remaining)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("关闭任务 %s 的检查点失败: %s", slot.task_id, exc)
+
+        # 在 finalizer executor 中关闭剩余引擎，并只等待全局 deadline 的剩余时间。
+        engine_futures: list[Future] = []
         for slot in list(self._tasks.values()):
-            self._close_engine(slot)
+            with self._lock:
+                engine = slot.engine
+                slot.engine = None
+            if engine is None:
+                continue
+            if self._remaining_close_time(deadline) <= 0:
+                logger.warning("队列关闭 deadline 已耗尽，跳过剩余引擎关闭")
+                break
+            try:
+                engine_futures.append(
+                    self._finalizer_executor.submit(self._finalize_task_resources, None, engine)
+                )
+            except RuntimeError as exc:
+                logger.warning("提交任务 %s 的引擎关闭失败: %s", slot.task_id, exc)
+        for future in engine_futures:
+            remaining = self._remaining_close_time(deadline)
+            if remaining <= 0:
+                logger.warning("队列关闭 deadline 已耗尽，仍有引擎在后台清理")
+                break
+            try:
+                future.result(timeout=remaining)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("队列引擎关闭失败或超时: %s", exc)
+
         # 释放写锁
         for slot in list(self._tasks.values()):
             self._release_write_lock(slot)
+        if not scheduler_alive:
+            self._finalizer_executor.shutdown(wait=False, cancel_futures=True)
         if self._owns_limiter_registry:
             self._limiter_registry.close_all()
+
+    @staticmethod
+    def _remaining_close_time(deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
 
     # ── 命令接口（Tk 主线程调用） ────────────────────────
 
@@ -1018,10 +1072,13 @@ class QueueTranslationCoordinator:
     def _wait_for_events(self, timeout: float) -> None:
         """等待命令、Future 完成或 limiter cooldown 到期。"""
         wait_timeout = timeout
-        if self._active_limiter is not None and self._active_limiter.is_blocked():
-            remaining = self._active_limiter.cooldown_remaining()
-            if remaining > 0:
-                wait_timeout = min(wait_timeout, remaining)
+        with self._lock:
+            limiters = {slot.limiter for slot in self._tasks.values() if slot.limiter is not None}
+        for limiter in limiters:
+            if limiter.is_blocked():
+                remaining = limiter.cooldown_remaining()
+                if remaining > 0:
+                    wait_timeout = min(wait_timeout, remaining)
         self._wake_event.wait(timeout=max(0.0, wait_timeout))
         self._wake_event.clear()
 
@@ -1149,6 +1206,7 @@ class QueueTranslationCoordinator:
         slot.completed_batch_ids = set()
         slot.in_flight_batches = {}
         slot.pending_batches = deque()
+        slot.limiter = None
         slot.completed_lines = 0
         # P1-UX-3：任务恢复时清空旧错误（开始新一轮 attempt）
         slot.actionable_error = None
@@ -1200,8 +1258,9 @@ class QueueTranslationCoordinator:
             self._close_engine_locked(slot)
             return
 
-        # 注册/获取共享 Limiter
-        self._get_or_create_limiter_locked()
+        # 一个 attempt 固定使用准备完成时的 limiter。_active_limiter 只保留
+        # 给当前 UI 指标和新任务的默认视图，不能替代 slot 的所有权。
+        slot.limiter = self._get_or_create_limiter_locked()
 
         # 只翻译缺失行（R2-BUG-024）
         # P1-UX-2：跳过手工编辑行（不被自动任务覆盖）和显式完成行
@@ -1405,10 +1464,10 @@ class QueueTranslationCoordinator:
             meta = self._in_flight.pop(future, None)
             if meta is None:
                 continue
-            task_id, batch_id = meta
-            # 释放 limiter 槽位（与派发时的 try_acquire 配对）
-            if self._active_limiter is not None:
-                self._active_limiter.release()
+            task_id, batch_id = meta.task_id, meta.batch_id
+            # 与派发时的 try_acquire 成对。不能释放“当前” limiter：设置切换
+            # 后，当前 limiter 可能已经属于另一批任务。
+            meta.limiter.release()
             try:
                 outcome: BatchOutcome = future.result()
             except Exception as exc:  # noqa: BLE001
@@ -1684,12 +1743,6 @@ class QueueTranslationCoordinator:
         第一轮：每个 READY/RUNNING 任务最多取得 1 个槽位（per_task_soft_limit）。
         第二轮：没有其他竞争者时，把空闲槽位借给仍有工作的任务。
         """
-        if self._active_limiter is None:
-            return
-        limiter = self._active_limiter
-        if limiter.is_blocked():
-            return  # cooldown 期间不派发
-
         with self._lock:
             if self._closed:
                 return
@@ -1709,20 +1762,33 @@ class QueueTranslationCoordinator:
             if not dispatchable:
                 return
 
+            # 多 Provider 时每个 task 使用自己 attempt 固定的 limiter；执行池
+            # 仍是全局硬上限，避免 Provider 数量增加后在途 Future 无界增长。
+            hard_cap = max(1, self._policy.hard_request_cap)
+
+            def can_dispatch(slot: _TaskSlot) -> bool:
+                limiter = slot.limiter
+                return (
+                    limiter is not None
+                    and not limiter.is_blocked()
+                    and limiter.available_capacity > 0
+                )
+
             # 第一轮：round-robin，每任务最多 per_task_soft_limit 个
             soft_limit = max(1, self._policy.per_task_soft_limit)
             dispatched_any = True
-            while dispatched_any:
+            while dispatched_any and len(self._in_flight) < hard_cap:
                 dispatched_any = False
                 for slot in dispatchable:
-                    if limiter.available_capacity <= 0:
+                    if len(self._in_flight) >= hard_cap:
                         return
                     in_flight_count = len(slot.in_flight_batches)
                     if in_flight_count >= soft_limit:
                         continue
-                    if not slot.pending_batches:
+                    if not slot.pending_batches or not can_dispatch(slot):
                         continue
-                    if self._try_dispatch_one_locked(slot, limiter):
+                    assert slot.limiter is not None
+                    if self._try_dispatch_one_locked(slot, slot.limiter):
                         dispatched_any = True
                         # 第一轮每个任务只派一个，然后轮到下一个
                         break
@@ -1732,20 +1798,26 @@ class QueueTranslationCoordinator:
 
             # 第二轮：空闲槽位借用给仍有工作的任务（无其他竞争者）
             # 简化策略：若仍有容量，且只有少数任务还有 pending，借给它们
-            while limiter.available_capacity > 0:
+            failed_borrowers: set[str] = set()
+            while len(self._in_flight) < hard_cap:
                 # 找到还有 pending 且 in_flight < hard_cap 的任务
                 borrower = None
                 for slot in dispatchable:
                     if (
-                        slot.pending_batches
+                        slot.task_id not in failed_borrowers
+                        and slot.pending_batches
                         and len(slot.in_flight_batches) < self._policy.hard_request_cap
+                        and can_dispatch(slot)
                     ):
                         borrower = slot
                         break
                 if borrower is None:
                     break
-                if not self._try_dispatch_one_locked(borrower, limiter):
-                    break
+                assert borrower.limiter is not None
+                if not self._try_dispatch_one_locked(borrower, borrower.limiter):
+                    # try_acquire may lose a race with an external consumer. Try
+                    # another Provider/task before ending this dispatch pass.
+                    failed_borrowers.add(borrower.task_id)
 
     def _try_dispatch_one_locked(self, slot: _TaskSlot, limiter: ProviderLimiter) -> bool:
         """尝试派发一个批次。在持有 ``self._lock`` 时调用。
@@ -1773,9 +1845,29 @@ class QueueTranslationCoordinator:
             return False
         cancel_event = slot.cancel_event
         # 释放锁后提交？为简化，在锁内 submit（submit 不阻塞，只入队）
-        future = self._executor.submit(execute_batch_job, job, engine, cancel_event, limiter)
+        try:
+            future = self._executor.submit(execute_batch_job, job, engine, cancel_event, limiter)
+        except Exception as exc:  # noqa: BLE001
+            # 提交失败时尚没有 Future 可以在收割阶段释放槽位，因此必须在
+            # 此处完成回滚。任务进入 ERROR，用户重新开始时会重建批次。
+            slot.in_flight_batches.pop(job.batch_id, None)
+            slot.pending_batches.clear()
+            limiter.release()
+            slot.state = QueueTaskState.ERROR
+            slot.error_message = f"提交翻译批次失败：{exc}"
+            slot.actionable_error = classify_error(exc)
+            log_classified_error(
+                exc,
+                slot.actionable_error,
+                context={"task_id": slot.task_id, "phase": "executor_submit"},
+            )
+            return False
         future.add_done_callback(lambda _future: self._wake_event.set())
-        self._in_flight[future] = (slot.task_id, job.batch_id)
+        self._in_flight[future] = _InFlightBatch(
+            task_id=slot.task_id,
+            batch_id=job.batch_id,
+            limiter=limiter,
+        )
         slot.last_dispatch_at = time.monotonic()
         return True
 

@@ -176,7 +176,7 @@ def classify_error(
         )
 
     # 网络超时 / 连接失败
-    if isinstance(error, (TimeoutError, ConnectionError)) or any(
+    if isinstance(error, TimeoutError | ConnectionError) or any(
         token in lowered for token in ("timeout", "connect", "network", "连接", "超时", "网络")
     ):
         return ActionableError(

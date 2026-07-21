@@ -91,7 +91,7 @@ def sanitize_for_log(value: Any) -> Any:
         return _sanitize_string(value)
     if isinstance(value, dict):
         return {k: _sanitize_dict_value(k, v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         sanitized = [sanitize_for_log(item) for item in value]
         return type(value)(sanitized) if isinstance(value, tuple) else sanitized
     return value

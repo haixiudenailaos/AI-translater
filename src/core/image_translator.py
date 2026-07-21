@@ -13,19 +13,20 @@ import threading
 import time
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
-from typing import Callable, Dict
+from typing import Any, Callable, Dict
 from urllib.parse import urlparse
 
 import httpx
 import requests
-from openai import (
-    APIConnectionError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
-    OpenAI,
+from volcenginesdkarkruntime import Ark
+from volcenginesdkarkruntime._exceptions import (
+    ArkAPIConnectionError,
+    ArkAPITimeoutError,
+    ArkAuthenticationError,
+    ArkBadRequestError,
 )
 
+from ..config.translation_profile import normalize_openai_base_url
 from ..config.volcengine_image import (
     VOLCENGINE_IMAGE_DEFAULT_BASE_URL,
     VOLCENGINE_IMAGE_DEFAULT_MODEL,
@@ -34,6 +35,7 @@ from ..config.volcengine_image import (
 )
 from ..domain.errors import ImageTranslationCancelled
 from ..infrastructure.image_asset_store import load_image_bytes
+from ..infrastructure.mapping_repository import resolve_mapping_file
 
 # P2-7：移除模块导入期 logging.basicConfig() 副作用。
 # 全局日志配置应由 src.utils.logger.setup_logging 在组合根中显式完成，
@@ -50,6 +52,18 @@ _IMAGE_API_LIMITS = httpx.Limits(
     max_connections=5,
     # 图片生成耗时较长，Windows 上复用半失效连接容易触发 WinError 10053。
     max_keepalive_connections=0,
+)
+
+# All currently supported Seedream variants accept 2K. Seedream 5.0 pro does
+# not accept 4K or the sequential_image_generation request field.
+_IMAGE_GENERATION_SIZE = "2K"
+
+# Valid 64x64 RGB PNG used by the paid connection test. Keep this above Ark's
+# minimum 14px edge limit and verify it in a regression test before shipping.
+_CONNECTION_TEST_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoPo33UrY"
+    "vQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHL"
+    "AMpT0sIcNbcEAAAAAElFTkSuQmCC"
 )
 
 
@@ -349,10 +363,11 @@ class ImageTranslator:
         self.max_retries = 3
 
         # 火山引擎配置
+        self._configuration_error = ""
         self.volc_base_url, self.volc_model = self._load_api_config()
 
-        # PERF-005：复用 OpenAI 客户端，仅在 API Key 变化时重建
-        self._client: OpenAI | None = None
+        # PERF-005：复用火山方舟官方 SDK 客户端，仅在 API Key 变化时重建
+        self._client: Ark | None = None
         self._client_api_key: str | None = None
         self._last_error = ""
 
@@ -371,17 +386,26 @@ class ImageTranslator:
             config = image_config.get("ai_volcengine", {})
             if not isinstance(config, dict):
                 raise TypeError("火山引擎配置必须是字典")
-            base_url = str(config.get("base_url", "")).strip().rstrip("/")
+            base_url = str(config.get("base_url", "")).strip()
             model = str(config.get("model", "")).strip()
+            base_url = base_url or self.DEFAULT_BASE_URL
+            try:
+                base_url = normalize_openai_base_url(base_url)
+            except ValueError as exc:
+                self._configuration_error = f"图片翻译 API 地址无效: {exc}"
+                return "", model or self.DEFAULT_MODEL
             return (
-                base_url or self.DEFAULT_BASE_URL,
+                base_url,
                 model or self.DEFAULT_MODEL,
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取图片翻译配置失败，使用默认配置: %s", exc)
             return self.DEFAULT_BASE_URL, self.DEFAULT_MODEL
 
-    def _get_client(self) -> OpenAI | None:
-        """PERF-005：获取复用的 OpenAI 客户端，API Key 变化时才重建。"""
+    def _get_client(self) -> Ark | None:
+        """获取复用的火山方舟官方 SDK 客户端。"""
+        if self._configuration_error:
+            raise ValueError(self._configuration_error)
         api_key = self._get_api_key()
         if not api_key:
             return None
@@ -399,7 +423,7 @@ class ImageTranslator:
                 trust_env=True,
             )
             try:
-                self._client = OpenAI(
+                self._client = Ark(
                     base_url=self.volc_base_url,
                     api_key=api_key,
                     http_client=http_client,
@@ -417,7 +441,7 @@ class ImageTranslator:
     def last_error(self) -> str:
         return self._last_error
 
-    def _discard_client(self, client: OpenAI | None = None) -> None:
+    def _discard_client(self, client: Ark | None = None) -> None:
         if client is not None and client is not self._client:
             return
         current = self._client
@@ -437,7 +461,7 @@ class ImageTranslator:
                 "与火山方舟的连接被本机网络软件中止（WinError 10053）。"
                 "已重建连接，请检查防火墙、杀毒软件或网络代理。"
             )
-        if isinstance(exc, APITimeoutError):
+        if isinstance(exc, ArkAPITimeoutError):
             return "火山方舟图片生成响应超时，已重建连接后重试。"
         return "无法稳定连接火山方舟服务，已重建连接后重试。"
 
@@ -453,25 +477,21 @@ class ImageTranslator:
             return False
 
         try:
-            dummy_b64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAACQd1PeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAMSURBVFhH7cExAQAAAMKg9U9tCy8gAAAAAAAAAAAAAAAAAD4MCwABhsjxcAAAAABJRU5ErkJggg=="
-            dummy_uri, _ = _build_image_data_uri(dummy_b64, "image/png")
+            dummy_uri, _ = _build_image_data_uri(_CONNECTION_TEST_PNG_BASE64, "image/png")
 
             images_response = client.images.generate(
                 model=self.volc_model,
                 prompt="Test connection",
-                size="2K",
+                size=_IMAGE_GENERATION_SIZE,
                 response_format="url",
-                extra_body={
-                    "image": dummy_uri,
-                    "watermark": True,
-                    "sequential_image_generation": "disabled",
-                },
+                image=dummy_uri,
+                watermark=True,
             )
             return bool(images_response and images_response.data)
-        except AuthenticationError:
+        except ArkAuthenticationError:
             self._last_error = "火山方舟 API Key 无效或格式错误，请重新保存后再试。"
             return False
-        except (APIConnectionError, APITimeoutError) as e:
+        except (ArkAPIConnectionError, ArkAPITimeoutError) as e:
             self._last_error = self._connection_error_message(e)
             self._discard_client(client)
             return False
@@ -484,9 +504,9 @@ class ImageTranslator:
         self,
         mapping_dir: str,
         target_lang: str,
-        progress_callback: Callable[[int, int, str], None] = None,
-        image_mappings_override: Dict = None,
-        image_translations: Dict[str, Dict] = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        image_mappings_override: Dict[str, Dict[str, Any]] | None = None,
+        image_translations: Dict[str, Dict[str, Any]] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> Dict[str, str]:
         """
@@ -507,10 +527,11 @@ class ImageTranslator:
 
         mapping_path = Path(mapping_dir)
 
+        image_mappings: Dict[str, Dict[str, Any]]
         if image_mappings_override is not None:
             image_mappings = image_mappings_override
         else:
-            images_json_path = mapping_path / "images.json"
+            images_json_path = resolve_mapping_file(mapping_path, "images.json")
             if not images_json_path.exists():
                 print("No images.json found.")
                 return {}
@@ -522,7 +543,13 @@ class ImageTranslator:
                 print(f"Failed to load images.json: {e}")
                 return {}
 
-            image_mappings = images_data.get("image_mappings", {})
+            raw_mappings = images_data.get("image_mappings", {})
+            if not isinstance(raw_mappings, dict):
+                logger.warning("images.json 中的 image_mappings 不是对象")
+                return {}
+            image_mappings = {
+                str(name): info for name, info in raw_mappings.items() if isinstance(info, dict)
+            }
 
         if not image_mappings:
             return {}
@@ -571,10 +598,12 @@ class ImageTranslator:
                 continue
 
             mime_type = info.get("mime_type", "image/png")
-            from .image_utils import convert_to_png_bytes
+            from .image_utils import canonicalize_for_ark_image_generation
 
             logger.debug("[translate_images] 开始格式转换，mime_type=%s", mime_type)
-            converted_bytes, converted_mime = convert_to_png_bytes(raw_bytes, mime_type)
+            converted_bytes, converted_mime = canonicalize_for_ark_image_generation(
+                raw_bytes, mime_type
+            )
             if converted_bytes is None:
                 logger.warning("[translate_images] 格式转换失败，跳过: %s (%s)", name, mime_type)
                 print(f"[插图翻译] 跳过不支持的图片格式: {name} ({mime_type})")
@@ -630,16 +659,16 @@ class ImageTranslator:
 
     def _process_single_image(
         self,
-        client: OpenAI,
+        client: Ark,
         original_name: str,
         b64_str: str,
         target_lang: str,
         output_dir: Path,
-        image_translation: Dict = None,
+        image_translation: Dict[str, Any] | None = None,
         mime_type: str = "image/png",
-        original_path: str = None,
+        original_path: str | None = None,
         cancel_event: threading.Event | None = None,
-    ) -> tuple | None:
+    ) -> tuple[str, str] | None:
         """处理单张图片：上传 -> 生成 -> 下载 -> 保存
 
         Args:
@@ -675,8 +704,8 @@ class ImageTranslator:
             prompt = base_prompt
             logger.debug("[_process_single_image] 使用基础prompt: %s", prompt)
 
-        # 方舟图生图接口要求 image 为完整 data URI。通过 extra_body
-        # 注入 OpenAI SDK 未声明的方舟字段，并在此处规范化 Base64。
+        # 方舟图生图接口要求 image 为完整 data URI。官方 SDK 原生声明了
+        # image 参数；在进入 SDK 前统一规范化 Base64 和 MIME。
         try:
             data_uri, normalized_mime = _build_image_data_uri(b64_str, mime_type)
         except ValueError as exc:
@@ -701,14 +730,10 @@ class ImageTranslator:
                 images_response = client.images.generate(
                     model=self.volc_model,
                     prompt=prompt,
-                    size="4K",
+                    size=_IMAGE_GENERATION_SIZE,
                     response_format="url",
-                    extra_body={
-                        "image": data_uri,
-                        "watermark": True,
-                        # 图像翻译只需要一张结果，避免 Ark 自动多图生成。
-                        "sequential_image_generation": "disabled",
-                    },
+                    image=data_uri,
+                    watermark=True,
                 )
                 logger.debug("[_process_single_image] API响应类型: %s", type(images_response))
 
@@ -778,16 +803,16 @@ class ImageTranslator:
             except ImageTranslationCancelled:
                 # P1-8：取消异常不重试，直接向上传递
                 raise
-            except BadRequestError as exc:
+            except ArkBadRequestError as exc:
                 # 参数错误（尤其是图片编码/尺寸）不会因重试而恢复。
                 self._last_error = f"火山方舟图片参数错误: {str(exc)[:240]}"
                 logger.error("[_process_single_image] %s", self._last_error)
                 return None
-            except AuthenticationError:
+            except ArkAuthenticationError:
                 self._last_error = "火山方舟 API Key 无效或格式错误，请在设置中重新保存。"
                 logger.error("[_process_single_image] 火山方舟鉴权失败")
                 return None
-            except (APIConnectionError, APITimeoutError) as e:
+            except (ArkAPIConnectionError, ArkAPITimeoutError) as e:
                 self._last_error = self._connection_error_message(e)
                 logger.error(
                     "[_process_single_image] 连接异常 (尝试 %d/%d): %s",

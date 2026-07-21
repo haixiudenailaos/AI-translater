@@ -138,7 +138,6 @@ class SiliconFlowAPI(BaseAPI):
                 request_data = {
                     "model": model_override or self.model_name,
                     "messages": messages,
-                    "max_tokens": self.max_tokens,
                     "temperature": 0.3,
                     "stream": False,
                 }

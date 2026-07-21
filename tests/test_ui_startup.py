@@ -117,6 +117,94 @@ class MainWindowLayoutTests(unittest.TestCase):
         self.assertIs(calls[2][1], footer_frame)
         self.assertIs(calls[3][1], footer_frame)
 
+    def test_onboarding_host_is_removed_when_panel_hides(self):
+        class Host:
+            def __init__(self):
+                self.manager = ""
+                self.pack_options = None
+                self.hidden = False
+
+            def winfo_manager(self):
+                return self.manager
+
+            def pack(self, **kwargs):
+                self.manager = "pack"
+                self.pack_options = kwargs
+                self.hidden = False
+
+            def pack_forget(self):
+                self.manager = ""
+                self.hidden = True
+
+        window = MainWindow.__new__(MainWindow)
+        window._onboarding_host = Host()
+        window._work_frame = object()
+
+        window._set_onboarding_host_visible(True)
+        self.assertEqual(window._onboarding_host.pack_options["before"], window._work_frame)
+
+        window._set_onboarding_host_visible(False)
+        self.assertTrue(window._onboarding_host.hidden)
+
+    def test_toolbar_keeps_project_name_in_flexible_middle_column(self):
+        class LayoutWidget:
+            def __init__(self, parent=None, **options):
+                self.parent = parent
+                self.options = options
+                self.pack_options = None
+                self.grid_options = None
+                self.column_options = {}
+
+            def pack(self, **kwargs):
+                self.pack_options = kwargs
+
+            def grid(self, **kwargs):
+                self.grid_options = kwargs
+
+            def grid_columnconfigure(self, column, **kwargs):
+                self.column_options[column] = kwargs
+
+        frames = []
+        labels = []
+        buttons = []
+
+        def make_frame(parent=None, **options):
+            widget = LayoutWidget(parent, **options)
+            frames.append(widget)
+            return widget
+
+        def make_label(parent=None, **options):
+            widget = LayoutWidget(parent, **options)
+            labels.append(widget)
+            return widget
+
+        def make_button(parent=None, **options):
+            widget = LayoutWidget(parent, **options)
+            buttons.append(widget)
+            return widget
+
+        window = MainWindow.__new__(MainWindow)
+        window.file_importer = SimpleNamespace(
+            import_file=lambda: None, import_clipboard=lambda: None
+        )
+        window.open_concurrent = lambda: None
+        window.open_settings = lambda: None
+
+        with (
+            patch("src.ui.main_window.ttk.Frame", side_effect=make_frame),
+            patch("src.ui.main_window.ttk.Label", side_effect=make_label),
+            patch("src.ui.main_window.ttk.Button", side_effect=make_button),
+            patch("src.ui.main_window.tk.Button", side_effect=make_button),
+        ):
+            window.create_toolbar(object())
+
+        toolbar, _left, right = frames
+        self.assertEqual(toolbar.column_options[1], {"weight": 1})
+        self.assertEqual(window.project_label.options["width"], 1)
+        self.assertEqual(window.project_label.grid_options["column"], 1)
+        self.assertEqual(right.grid_options["column"], 2)
+        self.assertEqual(window.settings_btn.pack_options["side"], tk.RIGHT)
+
     def test_shortcuts_bind_control_and_command_variants(self):
         class Root:
             def __init__(self):

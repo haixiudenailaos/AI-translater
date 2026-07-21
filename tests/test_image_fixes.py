@@ -6,15 +6,20 @@
 - R2-BUG-016：图片译文文件名唯一 + 真实格式检测 + 禁止 basename 匹配
 - R2-BUG-017：区分"无外文"和"检测失败"
 - R2-BUG-018：空结果始终写入结果文件
-- R2-BUG-025：OpenAI 客户端显式关闭
+- R2-BUG-025：Ark SDK 客户端显式关闭
 """
 
 import base64
+import io
 import json
+import struct
+import zlib
 from unittest.mock import MagicMock, patch
 
 import httpx
-from openai import APIConnectionError
+import pytest
+from volcenginesdkarkruntime import Ark
+from volcenginesdkarkruntime._exceptions import ArkAPIConnectionError
 
 from src.core.image_text_translator import (
     DETECTION_FAILED,
@@ -23,11 +28,13 @@ from src.core.image_text_translator import (
     ImageTextTranslator,
 )
 from src.core.image_translator import (
+    _CONNECTION_TEST_PNG_BASE64,
     _FORMAT_TO_EXT,
     ImageTranslator,
     _build_image_data_uri,
     _detect_image_format,
 )
+from src.core.image_utils import canonicalize_for_ark_image_generation
 
 # ── R2-BUG-016：图片格式检测 ──────────────────────────
 
@@ -64,6 +71,33 @@ class TestImageFormatDetection:
         assert _FORMAT_TO_EXT["png"] == ".png"
         assert _FORMAT_TO_EXT["jpeg"] == ".jpg"
         assert _FORMAT_TO_EXT["svg+xml"] == ".svg"
+
+    def test_ark_reference_jpeg_is_reencoded_as_canonical_png(self):
+        from PIL import Image
+
+        jpeg_buffer = io.BytesIO()
+        Image.new("L", (32, 48), 127).save(jpeg_buffer, format="JPEG")
+
+        png, mime = canonicalize_for_ark_image_generation(jpeg_buffer.getvalue(), "image/jpeg")
+
+        assert mime == "image/png"
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        with Image.open(io.BytesIO(png)) as image:
+            image.load()
+            assert image.format == "PNG"
+            assert image.size == (32, 48)
+            assert image.mode == "RGB"
+
+    def test_ark_reference_rejects_edges_at_or_below_fourteen_pixels(self):
+        from PIL import Image
+
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (14, 64), "white").save(image_buffer, format="PNG")
+
+        assert canonicalize_for_ark_image_generation(image_buffer.getvalue(), "image/png") == (
+            None,
+            None,
+        )
 
 
 # ── R2-BUG-016：唯一文件名 ────────────────────────────
@@ -258,11 +292,51 @@ class TestResultFileCompat:
         assert image_map == {"a.jpg": "a_translated.png"}
 
 
-# ── R2-BUG-025 / PERF-005：OpenAI 客户端复用与关闭 ────
+# ── R2-BUG-025 / PERF-005：Ark SDK 客户端复用与关闭 ────
 
 
-class TestOpenAIClientClose:
-    """R2-BUG-025 / PERF-005：OpenAI 客户端复用与显式关闭"""
+class TestArkClientClose:
+    """R2-BUG-025 / PERF-005：Ark SDK 客户端复用与显式关闭"""
+
+    def test_remote_http_volc_endpoint_never_creates_a_client(self):
+        """远程明文 endpoint 必须在携带 API Key 前被拒绝。"""
+        config_manager = MagicMock()
+        config_manager.get_volc_key.return_value = "sk-image-test"
+        config_manager.get_app_config.return_value = {
+            "image_translation": {
+                "ai_volcengine": {
+                    "base_url": "http://image-api.example.com/v1",
+                    "model": "image-model",
+                }
+            }
+        }
+        translator = ImageTranslator(config_manager)
+
+        with patch("src.core.image_translator.Ark") as ark_cls:
+            with pytest.raises(ValueError, match="HTTPS"):
+                translator._get_client()
+
+        ark_cls.assert_not_called()
+
+    def test_loopback_http_volc_endpoint_remains_supported(self):
+        """本地开发服务仍可使用受限的 HTTP loopback 地址。"""
+        config_manager = MagicMock()
+        config_manager.get_volc_key.return_value = "sk-image-test"
+        config_manager.get_app_config.return_value = {
+            "image_translation": {
+                "ai_volcengine": {
+                    "base_url": "http://127.0.0.1:11434/v1/",
+                    "model": "image-model",
+                }
+            }
+        }
+        translator = ImageTranslator(config_manager)
+        fake_client = MagicMock()
+
+        with patch("src.core.image_translator.Ark", return_value=fake_client):
+            assert translator._get_client() is fake_client
+
+        assert translator.volc_base_url == "http://127.0.0.1:11434/v1"
 
     def test_custom_volc_endpoint_and_model_are_loaded(self):
         config_manager = MagicMock()
@@ -315,11 +389,11 @@ class TestOpenAIClientClose:
             }
         }
 
-        with patch("src.core.image_translator.OpenAI", return_value=FakeClient()):
+        with patch("src.core.image_translator.Ark", return_value=FakeClient()):
             with patch(
-                "src.core.image_utils.convert_to_png",
+                "src.core.image_utils.canonicalize_for_ark_image_generation",
                 return_value=(
-                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+                    base64.b64decode(_CONNECTION_TEST_PNG_BASE64),
                     "image/png",
                 ),
             ):
@@ -347,16 +421,51 @@ class TestOpenAIClientClose:
                 return_value=fake_http_client,
             ) as http_client_cls,
             patch(
-                "src.core.image_translator.OpenAI",
+                "src.core.image_translator.Ark",
                 return_value=fake_client,
-            ) as openai_cls,
+            ) as ark_cls,
         ):
             assert translator._get_client() is fake_client
 
-        assert openai_cls.call_args.kwargs["max_retries"] == 0
-        assert openai_cls.call_args.kwargs["http_client"] is fake_http_client
+        assert ark_cls.call_args.kwargs["max_retries"] == 0
+        assert ark_cls.call_args.kwargs["http_client"] is fake_http_client
         limits = http_client_cls.call_args.kwargs["limits"]
         assert limits.max_keepalive_connections == 0
+
+    def test_connection_uses_valid_seedream_compatible_image_request(self):
+        config_manager = MagicMock()
+        translator = ImageTranslator(config_manager)
+        client = MagicMock()
+        client.images.generate.return_value = MagicMock(data=[MagicMock(url="https://example")])
+
+        with patch.object(translator, "_get_client", return_value=client):
+            assert translator.test_connection() is True
+
+        kwargs = client.images.generate.call_args.kwargs
+        assert kwargs["size"] == "2K"
+        assert kwargs["watermark"] is True
+        assert "sequential_image_generation" not in kwargs
+        assert kwargs["image"] == f"data:image/png;base64,{_CONNECTION_TEST_PNG_BASE64}"
+
+        png = base64.b64decode(_CONNECTION_TEST_PNG_BASE64, validate=True)
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        assert struct.unpack(">II", png[16:24]) == (64, 64)
+
+        offset = 8
+        seen_iend = False
+        while offset < len(png):
+            length = struct.unpack(">I", png[offset : offset + 4])[0]
+            chunk_type = png[offset + 4 : offset + 8]
+            chunk_data = png[offset + 8 : offset + 8 + length]
+            stored_crc = struct.unpack(">I", png[offset + 8 + length : offset + 12 + length])[0]
+            assert stored_crc == zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+            offset += length + 12
+            if chunk_type == b"IEND":
+                seen_iend = True
+                break
+
+        assert seen_iend is True
+        assert offset == len(png)
 
     def test_connection_error_rebuilds_client_before_retry(self, tmp_path):
         """WinError 10053 后不得继续复用发生错误的连接池。"""
@@ -366,7 +475,7 @@ class TestOpenAIClientClose:
         request = httpx.Request(
             "POST", "https://ark.cn-beijing.volces.com/api/v3/images/generations"
         )
-        error = APIConnectionError(request=request)
+        error = ArkAPIConnectionError(request=request, request_id="test-request")
         error.__cause__ = httpx.ReadError("[WinError 10053] connection aborted", request=request)
 
         failed_client = MagicMock()
@@ -426,11 +535,11 @@ class TestOpenAIClientClose:
             }
         }
 
-        with patch("src.core.image_translator.OpenAI", return_value=FakeClient()):
+        with patch("src.core.image_translator.Ark", return_value=FakeClient()):
             with patch(
-                "src.core.image_utils.convert_to_png",
+                "src.core.image_utils.canonicalize_for_ark_image_generation",
                 return_value=(
-                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+                    base64.b64decode(_CONNECTION_TEST_PNG_BASE64),
                     "image/png",
                 ),
             ):
@@ -470,11 +579,11 @@ class TestOpenAIClientClose:
             }
         }
 
-        with patch("src.core.image_translator.OpenAI", return_value=FakeClient()):
+        with patch("src.core.image_translator.Ark", return_value=FakeClient()):
             with patch(
-                "src.core.image_utils.convert_to_png",
+                "src.core.image_utils.canonicalize_for_ark_image_generation",
                 return_value=(
-                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+                    base64.b64decode(_CONNECTION_TEST_PNG_BASE64),
                     "image/png",
                 ),
             ):
@@ -488,8 +597,8 @@ class TestOpenAIClientClose:
 
         assert closed["called"] is False, "PERF-005：异常时不应关闭复用的客户端"
 
-    def test_generate_uses_openai_compatible_extra_body(self, tmp_path):
-        """火山专用参数应通过 OpenAI SDK 的 extra_body 传递。"""
+    def test_generate_uses_official_ark_sdk_image_parameter(self, tmp_path):
+        """火山图片参数应通过官方 Ark SDK 的原生参数传递。"""
         config_manager = MagicMock()
         translator = ImageTranslator(config_manager)
         client = MagicMock()
@@ -516,9 +625,52 @@ class TestOpenAIClientClose:
         assert result is not None
         kwargs = client.images.generate.call_args.kwargs
         assert kwargs["response_format"] == "url"
-        assert kwargs["extra_body"]["image"].startswith("data:image/png;base64,")
-        assert kwargs["extra_body"]["watermark"] is True
-        assert "image" not in kwargs
+        assert kwargs["size"] == "2K"
+        assert kwargs["image"].startswith("data:image/png;base64,")
+        assert kwargs["watermark"] is True
+        assert "extra_body" not in kwargs
+        assert "sequential_image_generation" not in kwargs
+
+    def test_official_ark_sdk_serializes_image_as_top_level_field(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "created": 1,
+                    "model": "test-model",
+                    "data": [{"url": "https://example.com/generated.png"}],
+                },
+                request=request,
+            )
+
+        http_client = httpx.Client(transport=httpx.MockTransport(handler))
+        client = Ark(
+            api_key="test-key",
+            base_url="https://ark.cn-beijing.volces.com/api/v3",
+            http_client=http_client,
+            max_retries=0,
+        )
+        data_uri = f"data:image/png;base64,{_CONNECTION_TEST_PNG_BASE64}"
+
+        try:
+            response = client.images.generate(
+                model="test-model",
+                prompt="test",
+                image=data_uri,
+                size="2K",
+                response_format="url",
+                watermark=True,
+            )
+        finally:
+            client.close()
+
+        assert response.data[0].url == "https://example.com/generated.png"
+        assert captured["image"] == data_uri
+        assert captured["watermark"] is True
+        assert captured["size"] == "2K"
 
     def test_build_image_data_uri_normalizes_legacy_mime_and_padding(self):
         """Ark receives canonical ASCII Base64 regardless of mapping legacy format."""

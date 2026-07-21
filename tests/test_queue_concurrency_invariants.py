@@ -460,9 +460,9 @@ class TestSchedulerFairness:
             _add_task(coord, "t2", "/tmp/b.txt", ["b1"])
             coord.submit_command("start_all")
             # 等待两个批次同时进入 _translate_batch（current == 2）
-            assert _wait_for(lambda: probe.current == 2, timeout=8.0), (
-                f"两个任务未同时占满槽位，当前在途={probe.current}"
-            )
+            assert _wait_for(
+                lambda: probe.current == 2, timeout=8.0
+            ), f"两个任务未同时占满槽位，当前在途={probe.current}"
             assert probe.max_seen == 2
         finally:
             probe.release_event.set()
@@ -541,9 +541,9 @@ class TestSchedulerFairness:
             coord.submit_command("start_all")
             # barrier.wait 会在两个批次都到达后返回；
             # 若只有一个批次被派发，barrier 会超时抛 BrokenBarrierError
-            assert _wait_for(lambda: entered.is_set(), timeout=12.0), (
-                "两个单批文件未并发执行（barrier 未被同时通过）"
-            )
+            assert _wait_for(
+                lambda: entered.is_set(), timeout=12.0
+            ), "两个单批文件未并发执行（barrier 未被同时通过）"
             assert not error_holder, f"barrier 错误: {error_holder}"
         finally:
             coord.close()
@@ -567,9 +567,9 @@ class TestSchedulerFairness:
             _add_task(coord, "short", "/tmp/short.txt", ["s1"])
             coord.submit_command("start_all")
             # 等待短任务的批次也被派发（translate_calls >= 2 表示两个任务都有批次在途）
-            assert _wait_for(lambda: probe.translate_calls >= 2, timeout=8.0), (
-                "短任务未被派发（被长任务饿死）"
-            )
+            assert _wait_for(
+                lambda: probe.translate_calls >= 2, timeout=8.0
+            ), "短任务未被派发（被长任务饿死）"
             # 确认两个任务都有在途批次（round-robin 第一轮各一个）
             long_slot = coord._tasks.get("long")
             short_slot = coord._tasks.get("short")
@@ -596,9 +596,9 @@ class TestSchedulerFairness:
             _add_task(coord, "t1", "/tmp/big.txt", ["a", "b", "c", "d"])
             coord.submit_command("start", "t1")
             # 等待两个槽位都被借用（current == 2）
-            assert _wait_for(lambda: probe.current == 2, timeout=8.0), (
-                f"单大任务未借用空闲槽位，当前在途={probe.current}"
-            )
+            assert _wait_for(
+                lambda: probe.current == 2, timeout=8.0
+            ), f"单大任务未借用空闲槽位，当前在途={probe.current}"
             assert probe.max_seen == 2
         finally:
             probe.release_event.set()
@@ -640,9 +640,9 @@ class TestSchedulerFairness:
                 if n > max_in_flight_seen:
                     max_in_flight_seen = n
                 time.sleep(0.02)
-            assert max_in_flight_seen <= policy.hard_request_cap, (
-                f"在途 Future 数 {max_in_flight_seen} 超过硬上限 {policy.hard_request_cap}"
-            )
+            assert (
+                max_in_flight_seen <= policy.hard_request_cap
+            ), f"在途 Future 数 {max_in_flight_seen} 超过硬上限 {policy.hard_request_cap}"
             assert probe.max_seen <= policy.hard_request_cap
         finally:
             probe.release_event.set()
@@ -725,9 +725,9 @@ class TestRateLimitAndRetry:
                 timeout=8.0,
             )
             # current_limit 应从 4 降到 2（4 // 2）
-            assert coord._active_limiter.current_limit <= 2, (
-                f"429 后 current_limit 未降级: {coord._active_limiter.current_limit}"
-            )
+            assert (
+                coord._active_limiter.current_limit <= 2
+            ), f"429 后 current_limit 未降级: {coord._active_limiter.current_limit}"
         finally:
             probe.release_all()
             coord.close()
@@ -964,9 +964,9 @@ class TestLifecycleStateMachine:
             probe.release(1)
             # 等待旧批次退出并释放 limiter 槽位（否则重启时无槽位可派发）
             assert _wait_for(lambda: 1 in probe.completed, timeout=8.0)
-            assert _wait_for(lambda: len(coord._in_flight) == 0, timeout=8.0), (
-                "旧批次未从在途集合中移除"
-            )
+            assert _wait_for(
+                lambda: len(coord._in_flight) == 0, timeout=8.0
+            ), "旧批次未从在途集合中移除"
             # 重启任务
             coord.submit_command("start", "t1")
             # 等待新批次进入（seq 2）
@@ -1104,9 +1104,9 @@ class TestLifecycleStateMachine:
             )
             # 释放旧批次并等待其从在途集合移除（释放 limiter 槽位）
             probe.release_all()
-            assert _wait_for(lambda: len(coord._in_flight) == 0, timeout=8.0), (
-                "旧批次未从在途集合中移除"
-            )
+            assert _wait_for(
+                lambda: len(coord._in_flight) == 0, timeout=8.0
+            ), "旧批次未从在途集合中移除"
             # 重启：应创建新引擎并关闭旧引擎
             coord.submit_command("start", "t1")
             assert _wait_for(lambda: len(engines) >= 2, timeout=8.0)
@@ -1308,9 +1308,9 @@ class TestUIAndPersistence:
         if out_file.exists():
             content = out_file.read_text(encoding="utf-8")
             # 至少第一批的译文应存在
-            assert "译:a" in content or "译:b" in content or content, (
-                f"已成功批次未落盘: {content!r}"
-            )
+            assert (
+                "译:a" in content or "译:b" in content or content
+            ), f"已成功批次未落盘: {content!r}"
 
     def test_checkpoint_writer_is_single_flight(self, tmp_config_manager, monkeypatch):
         """检查点写入是 single-flight：多个批次成功时合并保存（§10.2）。"""

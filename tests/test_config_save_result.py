@@ -9,6 +9,8 @@ ENG-1 回归测试：配置保存聚合结果与关闭流程一致性
 - 错误信息脱敏，不含密钥明文。
 """
 
+import json
+import threading
 from types import SimpleNamespace
 
 from src.domain.secret import ConfigSaveResult, SecretSaveResult, StorageStatus
@@ -237,6 +239,188 @@ class TestSaveConfigAggregatedResult:
         assert result.glossary_saved
         # 整体失败
         assert result.failed
+
+
+class TestApiConfigRuntimeSnapshot:
+    """API 元数据与密钥必须以一个一致快照对外发布。"""
+
+    def test_metadata_only_snapshot_never_exposes_cached_secret(self, tmp_config_manager):
+        tmp_config_manager.api_config = {
+            **tmp_config_manager.api_config,
+            "provider": "siliconflow",
+            "api_key": "sk-cached-secret",
+        }
+        tmp_config_manager._api_key_provider = "siliconflow"
+
+        metadata = tmp_config_manager.get_api_config(load_secret=False)
+
+        assert metadata["provider"] == "siliconflow"
+        assert metadata["api_key"] == ""
+        assert tmp_config_manager.get_api_config()["api_key"] == "sk-cached-secret"
+
+    def test_concurrent_save_and_read_never_mix_provider_and_secret(self, tmp_config_manager):
+        """读取者只能看到同一 Provider 对应的密钥。"""
+        secret_store = FakeSecretStore()
+        tmp_config_manager._secret_store = secret_store
+        expected_keys = {
+            "siliconflow": "sk-siliconflow",
+            "deepseek": "sk-deepseek",
+        }
+        tmp_config_manager.api_config = {
+            **tmp_config_manager.api_config,
+            "provider": "siliconflow",
+            "model_name": "initial-model",
+            "api_key": expected_keys["siliconflow"],
+        }
+        tmp_config_manager._api_key_provider = "siliconflow"
+        secret_store.stored["provider:siliconflow"] = expected_keys["siliconflow"]
+
+        start = threading.Event()
+        writer_done = threading.Event()
+        errors: list[tuple[str, str]] = []
+        errors_lock = threading.Lock()
+
+        def writer():
+            start.wait()
+            for index in range(40):
+                provider = "siliconflow" if index % 2 == 0 else "deepseek"
+                result = tmp_config_manager.save_api_config(
+                    {
+                        "provider": provider,
+                        "model_name": f"{provider}-model-{index}",
+                        "api_key": expected_keys[provider],
+                    }
+                )
+                if not result:
+                    with errors_lock:
+                        errors.append(("save", result.error_message))
+            writer_done.set()
+
+        def reader():
+            start.wait()
+            while not writer_done.is_set():
+                snapshot = tmp_config_manager.get_api_config()
+                provider = snapshot["provider"]
+                key = snapshot["api_key"]
+                if key and key != expected_keys.get(provider):
+                    with errors_lock:
+                        errors.append((provider, key))
+                    return
+
+        threads = [
+            threading.Thread(target=writer),
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+        ]
+        for thread in threads:
+            thread.start()
+        start.set()
+        for thread in threads:
+            thread.join(timeout=10.0)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+
+    def test_json_failure_keeps_the_previous_secret_metadata_pair(
+        self, tmp_config_manager, monkeypatch
+    ):
+        """未发布的新密钥版本不能改变当前或重启后的运行时配置。"""
+        from src.config import config_manager as cm_mod
+
+        secret_store = FakeSecretStore()
+        tmp_config_manager._secret_store = secret_store
+        assert tmp_config_manager.save_api_config(
+            {
+                "provider": "siliconflow",
+                "model_name": "stable-model",
+                "api_key": "sk-stable",
+            }
+        )
+        old_snapshot = tmp_config_manager.get_api_config()
+        old_reference = old_snapshot["active_secret_ref"]
+        disk_before = json.loads(tmp_config_manager.api_config_file.read_text(encoding="utf-8"))
+
+        original_write = cm_mod.write_json_atomic
+
+        def fail_api_write(path, data):
+            if path == tmp_config_manager.api_config_file:
+                raise OSError("simulated disk full")
+            return original_write(path, data)
+
+        monkeypatch.setattr(cm_mod, "write_json_atomic", fail_api_write)
+
+        result = tmp_config_manager.save_api_config(
+            {
+                "provider": "deepseek",
+                "model_name": "new-model",
+                "api_key": "sk-new",
+            }
+        )
+
+        assert result.failed
+        assert tmp_config_manager.get_api_config() == old_snapshot
+        assert secret_store.stored == {old_reference: "sk-stable"}
+        assert (
+            json.loads(tmp_config_manager.api_config_file.read_text(encoding="utf-8"))
+            == disk_before
+        )
+
+        reloaded = cm_mod.ConfigManager(
+            app_paths=SimpleNamespace(config_dir=tmp_config_manager.config_dir),
+            secret_store=secret_store,
+        )
+        assert reloaded.get_api_config()["provider"] == "siliconflow"
+        assert reloaded.get_api_config()["api_key"] == "sk-stable"
+
+    def test_public_configuration_snapshots_are_deeply_isolated(self, tmp_config_manager):
+        """调用方修改返回的嵌套对象不能污染内存中的未保存状态。"""
+        api_snapshot = tmp_config_manager.get_api_config(load_secret=False)
+        api_snapshot["cache_config"]["max_entries"] = 1
+        assert (
+            tmp_config_manager.get_api_config(load_secret=False)["cache_config"]["max_entries"] != 1
+        )
+
+        app_snapshot = tmp_config_manager.get_app_config()
+        app_snapshot["image_translation"]["manga"]["batch_size"] = 99
+        assert tmp_config_manager.get_app_config()["image_translation"]["manga"]["batch_size"] != 99
+
+        glossary_snapshot = tmp_config_manager.get_glossary()
+        glossary_snapshot["categories"].append("测试")
+        assert "测试" not in tmp_config_manager.get_glossary()["categories"]
+
+    def test_update_provider_failure_does_not_mutate_live_snapshot(
+        self, tmp_config_manager, monkeypatch
+    ):
+        """兼容入口必须复用保存事务，不能在失败前原地修改配置。"""
+        from src.config import config_manager as cm_mod
+
+        secret_store = FakeSecretStore()
+        tmp_config_manager._secret_store = secret_store
+        assert tmp_config_manager.save_api_config(
+            {
+                "provider": "siliconflow",
+                "model_name": "stable-model",
+                "api_key": "sk-stable",
+            }
+        )
+        old_snapshot = tmp_config_manager.get_api_config()
+
+        original_write = cm_mod.write_json_atomic
+
+        def fail_api_write(path, data):
+            if path == tmp_config_manager.api_config_file:
+                raise OSError("simulated read-only disk")
+            return original_write(path, data)
+
+        monkeypatch.setattr(cm_mod, "write_json_atomic", fail_api_write)
+
+        result = tmp_config_manager.update_api_provider_config(
+            "deepseek",
+            {"model_name": "new-model", "api_key": "sk-new"},
+        )
+
+        assert result.failed
+        assert tmp_config_manager.get_api_config() == old_snapshot
 
 
 # ── 关闭流程分支测试（main.py on_closing 的逻辑分支） ─────────────────────────

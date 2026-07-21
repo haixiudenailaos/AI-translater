@@ -98,7 +98,7 @@ class FakeImageTranslationProvider:
         if self._cancel_raises:
             raise RuntimeError("cancel error (test)")
 
-    def close(self) -> None:
+    def close(self, *, timeout_seconds: float | None = None) -> None:
         self.close_called = True
 
     def reset(self) -> None:

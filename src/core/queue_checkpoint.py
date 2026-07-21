@@ -214,7 +214,7 @@ class CheckpointCoordinator:
         with self._lock:
             return self._state.retry_count
 
-    def close(self) -> None:
+    def close(self, timeout: float = _FINAL_SAVE_TIMEOUT_SECONDS) -> None:
         """关闭协调器，触发最后一次关键保存并等待（带超时）。幂等。
 
         P1-2：``close`` 必须确保保存线程退出，否则调用方可能在持有
@@ -229,7 +229,7 @@ class CheckpointCoordinator:
             self._ensure_save_thread_locked()
         # 等待保存线程结束。
         if self._save_thread is not None:
-            self._save_thread.join(timeout=_FINAL_SAVE_TIMEOUT_SECONDS)
+            self._save_thread.join(timeout=max(0.0, timeout))
             if self._save_thread.is_alive():
                 logger.warning(
                     "任务 %s 检查点保存线程在 close 后仍未退出",

@@ -36,12 +36,16 @@ from ..infrastructure.exporter import (
 from ..infrastructure.exporter import (
     export_epub as _export_epub_impl,
 )
-from ..infrastructure.image_asset_store import save_image_binary
+from ..infrastructure.image_asset_store import IMAGE_MAPPING_SCHEMA_VERSION, save_image_binary
 from ..infrastructure.image_rewriter import (
     match_and_get_new_path as _match_and_get_new_path_impl,
 )
 from ..infrastructure.mapping_repository import (
     load_content_mapping as _load_content_mapping_impl,
+)
+from ..infrastructure.mapping_repository import (
+    publish_mapping_bundle,
+    resolve_mapping_file,
 )
 from ..infrastructure.mapping_repository import (
     save_translations as _save_translations_impl,
@@ -52,7 +56,6 @@ from ..infrastructure.segment_extractor import (
 from ..infrastructure.segment_extractor import (
     compute_source_checksum as _compute_source_checksum_impl,
 )
-from ..utils.file_handler import write_json_atomic
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -69,6 +72,10 @@ class EpubArchiveValidationError(ValueError):
 
 class EpubImportCancelled(Exception):
     """Raised at EPUB import safe points after the user requests cancellation."""
+
+
+class EpubImportPartialError(RuntimeError):
+    """正文解析不完整时中止导入，禁止发布缺章映射。"""
 
 
 def _raise_if_epub_import_cancelled(cancel_requested: Callable[[], bool] | None) -> None:
@@ -225,17 +232,25 @@ class EPUBProcessor:
         # 用 size + mtime 快速验证；命中已有 mapping 直接返回，不重新
         # 解析 ebooklib、不重提取图片、不重建 format_info。
         # 翻译进度保存在 content_mapping.json 中，不受跳过影响。
-        content_file = mapping_dir / "content_mapping.json"
-        images_file = mapping_dir / "images.json"
-        format_file = mapping_dir / "format_info.json"
+        content_file = resolve_mapping_file(mapping_dir, "content_mapping.json")
+        images_file = resolve_mapping_file(mapping_dir, "images.json")
+        format_file = resolve_mapping_file(mapping_dir, "format_info.json")
         if content_file.exists() and images_file.exists() and format_file.exists():
             try:
                 old_info = json.loads(content_file.read_text(encoding="utf-8"))
+                old_images = json.loads(images_file.read_text(encoding="utf-8"))
                 cached = old_info.get("project_info", {})
+                cached_images = old_images.get("image_mappings", {})
+                image_cache_compatible = old_images.get(
+                    "schema_version"
+                ) == IMAGE_MAPPING_SCHEMA_VERSION and all(
+                    bool(info.get("base64_data")) for info in cached_images.values()
+                )
                 stat = epub_path.stat()
                 if (
                     cached.get("source_file_size") == stat.st_size
                     and cached.get("source_file_mtime") == stat.st_mtime
+                    and image_cache_compatible
                 ):
                     logger.info(
                         "[import_epub] 源文件未变化（size=%s, mtime=%s），跳过重解析",
@@ -416,7 +431,7 @@ class EPUBProcessor:
         existing_translations = {}  # 按原文文本匹配（降级用）
         existing_by_locator = {}  # 按稳定定位符匹配（优先用）
         existing_by_chapter_seq = {}  # 按 chapter_id+block_index 匹配（次优先）
-        content_file = mapping_dir / "content_mapping.json"
+        content_file = resolve_mapping_file(mapping_dir, "content_mapping.json")
         if content_file.exists():
             try:
                 old_data = json.loads(content_file.read_text(encoding="utf-8"))
@@ -565,12 +580,18 @@ class EPUBProcessor:
                                 block_index_in_chapter += 1
                     except EpubImportCancelled:
                         raise
-                    except Exception:
-                        continue
+                    except Exception as exc:
+                        raise EpubImportPartialError(
+                            f"第 {chapter_index} 章的正文节点解析失败，已取消导入以避免缺失内容"
+                        ) from exc
             except EpubImportCancelled:
                 raise
-            except Exception:
-                continue
+            except EpubImportPartialError:
+                raise
+            except Exception as exc:
+                raise EpubImportPartialError(
+                    f"第 {chapter_index} 章解析失败，已取消导入以避免生成缺章映射"
+                ) from exc
 
         # R2-BUG-001：spine 非空但未解析出任何正文时，导入必须失败
         # 不能生成"成功但空内容"的映射
@@ -658,8 +679,8 @@ class EPUBProcessor:
                                 continue
                             data = item.get_content()
                             mime = media_type or "image/png"
-                            # PERF-004：导入时保存二进制资源，images.json 只保留元数据。
-                            # Base64 仅在调用图片 API 时按需构建。
+                            # 保留 V1.5 的 Base64 原图作为透明加密环境下的可靠回退，
+                            # 同时继续写入二进制资产供正常环境按需使用。
                             images_mapping[name] = save_image_binary(
                                 mapping_dir, image_count, name, data, mime
                             )
@@ -721,7 +742,10 @@ class EPUBProcessor:
         content_payload = {"project_info": project_info, "content_mappings": content_mappings}
         logger.debug("[import_epub] content_payload: %d 个content_mappings", len(content_mappings))
 
-        images_payload = {"image_mappings": images_mapping}
+        images_payload = {
+            "schema_version": IMAGE_MAPPING_SCHEMA_VERSION,
+            "image_mappings": images_mapping,
+        }
         logger.debug("[import_epub] images_payload: %d 个image_mappings", len(images_mapping))
 
         # 【关键修复】如果spine_order为空，从content_mappings推断章节顺序
@@ -748,15 +772,14 @@ class EPUBProcessor:
         _raise_if_epub_import_cancelled(cancel_requested)
         if progress_callback is not None:
             progress_callback("正在保存导入映射...")
-        # 保存JSON
-        # BUG-006：统一使用原子写入，写入失败时旧文件保持不变
-        logger.debug("[import_epub] 保存content_mapping.json...")
-        write_json_atomic(content_file, content_payload)
-        logger.debug("[import_epub] 保存images.json...")
-        write_json_atomic(images_file, images_payload)
-        logger.debug("[import_epub] 保存format_info.json...")
-        write_json_atomic(format_file, format_info)
-        logger.debug("[import_epub] ====== 所有文件保存完成 ======")
+        # 所有 generation 成员先写完，最后原子发布 manifest。顶层 JSON 只是
+        # 兼容副本；新的读取端只接受 manifest 指向的完整 generation。
+        logger.debug("[import_epub] 发布完整 mapping generation...")
+        publish_mapping_bundle(mapping_dir, content_payload, images_payload, format_info)
+        content_file = mapping_dir / "content_mapping.json"
+        images_file = mapping_dir / "images.json"
+        format_file = mapping_dir / "format_info.json"
+        logger.debug("[import_epub] ====== mapping generation 发布完成 ======")
 
         result = {
             "mapping_dir": str(mapping_dir),

@@ -12,6 +12,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 SUPPORTED_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg"}
+_ARK_MAX_INPUT_BYTES = 30 * 1024 * 1024
+_ARK_MAX_INPUT_PIXELS = 36_000_000
+_ARK_MIN_EDGE_EXCLUSIVE = 14
+_ARK_MAX_ASPECT_RATIO = 16
 
 
 def convert_to_png(b64_data: str, mime_type: str) -> tuple:
@@ -65,6 +69,65 @@ def convert_to_png_bytes(raw: bytes, mime_type: str) -> tuple:
     if png_data is None:
         return None, None
 
+    return png_data, "image/png"
+
+
+def canonicalize_for_ark_image_generation(raw: bytes, mime_type: str) -> tuple:
+    """Decode and re-encode an Ark reference image as a canonical PNG.
+
+    EPUB JPEG files can be accepted by Pillow and browsers while still being
+    rejected by Ark's stricter image decoder. Re-encoding at the API boundary
+    also strips metadata and guarantees that the data URI MIME matches its
+    bytes. The original EPUB asset is never modified.
+    """
+    if not raw:
+        logger.warning("Ark 参考图片为空")
+        return None, None
+    if len(raw) > _ARK_MAX_INPUT_BYTES:
+        logger.warning("Ark 参考图片超过 30MB: %d bytes", len(raw))
+        return None, None
+
+    source = _convert_svg(raw) if mime_type == "image/svg+xml" else raw
+    if source is None:
+        return None, None
+
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(source)) as opened:
+            if getattr(opened, "n_frames", 1) > 1:
+                opened.seek(0)
+
+            width, height = opened.size
+            if width <= _ARK_MIN_EDGE_EXCLUSIVE or height <= _ARK_MIN_EDGE_EXCLUSIVE:
+                logger.warning("Ark 参考图片边长必须大于 14px: %dx%d", width, height)
+                return None, None
+            if width * height > _ARK_MAX_INPUT_PIXELS:
+                logger.warning("Ark 参考图片总像素超过限制: %dx%d", width, height)
+                return None, None
+            ratio = width / height
+            if ratio > _ARK_MAX_ASPECT_RATIO or ratio < 1 / _ARK_MAX_ASPECT_RATIO:
+                logger.warning("Ark 参考图片宽高比超过限制: %dx%d", width, height)
+                return None, None
+
+            image = ImageOps.exif_transpose(opened)
+            has_alpha = "A" in image.getbands() or "transparency" in image.info
+            image = image.convert("RGBA" if has_alpha else "RGB")
+            image.load()
+
+            output = io.BytesIO()
+            image.save(output, format="PNG")
+            png_data = output.getvalue()
+    except ImportError:
+        logger.warning("Pillow 未安装，无法规范化 Ark 参考图片")
+        return None, None
+    except Exception as e:
+        logger.warning("Ark 参考图片解码或重编码失败: %s", e)
+        return None, None
+
+    if len(png_data) > _ARK_MAX_INPUT_BYTES:
+        logger.warning("规范化后的 Ark 参考图片超过 30MB: %d bytes", len(png_data))
+        return None, None
     return png_data, "image/png"
 
 

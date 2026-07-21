@@ -15,6 +15,8 @@ MAX_STABLE_TRANSLATION_BATCH_LINES = 20
 DEFAULT_TRANSLATION_INPUT_TOKENS = 6000
 MAX_STABLE_TRANSLATION_INPUT_TOKENS = 6000
 DEFAULT_TRANSLATION_CONCURRENCY = 1
+# 仅用于自动分批时预留模型输出上下文，不会作为 max_tokens 发送给 API。
+DEFAULT_OUTPUT_TOKEN_RESERVE = 4096
 
 # Queue translation is an unattended throughput-oriented path. It deliberately
 # uses larger requests and more in-flight batches than the interactive editor.
@@ -209,6 +211,8 @@ def normalize_openai_base_url(value: str) -> str:
     parsed = urlsplit(raw_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("Base URL 必须是以 http:// 或 https:// 开头的有效地址")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Base URL 不能包含用户名或密码")
     if parsed.query or parsed.fragment:
         raise ValueError("Base URL 不能包含查询参数或锚点")
     if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname or ""):
