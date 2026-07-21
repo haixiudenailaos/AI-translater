@@ -62,6 +62,8 @@ jobs:
         if: matrix.python-version == '3.11'
         run: >
           python -m pyright
+          --pythonversion 3.11
+          --pythonplatform Linux
           src/config/config_manager.py
           src/infrastructure/project_repository.py
           src/core/image_translator.py
@@ -71,7 +73,7 @@ jobs:
       - name: Type check report
         if: matrix.python-version == '3.11'
         continue-on-error: true
-        run: python -m pyright
+        run: python -m pyright --pythonversion 3.11 --pythonplatform Linux
 
       - name: Upload coverage report
         if: matrix.python-version == '3.11'

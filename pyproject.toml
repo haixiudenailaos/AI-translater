@@ -43,7 +43,8 @@ dev = [
     "ruff>=0.6.0,<0.7.0",
     # P2-6：渐进类型门禁。先对 domain/application 启用严格类型，
     # 再扩展到 infrastructure 与新 UI adapter。
-    "pyright>=1.1.350",
+    # Keep CI's enforced type-checker deterministic across Python versions.
+    "pyright==1.1.411",
 ]
 [tool.setuptools.packages.find]
 # P1-4：修复 wheel 包发现，包含 src 及其所有子包
