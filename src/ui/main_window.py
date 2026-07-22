@@ -22,6 +22,10 @@ from ..application.preflight import PreflightSeverity, build_preflight_report
 from ..application.quality_review import inspect_quality
 from ..application.translation_document import TranslationDocument
 from ..application.usage import UsageStatistics
+from ..config.translation_profile import (
+    SMALL_MODEL_MODE_CONFIG_KEY,
+    build_queue_policy_from_app_config,
+)
 from ..domain.project import TranslationProject
 from ..domain.translation import TranslationOptions
 from ..utils.logger import get_logger
@@ -88,6 +92,9 @@ class MainWindow:
         self._search_var = tk.StringVar()
         self._search_case_var = tk.BooleanVar(value=False)
         self._search_regex_var = tk.BooleanVar(value=False)
+        self._small_model_mode_var = tk.BooleanVar(
+            value=bool(self.config_manager.get_app_config().get(SMALL_MODEL_MODE_CONFIG_KEY, False))
+        )
         # 新手指导自动展示仅在首次 API 状态返回后评估一次
         self._onboarding_auto_evaluated = False
 
@@ -161,6 +168,7 @@ class MainWindow:
             preflight_callback=self._run_preflight,
             on_run_terminal=self._record_translation_usage,
             on_retranslated=self._on_rows_retranslated,
+            mode_toggle=self.small_model_mode_btn,
         )
 
         # PERF §8：自动保存协调器（generation 状态机 + 单飞 + debounce）。
@@ -527,6 +535,13 @@ class MainWindow:
             command=lambda: self.translation_controller.stop_translation(),
         )
         self.stop_btn.pack(side=tk.LEFT)
+        self.small_model_mode_btn = ttk.Checkbutton(
+            left_control,
+            text="小模型（逐行）",
+            variable=self._small_model_mode_var,
+            command=self._on_small_model_mode_changed,
+        )
+        self.small_model_mode_btn.pack(side=tk.LEFT, padx=(12, 0))
 
         right_control = ttk.Frame(action_row)
         right_control.pack(side=tk.RIGHT)
@@ -1198,6 +1213,35 @@ class MainWindow:
         self._show_all_rows()
         self.translation_controller.continue_translation()
 
+    def _on_small_model_mode_changed(self):
+        enabled = bool(self._small_model_mode_var.get())
+        config = self.config_manager.get_app_config()
+        config[SMALL_MODEL_MODE_CONFIG_KEY] = enabled
+        if not self.config_manager.save_app_config(config):
+            self._small_model_mode_var.set(not enabled)
+            messagebox.showerror("保存失败", "无法保存小模型模式设置。", parent=self.root)
+            return
+        policy = self._refresh_shared_translation_policy()
+        if enabled:
+            self.update_status(
+                "已开启小模型模式：逐行翻译，"
+                f"主界面与后台队列并发 {policy.max_in_flight_requests}"
+            )
+        else:
+            self.update_status("已关闭小模型模式：恢复按设置分批翻译")
+
+    def _refresh_shared_translation_policy(self):
+        policy = build_queue_policy_from_app_config(self.config_manager.get_app_config())
+        self._provider_limiter_registry.update_limits(
+            configured_max=policy.max_in_flight_requests,
+            hard_cap=policy.hard_request_cap,
+        )
+        queue_manager = getattr(self, "_queue_manager", None)
+        refresh_policy = getattr(queue_manager, "refresh_policy", None)
+        if callable(refresh_policy):
+            refresh_policy(policy)
+        return policy
+
     def _retranslate_all(self):
         self._show_all_rows()
         self.translation_controller.retranslate_all()
@@ -1678,6 +1722,7 @@ class MainWindow:
     # ── 状态更新 ──────────────────────────────────────
 
     def _on_settings_updated(self, refresh_engine=True):
+        self._refresh_shared_translation_policy()
         if not refresh_engine:
             self.api_status_label.config(text="API: 正在检查")
             self.model_label.config(text="正在读取配置")

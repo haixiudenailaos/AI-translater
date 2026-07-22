@@ -84,6 +84,48 @@ class ConfigStartupTests(unittest.TestCase):
 
 
 class MainWindowLayoutTests(unittest.TestCase):
+    def test_small_model_toggle_is_persisted_and_refreshes_global_policy(self):
+        class Config:
+            def __init__(self):
+                self.app = {
+                    "small_model_mode": False,
+                    "queue_max_in_flight_requests": 4,
+                    "queue_hard_request_cap": 4,
+                }
+                self.saved = []
+
+            def get_app_config(self):
+                return dict(self.app)
+
+            def save_app_config(self, config):
+                self.app = dict(config)
+                self.saved.append(dict(config))
+                return True
+
+        config = Config()
+        limiter_updates = []
+        policy_updates = []
+        statuses = []
+        window = MainWindow.__new__(MainWindow)
+        window.root = object()
+        window.config_manager = config
+        window._small_model_mode_var = SimpleNamespace(get=lambda: True)
+        window._provider_limiter_registry = SimpleNamespace(
+            update_limits=lambda **limits: limiter_updates.append(limits)
+        )
+        window._queue_manager = SimpleNamespace(refresh_policy=policy_updates.append)
+        window.update_status = statuses.append
+
+        window._on_small_model_mode_changed()
+
+        self.assertTrue(config.saved[-1]["small_model_mode"])
+        self.assertEqual(
+            limiter_updates,
+            [{"configured_max": 1, "hard_cap": 1}],
+        )
+        self.assertEqual(policy_updates[0].max_batch_lines, 1)
+        self.assertIn("主界面与后台队列并发 1", statuses[-1])
+
     def test_footer_is_reserved_before_expandable_work_area(self):
         class PackedFrame:
             def __init__(self):
@@ -244,10 +286,13 @@ class MainWindowLayoutTests(unittest.TestCase):
         window._run_primary_action = lambda: calls.append("start")
         window._retranslate_all = lambda: calls.append("retranslate")
         window._continue_translation = lambda: None
+        window._on_small_model_mode_changed = lambda: None
+        window._small_model_mode_var = object()
 
         with (
             patch("src.ui.main_window.ttk.Frame", side_effect=make_widget),
             patch("src.ui.main_window.ttk.Button", side_effect=make_button),
+            patch("src.ui.main_window.ttk.Checkbutton", side_effect=make_widget),
             patch("src.ui.main_window.ttk.Menubutton", side_effect=make_widget),
             patch("src.ui.main_window.ttk.Label", side_effect=make_widget),
             patch("src.ui.main_window.ttk.Progressbar", side_effect=make_widget),

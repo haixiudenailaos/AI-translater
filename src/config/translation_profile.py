@@ -6,6 +6,7 @@ from urllib.parse import urlsplit, urlunsplit
 SILICONFLOW_PROVIDER = "siliconflow"
 DEEPSEEK_PROVIDER = "deepseek"
 OPENAI_COMPATIBLE_PROVIDER = "openai_compatible"
+SMALL_MODEL_MODE_CONFIG_KEY = "small_model_mode"
 
 SILICONFLOW_DEEPSEEK_V32_MODEL = "deepseek-ai/DeepSeek-V3.2"
 DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash"
@@ -43,7 +44,7 @@ MAX_QUEUE_CUSTOM_CONCURRENCY = 16
 # ``ProviderLimiter.current_limit``，不再有"文件并发 × 文件内并发"两层乘法。
 #
 # - ``queue_max_in_flight_requests``：ProviderLimiter 的 configured_max，
-#   即主编辑器与后台队列在同一 Provider 上合计的在途请求上限
+#   即主编辑器与后台队列跨所有 Provider 合计的在途请求上限
 #   （AIMD 在此基础上动态调整；字段名为兼容旧配置而保留 queue_ 前缀）。
 # - ``queue_hard_request_cap``：硬上限，不可突破。ThreadPoolExecutor 的
 #   max_workers 也以此为准，避免两层并发乘法导致实际请求数失控。
@@ -163,6 +164,11 @@ def build_queue_policy_from_app_config(app_config: Dict[str, Any]):
         max_in_flight = min(max_in_flight, legacy_concurrency)
         hard_cap = max(hard_cap, min(MAX_QUEUE_HARD_REQUEST_CAP, legacy_concurrency * 2))
 
+    small_model_mode = bool(app_config.get(SMALL_MODEL_MODE_CONFIG_KEY, False))
+    if small_model_mode:
+        max_in_flight = 1
+        hard_cap = 1
+
     target_tokens = _clamp(
         "queue_batch_max_input_tokens",
         DEFAULT_QUEUE_TRANSLATION_INPUT_TOKENS,
@@ -182,6 +188,8 @@ def build_queue_policy_from_app_config(app_config: Dict[str, Any]):
         1,
         MAX_QUEUE_TRANSLATION_BATCH_LINES,
     )
+    if small_model_mode:
+        max_lines = 1
 
     rpm_limit = _clamp(
         "queue_rpm_limit",

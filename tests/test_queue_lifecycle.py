@@ -279,6 +279,17 @@ class TestQueuePolicyFromConfig:
         assert policy.hard_request_cap == DEFAULT_QUEUE_HARD_REQUEST_CAP
         assert policy.max_batch_lines > 0
 
+    def test_small_model_mode_forces_single_line_queue_batches(self):
+        from src.config.translation_profile import build_queue_policy_from_app_config
+
+        policy = build_queue_policy_from_app_config(
+            {"small_model_mode": True, "queue_batch_lines": 200}
+        )
+
+        assert policy.max_batch_lines == 1
+        assert policy.max_in_flight_requests == 1
+        assert policy.hard_request_cap == 1
+
     def test_user_facing_concurrency_presets_cover_common_api_tiers(self):
         from src.config.translation_profile import (
             QUEUE_CONCURRENCY_CUSTOM,

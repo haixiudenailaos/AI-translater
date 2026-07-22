@@ -82,6 +82,7 @@ class TranslationController:
         start_btn=None,
         retranslate_btn=None,
         on_retranslated: Callable[[set[int]], None] | None = None,
+        mode_toggle=None,
     ):
         self.root = root
         self.config_manager = config_manager
@@ -94,6 +95,7 @@ class TranslationController:
         self.start_btn = start_btn
         self.translate_btn = translate_btn
         self.retranslate_btn = retranslate_btn
+        self.mode_toggle = mode_toggle
         self.continue_btn = continue_btn
         self.stop_btn = stop_btn
         self.status_updater = status_updater
@@ -183,6 +185,9 @@ class TranslationController:
                 seen.add(id(button))
         self.continue_btn.config(state=continue_state)
         self.stop_btn.config(state=stop_state)
+        mode_toggle = getattr(self, "mode_toggle", None)
+        if mode_toggle is not None:
+            mode_toggle.config(state=translate_state)
 
     def close(self):
         """关闭事件泵并使当前 run_id 失效。

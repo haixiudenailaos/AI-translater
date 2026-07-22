@@ -587,7 +587,23 @@ class BaseAPI:
             except Exception as e:
                 if self._cancel_event.is_set():
                     return None
-                raise TranslationRequestError(f"流式翻译异常: {e}") from e
+                detail = str(e).strip() or e.__class__.__name__
+                # 部分 HTTP/2/代理异常不会被 httpx 归类为 NetworkError，
+                # 甚至没有错误文本。尚未收到内容时可安全重放整个请求。
+                if not content_parts and attempt < self._max_attempts - 1:
+                    self._record_retry()
+                    self._recreate_client_if_safe()
+                    delay = self._retry_delay(attempt)
+                    logger.warning(
+                        "流式读取失败: %s，%.1f 秒后重试 (%s/%s)",
+                        detail,
+                        delay,
+                        attempt + 1,
+                        self._max_attempts,
+                    )
+                    self._cancel_event.wait(delay)
+                    continue
+                raise TranslationRequestError(f"流式翻译异常: {detail}") from e
         raise TranslationRequestError("API 重试耗尽")
 
     # ── 视觉查询 ────────────────────────────────────────

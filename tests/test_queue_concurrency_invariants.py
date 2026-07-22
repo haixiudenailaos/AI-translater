@@ -919,6 +919,7 @@ class TestLifecycleStateMachine:
                 lambda: coord._tasks["t1"].state == QueueTaskState.PAUSE_REQUESTED,
                 timeout=8.0,
             )
+            assert coord._tasks["t1"].limiter_consumer_id == ""
             in_flight_before = len(coord._tasks["t1"].in_flight_batches)
             # 释放让在途批次完成
             probe.release_event.set()

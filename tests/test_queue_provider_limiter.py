@@ -187,6 +187,86 @@ class TestAcquireRelease:
         limiter.release()
 
 
+# ── 主界面 + 队列公平份额 ───────────────────────────────
+
+
+class TestFairConsumerShares:
+    def test_main_editor_alone_uses_all_four_global_slots(self):
+        limiter = _make_limiter(configured_max=4, hard_cap=4)
+        limiter.register_consumer("main", priority=0)
+
+        assert all(limiter.try_acquire(consumer_id="main") for _ in range(4))
+        assert not limiter.try_acquire(consumer_id="main")
+
+        for _ in range(4):
+            limiter.release(consumer_id="main")
+        limiter.unregister_consumer("main")
+
+    def test_main_editor_and_one_queue_split_four_slots_evenly(self):
+        limiter = _make_limiter(configured_max=4, hard_cap=4)
+        # Register the queue first to prove main priority is independent of timing.
+        limiter.register_consumer("queue:1", priority=10)
+        limiter.register_consumer("main", priority=0)
+
+        assert limiter.try_acquire(consumer_id="main")
+        assert limiter.try_acquire(consumer_id="main")
+        assert not limiter.try_acquire(consumer_id="main")
+        assert limiter.try_acquire(consumer_id="queue:1")
+        assert limiter.try_acquire(consumer_id="queue:1")
+        assert not limiter.try_acquire(consumer_id="queue:1")
+        assert limiter.in_flight == 4
+
+    def test_four_queues_each_receive_one_slot(self):
+        limiter = _make_limiter(configured_max=4, hard_cap=4)
+        queue_ids = [f"queue:{index}" for index in range(4)]
+        for queue_id in queue_ids:
+            limiter.register_consumer(queue_id, priority=10)
+
+        assert all(limiter.try_acquire(consumer_id=queue_id) for queue_id in queue_ids)
+        assert all(not limiter.try_acquire(consumer_id=queue_id) for queue_id in queue_ids)
+        assert limiter.in_flight == 4
+
+    def test_consumer_without_unsent_work_releases_its_unused_share(self):
+        limiter = _make_limiter(configured_max=4, hard_cap=4)
+        limiter.register_consumer("main", priority=0)
+        limiter.register_consumer("queue:1", priority=10)
+
+        assert limiter.try_acquire(consumer_id="main")
+        assert limiter.try_acquire(consumer_id="queue:1")
+        assert limiter.try_acquire(consumer_id="queue:1")
+        assert not limiter.try_acquire(consumer_id="queue:1")
+
+        limiter.set_consumer_demand("main", False)
+
+        assert limiter.try_acquire(consumer_id="queue:1")
+        assert limiter.in_flight == 4
+
+    def test_later_queues_inherit_slots_in_registration_order(self):
+        limiter = _make_limiter(configured_max=4, hard_cap=4)
+        queue_ids = [f"queue:{index}" for index in range(8)]
+        for queue_id in queue_ids:
+            limiter.register_consumer(queue_id, priority=10)
+
+        assert all(limiter.try_acquire(consumer_id=queue_id) for queue_id in queue_ids[:4])
+        assert all(not limiter.try_acquire(consumer_id=queue_id) for queue_id in queue_ids[4:])
+
+        limiter.unregister_consumer(queue_ids[0])
+        limiter.release(consumer_id=queue_ids[0])
+
+        assert limiter.try_acquire(consumer_id=queue_ids[4])
+        assert not limiter.try_acquire(consumer_id=queue_ids[5])
+
+    def test_unregister_cleans_consumer_after_its_in_flight_request_finishes(self):
+        limiter = _make_limiter(configured_max=1, hard_cap=1)
+        limiter.register_consumer("queue:1")
+        assert limiter.try_acquire(consumer_id="queue:1")
+
+        limiter.unregister_consumer("queue:1")
+        limiter.release(consumer_id="queue:1")
+
+        assert limiter.metrics()["consumers"] == []
+
+
 # ── AIMD ─────────────────────────────────────────────────
 
 
@@ -314,6 +394,29 @@ class TestRegistry:
         l2 = registry.get_or_create(key2, configured_max=4, hard_cap=8)
         assert l1 is not l2
 
+    def test_different_providers_share_one_application_wide_budget(self):
+        registry = ProviderLimiterRegistry()
+        limiter_a = registry.get_or_create(
+            _make_key(provider="siliconflow"),
+            configured_max=4,
+            hard_cap=4,
+        )
+        limiter_b = registry.get_or_create(
+            _make_key(provider="deepseek"),
+            configured_max=4,
+            hard_cap=4,
+        )
+        limiter_a.register_consumer("main", priority=0)
+        limiter_b.register_consumer("queue:1", priority=10)
+
+        assert limiter_a.try_acquire(consumer_id="main")
+        assert limiter_a.try_acquire(consumer_id="main")
+        assert not limiter_a.try_acquire(consumer_id="main")
+        assert limiter_b.try_acquire(consumer_id="queue:1")
+        assert limiter_b.try_acquire(consumer_id="queue:1")
+        assert not limiter_b.try_acquire(consumer_id="queue:1")
+        assert limiter_a.in_flight + limiter_b.in_flight == 4
+
     def test_update_configured_max_on_existing(self):
         registry = ProviderLimiterRegistry()
         key = _make_key()
@@ -322,6 +425,17 @@ class TestRegistry:
         l2 = registry.get_or_create(key, configured_max=6, hard_cap=8)
         assert l1 is l2
         assert l2.current_limit <= 6  # 应被新的 configured_max 约束
+
+    def test_global_setting_can_raise_previous_hard_cap(self):
+        registry = ProviderLimiterRegistry()
+        key = _make_key()
+        limiter = registry.get_or_create(key, configured_max=4, hard_cap=4)
+
+        updated = registry.get_or_create(key, configured_max=8, hard_cap=8)
+
+        assert updated is limiter
+        assert updated.metrics()["hard_cap"] == 8
+        assert updated.current_limit == 8
 
 
 # ── credential_reference_for ─────────────────────────────

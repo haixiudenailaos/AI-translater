@@ -280,14 +280,14 @@ def test_concurrent_batches_write_back_in_source_order():
 
 
 def test_main_translation_uses_only_capacity_left_by_background_queue():
-    """主编辑器和后台队列共享最大在途请求数，而不是各自占满上限。"""
+    """主编辑器和一个后台队列公平平分全局 4 个请求槽。"""
     from src.core.queue_provider import ProviderLimiterRegistry
 
-    config = PerformanceConfig(concurrency=2, batch_lines=1)
+    config = PerformanceConfig(concurrency=4, batch_lines=1)
     config.app.update(
         {
-            "queue_max_in_flight_requests": 2,
-            "queue_hard_request_cap": 2,
+            "queue_max_in_flight_requests": 4,
+            "queue_hard_request_cap": 4,
         }
     )
     registry = ProviderLimiterRegistry()
@@ -295,11 +295,13 @@ def test_main_translation_uses_only_capacity_left_by_background_queue():
     engine = TranslatorEngine(config, limiter_registry=registry)
     engine.api = api
 
-    # 模拟后台队列已有一个真实在途请求；主编辑器局部并发虽为 2，
-    # 此时也只能使用剩余的一个 Provider 槽位。
+    # 模拟一个后台队列占用其两个公平份额；主界面只能同时使用自己的
+    # 两个全局份额。
     limiter = engine._get_shared_limiter(config.get_api_config())
     assert limiter is not None
-    assert limiter.try_acquire(estimated_tokens=100)
+    limiter.register_consumer("queue:test", priority=10)
+    assert limiter.try_acquire(estimated_tokens=100, consumer_id="queue:test")
+    assert limiter.try_acquire(estimated_tokens=100, consumer_id="queue:test")
     completed = []
     try:
         engine._translate(
@@ -309,10 +311,70 @@ def test_main_translation_uses_only_capacity_left_by_background_queue():
         )
 
         assert completed[0].status == OperationStatus.SUCCEEDED
-        assert api.max_active == 1
-        assert limiter.in_flight == 1
+        assert api.max_active == 2
+        assert limiter.in_flight == 2
     finally:
-        limiter.release()
+        limiter.release(consumer_id="queue:test")
+        limiter.release(consumer_id="queue:test")
+        limiter.unregister_consumer("queue:test")
+
+
+def test_small_model_mode_limits_effective_concurrency_to_one():
+    """逐行模式始终串行发送，即使保存的全局设置更高。"""
+    config = PerformanceConfig(concurrency=1, batch_lines=20)
+    config.app.update(
+        {
+            "small_model_mode": True,
+            "queue_max_in_flight_requests": 3,
+            "queue_hard_request_cap": 3,
+        }
+    )
+    api = ConcurrentApi()
+    engine = TranslatorEngine(config)
+    engine.api = api
+    completed = []
+
+    engine._translate(
+        "\n".join(f"line-{index}" for index in range(12)),
+        lambda *_: None,
+        completed.append,
+    )
+
+    assert completed[0].status == OperationStatus.SUCCEEDED
+    assert api.max_active == 1
+    assert len(api.system_prompts) == 12
+
+
+def test_main_translation_releases_fair_share_after_last_request_is_sent():
+    from src.core.queue_provider import ProviderLimiterRegistry
+
+    config = PerformanceConfig(concurrency=4, batch_lines=1)
+    config.app.update(
+        {
+            "queue_max_in_flight_requests": 4,
+            "queue_hard_request_cap": 4,
+        }
+    )
+    registry = ProviderLimiterRegistry()
+    engine = TranslatorEngine(config, limiter_registry=registry)
+    engine.api = ConcurrentApi()
+    limiter = engine._get_shared_limiter(config.get_api_config())
+    assert limiter is not None
+    demand_changes = []
+    original_set_demand = limiter.set_consumer_demand
+
+    def record_demand(consumer_id, demanding):
+        demand_changes.append((consumer_id, demanding))
+        original_set_demand(consumer_id, demanding)
+
+    limiter.set_consumer_demand = record_demand
+
+    engine._translate("line-0\nline-1\nline-2", lambda *_: None, lambda *_: None)
+
+    assert any(
+        consumer_id.startswith("main:") and demanding is False
+        for consumer_id, demanding in demand_changes
+    )
 
 
 def test_provider_recommendation_can_reduce_concurrency():
@@ -404,6 +466,52 @@ def test_api_retries_429_once_and_sends_system_message():
         assert metrics["rate_limit_errors"] == 1
         assert metrics["successful_requests"] == 1
         assert api.recommended_concurrency(4) == 1
+    finally:
+        api.close()
+
+
+def test_api_retries_empty_stream_exception_before_receiving_content(monkeypatch):
+    class EmptyStreamError(Exception):
+        def __str__(self):
+            return ""
+
+    class FailedStreamResponse(FakeResponse):
+        def iter_lines(self):
+            raise EmptyStreamError()
+
+    api, client = make_api(
+        [
+            FailedStreamResponse(),
+            FakeResponse(chunks=[sse("译文"), "data: [DONE]"]),
+        ]
+    )
+    monkeypatch.setattr(api, "_recreate_client_if_safe", lambda: None)
+    try:
+        result = api.translate_stream("原文")
+        metrics = api.get_performance_metrics()
+
+        assert result == "译文"
+        assert len(client.requests) == 2
+        assert metrics["retries"] == 1
+        assert metrics["successful_requests"] == 1
+    finally:
+        api.close()
+
+
+def test_api_names_empty_stream_exception_after_retries_are_exhausted(monkeypatch):
+    class EmptyStreamError(Exception):
+        def __str__(self):
+            return ""
+
+    class FailedStreamResponse(FakeResponse):
+        def iter_lines(self):
+            raise EmptyStreamError()
+
+    api, _ = make_api([FailedStreamResponse(), FailedStreamResponse(), FailedStreamResponse()])
+    monkeypatch.setattr(api, "_recreate_client_if_safe", lambda: None)
+    try:
+        with pytest.raises(TranslationRequestError, match="EmptyStreamError"):
+            api.translate_stream("原文")
     finally:
         api.close()
 

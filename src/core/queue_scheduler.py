@@ -37,6 +37,7 @@ from ..application.error_handling import (
     classify_error,
     log_classified_error,
 )
+from ..config.translation_profile import MAX_QUEUE_CUSTOM_CONCURRENCY
 from ..domain.errors import TranslationCancelled, TranslationRequestError
 from ..domain.project import TranslationProject
 
@@ -206,6 +207,7 @@ class _InFlightBatch:
     task_id: str
     batch_id: int
     limiter: ProviderLimiter
+    consumer_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,6 +527,7 @@ class _TaskSlot:
     # 一个 attempt 在准备完成时固定其 Provider limiter。后续设置切换只会
     # 影响新 attempt，不能改变旧批次的并发归属。
     limiter: ProviderLimiter | None = None
+    limiter_consumer_id: str = ""
     cancel_event: threading.Event = field(default_factory=threading.Event)
     # 批次队列（未提交）
     pending_batches: deque = field(default_factory=deque)
@@ -627,7 +630,7 @@ class QueueTranslationCoordinator:
 
         # 全局执行池：max_workers = hard_cap，硬上限不可突破（§6.1）
         self._executor = ThreadPoolExecutor(
-            max_workers=max(1, policy.hard_request_cap),
+            max_workers=MAX_QUEUE_CUSTOM_CONCURRENCY,
             thread_name_prefix="queue-batch",
         )
         self._in_flight: Dict[Future, _InFlightBatch] = {}
@@ -691,6 +694,7 @@ class QueueTranslationCoordinator:
             # 取消所有未提交的 pending 批次
             for slot in self._tasks.values():
                 slot.pending_batches.clear()
+                self._unregister_limiter_consumer_locked(slot)
                 if slot.engine is not None:
                     engines_to_stop.append(slot.engine)
             self._wake_event.set()
@@ -764,6 +768,54 @@ class QueueTranslationCoordinator:
                 return
             self._commands.append(_Command(kind=kind, task_id=task_id))
         self._wake_event.set()
+
+    def update_policy(self, policy: QueuePolicy) -> None:
+        """Apply settings changes without recreating or losing queued tasks."""
+        self._limiter_registry.update_limits(
+            configured_max=policy.max_in_flight_requests,
+            hard_cap=policy.hard_request_cap,
+        )
+        with self._lock:
+            self._policy = policy
+            if policy.max_batch_lines == 1:
+                self._split_pending_batches_to_single_lines_locked()
+            self._activate_pending_tasks_locked()
+        self._wake_event.set()
+
+    def _split_pending_batches_to_single_lines_locked(self) -> None:
+        """Re-plan not-yet-dispatched work when small-model mode is enabled."""
+        for slot in self._tasks.values():
+            if not slot.pending_batches:
+                continue
+            used_ids = set(slot.completed_batch_ids)
+            used_ids.update(slot.in_flight_batches)
+            used_ids.update(job.batch_id for job in slot.pending_batches)
+            next_batch_id = max(used_ids, default=-1) + 1
+            rebuilt: deque[BatchJob] = deque()
+            for job in slot.pending_batches:
+                if len(job.source_lines) <= 1:
+                    rebuilt.append(job)
+                    continue
+                fixed_tokens = estimate_tokens(job.run_context.system_prompt or "")
+                for source_index, source_line in zip(
+                    job.source_indices,
+                    job.source_lines,
+                    strict=True,
+                ):
+                    line_tokens = estimate_tokens(f"[LINE_001]{source_line}\n")
+                    rebuilt.append(
+                        BatchJob(
+                            task_id=job.task_id,
+                            attempt_id=job.attempt_id,
+                            batch_id=next_batch_id,
+                            source_indices=(source_index,),
+                            source_lines=(source_line,),
+                            estimated_input_tokens=fixed_tokens + line_tokens,
+                            run_context=job.run_context,
+                        )
+                    )
+                    next_batch_id += 1
+            slot.pending_batches = rebuilt
 
     def add_task(
         self,
@@ -1206,6 +1258,7 @@ class QueueTranslationCoordinator:
         slot.completed_batch_ids = set()
         slot.in_flight_batches = {}
         slot.pending_batches = deque()
+        self._unregister_limiter_consumer_locked(slot)
         slot.limiter = None
         slot.completed_lines = 0
         # P1-UX-3：任务恢复时清空旧错误（开始新一轮 attempt）
@@ -1299,6 +1352,7 @@ class QueueTranslationCoordinator:
             for j in jobs
         ]
         slot.pending_batches = deque(filled_jobs)
+        self._ensure_limiter_consumer_locked(slot)
         slot.state = QueueTaskState.READY
 
     def _compute_missing_indices_locked(self, slot: _TaskSlot) -> List[int]:
@@ -1336,16 +1390,24 @@ class QueueTranslationCoordinator:
             slot = self._tasks.get(task_id)
             if slot is None:
                 return
-            if slot.state in (QueueTaskState.RUNNING, QueueTaskState.READY):
+            if slot.state == QueueTaskState.READY and not slot.in_flight_batches:
+                slot.state = QueueTaskState.PAUSED
+                self._unregister_limiter_consumer_locked(slot)
+            elif slot.state in (QueueTaskState.RUNNING, QueueTaskState.READY):
                 slot.state = QueueTaskState.PAUSE_REQUESTED
+                self._unregister_limiter_consumer_locked(slot)
             elif slot.state == QueueTaskState.PAUSE_REQUESTED:
                 pass  # 已请求暂停
 
     def _cmd_pause_all(self) -> None:
         with self._lock:
             for slot in self._tasks.values():
-                if slot.state in (QueueTaskState.RUNNING, QueueTaskState.READY):
+                if slot.state == QueueTaskState.READY and not slot.in_flight_batches:
+                    slot.state = QueueTaskState.PAUSED
+                    self._unregister_limiter_consumer_locked(slot)
+                elif slot.state in (QueueTaskState.RUNNING, QueueTaskState.READY):
                     slot.state = QueueTaskState.PAUSE_REQUESTED
+                    self._unregister_limiter_consumer_locked(slot)
 
     def _cmd_resume_task(self, task_id: str | None) -> None:
         if task_id is None:
@@ -1380,6 +1442,7 @@ class QueueTranslationCoordinator:
             engine = slot.engine
             slot.state = QueueTaskState.CANCELLED
             slot.start_requested = False
+            self._unregister_limiter_consumer_locked(slot)
         if engine is not None:
             self._stop_engine(engine)
 
@@ -1396,6 +1459,7 @@ class QueueTranslationCoordinator:
                     engines.append(slot.engine)
                 slot.state = QueueTaskState.CANCELLED
                 slot.start_requested = False
+                self._unregister_limiter_consumer_locked(slot)
         for engine in engines:
             self._stop_engine(engine)
 
@@ -1434,6 +1498,7 @@ class QueueTranslationCoordinator:
             engine = slot.engine
             slot.engine = None
             slot.checkpoint = None
+            self._unregister_limiter_consumer_locked(slot)
             # 从注册表移除
             self._tasks.pop(task_id, None)
             if task_id in self._task_order:
@@ -1467,7 +1532,7 @@ class QueueTranslationCoordinator:
             task_id, batch_id = meta.task_id, meta.batch_id
             # 与派发时的 try_acquire 成对。不能释放“当前” limiter：设置切换
             # 后，当前 limiter 可能已经属于另一批任务。
-            meta.limiter.release()
+            meta.limiter.release(consumer_id=meta.consumer_id)
             try:
                 outcome: BatchOutcome = future.result()
             except Exception as exc:  # noqa: BLE001
@@ -1610,6 +1675,7 @@ class QueueTranslationCoordinator:
         """PAUSE_REQUESTED 且 in_flight==0 时转为 PAUSED（§9.1）。"""
         if slot.state == QueueTaskState.PAUSE_REQUESTED and not slot.in_flight_batches:
             slot.state = QueueTaskState.PAUSED
+            self._unregister_limiter_consumer_locked(slot)
 
     def _check_task_completion_locked(self, slot: _TaskSlot) -> None:
         """所有批次完成时转换到终态（COMPLETED/PARTIAL/ERROR）。"""
@@ -1654,6 +1720,7 @@ class QueueTranslationCoordinator:
                     slot.final_state_hint = slot.state
                     slot.state = QueueTaskState.FINALIZING
                 slot.finalization_scheduled = True
+                self._unregister_limiter_consumer_locked(slot)
                 engine = slot.engine
                 slot.engine = None
                 work.append((slot.task_id, slot.checkpoint, engine))
@@ -1768,10 +1835,12 @@ class QueueTranslationCoordinator:
 
             def can_dispatch(slot: _TaskSlot) -> bool:
                 limiter = slot.limiter
+                consumer_id = self._ensure_limiter_consumer_locked(slot)
                 return (
                     limiter is not None
+                    and consumer_id is not None
                     and not limiter.is_blocked()
-                    and limiter.available_capacity > 0
+                    and limiter.available_capacity_for(consumer_id) > 0
                 )
 
             # 第一轮：round-robin，每任务最多 per_task_soft_limit 个
@@ -1827,8 +1896,15 @@ class QueueTranslationCoordinator:
         if not slot.pending_batches:
             return False
         job = slot.pending_batches.popleft()
+        consumer_id = self._ensure_limiter_consumer_locked(slot)
+        if consumer_id is None:
+            slot.pending_batches.appendleft(job)
+            return False
         # 获取 limiter 槽位（带预估 token）
-        if not limiter.try_acquire(estimated_tokens=job.estimated_input_tokens):
+        if not limiter.try_acquire(
+            estimated_tokens=job.estimated_input_tokens,
+            consumer_id=consumer_id,
+        ):
             # 无容量：放回队首，下次再试
             slot.pending_batches.appendleft(job)
             return False
@@ -1841,7 +1917,7 @@ class QueueTranslationCoordinator:
         if engine is None:
             slot.pending_batches.appendleft(job)
             slot.in_flight_batches.pop(job.batch_id, None)
-            limiter.release()
+            limiter.release(consumer_id=consumer_id)
             return False
         cancel_event = slot.cancel_event
         # 释放锁后提交？为简化，在锁内 submit（submit 不阻塞，只入队）
@@ -1852,7 +1928,7 @@ class QueueTranslationCoordinator:
             # 此处完成回滚。任务进入 ERROR，用户重新开始时会重建批次。
             slot.in_flight_batches.pop(job.batch_id, None)
             slot.pending_batches.clear()
-            limiter.release()
+            limiter.release(consumer_id=consumer_id)
             slot.state = QueueTaskState.ERROR
             slot.error_message = f"提交翻译批次失败：{exc}"
             slot.actionable_error = classify_error(exc)
@@ -1867,7 +1943,10 @@ class QueueTranslationCoordinator:
             task_id=slot.task_id,
             batch_id=job.batch_id,
             limiter=limiter,
+            consumer_id=consumer_id,
         )
+        if not slot.pending_batches:
+            limiter.set_consumer_demand(consumer_id, False)
         slot.last_dispatch_at = time.monotonic()
         return True
 
@@ -2081,6 +2160,22 @@ class QueueTranslationCoordinator:
         )
         self._active_limiter = limiter
         return limiter
+
+    def _ensure_limiter_consumer_locked(self, slot: _TaskSlot) -> str | None:
+        limiter = slot.limiter
+        if limiter is None:
+            return None
+        if not slot.limiter_consumer_id:
+            attempt_id = slot.attempt_id or "legacy"
+            slot.limiter_consumer_id = f"queue:{slot.task_id}:{attempt_id}"
+        limiter.register_consumer(slot.limiter_consumer_id, priority=10)
+        return slot.limiter_consumer_id
+
+    @staticmethod
+    def _unregister_limiter_consumer_locked(slot: _TaskSlot) -> None:
+        if slot.limiter is not None and slot.limiter_consumer_id:
+            slot.limiter.unregister_consumer(slot.limiter_consumer_id)
+        slot.limiter_consumer_id = ""
 
     def _close_engine_locked(self, slot: _TaskSlot) -> None:
         """Detach an engine under lock and close it in the finalizer executor."""

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from src.application.error_handling import ActionableError, ErrorCategory, RetryPolicy
+from src.application.error_handling import (
+    ActionableError,
+    ErrorCategory,
+    RetryPolicy,
+    classify_error,
+)
 from src.ui.translation_controller import TranslationController
 
 
@@ -42,6 +47,15 @@ def test_main_translation_error_dialog_is_sanitized(monkeypatch):
     assert "secret-token-value-12345" not in dialogs[0][1]
     assert "建议操作：" in dialogs[0][1]
     assert "诊断编号：" in dialogs[0][1]
+
+
+def test_small_model_provider_rejection_recommends_lower_global_concurrency():
+    actionable = classify_error(
+        RuntimeError("小模型逐行翻译的并发批次过大，已被服务商拒绝。翻译已停止。")
+    )
+
+    assert actionable.category is ErrorCategory.RATE_LIMIT
+    assert "并发 1" in actionable.recommended_action
 
 
 def test_non_retryable_missing_error_stops_automatic_retry(monkeypatch):

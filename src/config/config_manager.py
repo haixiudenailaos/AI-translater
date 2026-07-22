@@ -39,6 +39,7 @@ from .translation_profile import (
     DEFAULT_TRANSLATION_CONCURRENCY,
     OPENAI_COMPATIBLE_PROVIDER,
     SILICONFLOW_DEEPSEEK_V32_MODEL,
+    SMALL_MODEL_MODE_CONFIG_KEY,
     apply_text_translation_profile,
     normalize_openai_base_url,
 )
@@ -115,6 +116,7 @@ class ConfigManager:
             "batch_max_input_characters": 8000,
             "batch_lines": DEFAULT_TRANSLATION_BATCH_LINES,
             "translation_concurrency": DEFAULT_TRANSLATION_CONCURRENCY,
+            SMALL_MODEL_MODE_CONFIG_KEY: False,
             "queue_batch_lines": DEFAULT_QUEUE_TRANSLATION_BATCH_LINES,
             "queue_translation_concurrency": DEFAULT_QUEUE_TRANSLATION_CONCURRENCY,
             "queue_concurrency_preset": DEFAULT_QUEUE_CONCURRENCY_PRESET,
