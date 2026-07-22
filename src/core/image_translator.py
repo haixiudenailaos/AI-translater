@@ -152,7 +152,13 @@ def _rasterize_safe_svg(data: bytes) -> bytes:
     try:
         import cairosvg
 
-        return cairosvg.svg2png(bytestring=ElementTree.tostring(root), unsafe=False)
+        rasterized = cairosvg.svg2png(
+            bytestring=ElementTree.tostring(root),
+            unsafe=False,
+        )
+        if not isinstance(rasterized, bytes):
+            raise ImageDownloadError("SVG 栅格化未返回图片字节")
+        return rasterized
     except ImageDownloadError:
         raise
     except Exception as exc:
