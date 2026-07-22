@@ -288,10 +288,7 @@ class TestQueuePolicyFromConfig:
 
         assert QUEUE_CONCURRENCY_PRESETS == {"small": 2, "medium": 4, "large": 8}
         assert detect_queue_concurrency_preset({}) == "medium"
-        assert (
-            detect_queue_concurrency_preset({"queue_max_in_flight_requests": 8})
-            == "large"
-        )
+        assert detect_queue_concurrency_preset({"queue_max_in_flight_requests": 8}) == "large"
         assert (
             detect_queue_concurrency_preset({"queue_max_in_flight_requests": 7})
             == QUEUE_CONCURRENCY_CUSTOM

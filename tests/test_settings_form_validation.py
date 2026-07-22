@@ -489,16 +489,15 @@ class SettingsWindowValidationTests(unittest.TestCase):
             self.assertEqual(str(btn.cget("state")), "normal")
 
     def test_test_buttons_registered_in_busy_list(self):
-        """三个测试按钮都应纳入 _test_buttons 列表。"""
+        """当前设置页的两个测试按钮都应纳入 _test_buttons 列表。"""
         dialog = self._make_dialog()
-        self.assertEqual(len(dialog._test_buttons), 3)
+        self.assertEqual(len(dialog._test_buttons), 2)
         texts = sorted(str(btn.cget("text")) for btn in dialog._test_buttons)
         self.assertEqual(
             texts,
             sorted(
                 [
                     "测试连接",
-                    "检测可用性",
                     "测试 AI 图片翻译连接",
                 ]
             ),

@@ -37,7 +37,6 @@ from .theme import COLORS
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 from .window_geometry import WindowGeometryTracker
 
-
 _QUEUE_CONCURRENCY_LABELS = {
     "small": "小批次（2 个请求）",
     "medium": "中批次（4 个请求，推荐）",
@@ -691,9 +690,7 @@ class SettingsWindow:
             configured_concurrency = int(configured_concurrency)
         except (TypeError, ValueError):
             configured_concurrency = DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS
-        configured_concurrency = max(
-            1, min(MAX_QUEUE_CUSTOM_CONCURRENCY, configured_concurrency)
-        )
+        configured_concurrency = max(1, min(MAX_QUEUE_CUSTOM_CONCURRENCY, configured_concurrency))
         self.queue_concurrency_preset_var = tk.StringVar(
             value=detect_queue_concurrency_preset(self.app_config)
         )
