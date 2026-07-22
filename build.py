@@ -209,7 +209,7 @@ class BuildManager:
         for exe_file in exe_files:
             file_size = exe_file.stat().st_size
             file_size_mb = file_size / (1024 * 1024)
-            self.print_status(f"  📁 {exe_file.name} ({file_size_mb:.1f} MB)")
+            self.print_status(f"  - {exe_file.name} ({file_size_mb:.1f} MB)")
 
         # 显示其他重要文件
         other_files = []
@@ -220,9 +220,9 @@ class BuildManager:
             self.print_status("其他文件:")
             for file_path in other_files:
                 if file_path.is_file():
-                    self.print_status(f"  📄 {file_path.relative_to(self.dist_dir)}")
+                    self.print_status(f"  - {file_path.relative_to(self.dist_dir)}")
                 elif file_path.is_dir():
-                    self.print_status(f"  📁 {file_path.relative_to(self.dist_dir)}/")
+                    self.print_status(f"  - {file_path.relative_to(self.dist_dir)}/")
 
         return True
 

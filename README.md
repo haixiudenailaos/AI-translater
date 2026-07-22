@@ -69,14 +69,19 @@ python main.py
 ### 术语表配置
 
 1. 复制 `config/glossary_sample.json` 为 `config/glossary.json`
-2. 添加自定义术语翻译对：
+2. 编辑 `config/glossary.json`，添加自定义术语翻译对：
 
 ```json
 {
-  "专有名词": "Proper Noun",
-  "角色名": "Character Name"
+  "terms": [
+    {"source": "专有名词", "target": "Proper Noun", "category": "通用"},
+    {"source": "角色名", "target": "Character Name", "category": "角色"}
+  ],
+  "categories": ["通用", "技术", "专业", "角色"]
 }
 ```
+
+> 详细说明请参阅 [GLOSSARY.md](GLOSSARY.md)。
 
 ## 📖 使用指南
 

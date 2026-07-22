@@ -53,6 +53,7 @@ class BaseAPI:
     DEFAULT_MAX_KEEPALIVE: int = 10
     DEFAULT_MAX_CONNECTIONS: int = 20
     DEFAULT_TIMEOUT: float = 60.0
+    DEFAULT_CONNECTION_TEST_TIMEOUT: float = 30.0
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -101,6 +102,15 @@ class BaseAPI:
         self._write_timeout = float(config.get("http_write_timeout", 60.0))
         self._pool_timeout = float(config.get("http_pool_timeout", 10.0))
         self._timeout = self._read_timeout
+        connection_test_timeout = float(
+            config.get("connection_test_timeout", self.DEFAULT_CONNECTION_TEST_TIMEOUT)
+        )
+        self._connection_test_timeout = httpx.Timeout(
+            connect=min(self._connect_timeout, connection_test_timeout),
+            read=min(self._read_timeout, connection_test_timeout),
+            write=min(self._write_timeout, connection_test_timeout),
+            pool=min(self._pool_timeout, connection_test_timeout),
+        )
         self._http_timeout = httpx.Timeout(
             connect=self._connect_timeout,
             read=self._read_timeout,
@@ -256,7 +266,14 @@ class BaseAPI:
 
         def _check_once(client: httpx.Client) -> bool | None:
             try:
-                resp = client.post(
+                # Only the response status is needed to prove that the endpoint,
+                # credentials, and model are accepted.  ``Client.post`` eagerly
+                # reads the generated body; some providers send HTTP 200 headers
+                # first and then take more than a few seconds to finish that body.
+                # This made a healthy connection look like a read timeout,
+                # especially during a packaged application's cold start.
+                with client.stream(
+                    "POST",
                     f"{self.base_url}/chat/completions",
                     headers=self.headers,
                     json={
@@ -265,43 +282,40 @@ class BaseAPI:
                         "temperature": 0.0,
                         "stream": False,
                     },
-                    timeout=min(self._timeout, 3.0),
-                )
-                if resp.status_code == 200:
-                    try:
-                        body = resp.json()
-                        return bool(body.get("choices"))
-                    except (KeyError, TypeError, json.JSONDecodeError):
+                    timeout=self._connection_test_timeout,
+                ) as resp:
+                    if resp.status_code == 200:
                         return True
-                if resp.status_code in (401, 403):
-                    logger.error("连接失败：鉴权错误（API Key 可能无效或权限不足）")
-                    return False
-                if resp.status_code == 429:
-                    logger.info("已连接：触发速率限制（429）")
-                    return True
-                if resp.status_code in (400, 404):
-                    try:
-                        body = resp.json()
-                        raw = str(body.get("error") or body.get("message") or resp.text)
-                    except Exception:
-                        raw = resp.text
-                    kw = [
-                        "model",
-                        "not found",
-                        "unknown",
-                        "invalid",
-                        "unsupported",
-                        "模型",
-                        "不存在",
-                        "未知",
-                        "无效",
-                        "不支持",
-                        "未找到",
-                    ]
-                    if any(k in raw.lower() for k in kw):
-                        logger.error("连接失败：模型不可用或不存在")
+                    if resp.status_code in (401, 403):
+                        logger.error("连接失败：鉴权错误（API Key 可能无效或权限不足）")
                         return False
-                return None
+                    if resp.status_code == 429:
+                        logger.info("已连接：触发速率限制（429）")
+                        return True
+                    if resp.status_code in (400, 404):
+                        try:
+                            resp.read()
+                            body = resp.json()
+                            raw = str(body.get("error") or body.get("message") or resp.text)
+                        except Exception:
+                            raw = resp.text
+                        kw = [
+                            "model",
+                            "not found",
+                            "unknown",
+                            "invalid",
+                            "unsupported",
+                            "模型",
+                            "不存在",
+                            "未知",
+                            "无效",
+                            "不支持",
+                            "未找到",
+                        ]
+                        if any(k in raw.lower() for k in kw):
+                            logger.error("连接失败：模型不可用或不存在")
+                            return False
+                    return None
             except Exception as exc:
                 logger.warning("连接测试异常: %s", exc)
                 return None

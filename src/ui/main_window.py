@@ -141,6 +141,7 @@ class MainWindow:
             translation_table=self.translation_table,
             progress_var=self.progress_var,
             progress_bar=self.progress_bar,
+            start_btn=self.start_translation_btn,
             translate_btn=self.translate_btn,
             continue_btn=self.continue_btn,
             stop_btn=self.stop_btn,
@@ -188,7 +189,7 @@ class MainWindow:
             targets={
                 "settings": lambda: self.settings_btn,
                 "import": lambda: self.import_file_btn,
-                "translate": lambda: self.translate_btn,
+                "translate": lambda: self.start_translation_btn,
                 "review": lambda: self.review_filter,
             },
             actions={
@@ -490,6 +491,13 @@ class MainWindow:
         left_control = ttk.Frame(control_frame)
         left_control.pack(side=tk.LEFT)
 
+        self.start_translation_btn = ttk.Button(
+            left_control,
+            text="开始翻译",
+            state=tk.DISABLED,
+            command=self._run_primary_action,
+        )
+        self.start_translation_btn.pack(side=tk.LEFT, padx=(0, 5))
         self.translate_btn = ttk.Button(
             left_control, text="翻译未完成行", command=self._run_primary_action
         )
@@ -673,6 +681,8 @@ class MainWindow:
             onboarding.notify("content_loaded", count=len(source_lines))
 
         self._table_loading = True
+        if hasattr(self, "start_translation_btn"):
+            self.start_translation_btn.config(state=tk.DISABLED)
         self.translate_btn.config(text="正在加载", state=tk.DISABLED)
         self.continue_btn.config(state=tk.DISABLED)
         self.update_status(f"正在加载 0/{len(source_lines)} 行")
@@ -1179,6 +1189,8 @@ class MainWindow:
 
     def refresh_action_state(self):
         if self._table_loading:
+            if hasattr(self, "start_translation_btn"):
+                self.start_translation_btn.config(state=tk.DISABLED)
             self.translate_btn.config(text="正在加载", state=tk.DISABLED)
             return
         # PERF §7：从文档模型读取统计，避免逐行调用 Tk item()。
@@ -1221,6 +1233,9 @@ class MainWindow:
             if not pending and has_content and api_configured
             else self._run_primary_action,
         )
+        if hasattr(self, "start_translation_btn"):
+            start_state = tk.NORMAL if has_content and pending and api_configured else tk.DISABLED
+            self.start_translation_btn.config(state=start_state)
         if hasattr(self, "more_actions_menu"):
             menu_state = tk.NORMAL if is_epub else tk.DISABLED
             if hasattr(self, "export_epub_btn"):

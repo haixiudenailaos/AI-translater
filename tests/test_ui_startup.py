@@ -10,6 +10,7 @@ from src.application.translation_document import TranslationDocument
 from src.config.config_manager import ConfigManager
 from src.ui.lazy_service import LazyService
 from src.ui.main_window import MainWindow
+from src.ui.translation_controller import TranslationController
 from src.ui.translation_table_adapter import TranslationTableAdapter
 
 
@@ -205,6 +206,63 @@ class MainWindowLayoutTests(unittest.TestCase):
         self.assertEqual(right.grid_options["column"], 2)
         self.assertEqual(window.settings_btn.pack_options["side"], tk.RIGHT)
 
+    def test_control_panel_places_start_translation_at_bottom_left(self):
+        class LayoutWidget:
+            def __init__(self, parent=None, **options):
+                self.parent = parent
+                self.options = options
+                self.pack_options = None
+
+            def pack(self, **kwargs):
+                self.pack_options = kwargs
+
+        class Menu:
+            def __init__(self, *_args, **_kwargs):
+                self.entries = []
+
+            def add_command(self, **options):
+                self.entries.append(options)
+
+            def add_separator(self):
+                self.entries.append(None)
+
+            def index(self, _index):
+                return len(self.entries) - 1
+
+        buttons = []
+        calls = []
+
+        def make_widget(parent=None, **options):
+            return LayoutWidget(parent, **options)
+
+        def make_button(parent=None, **options):
+            widget = LayoutWidget(parent, **options)
+            buttons.append(widget)
+            return widget
+
+        window = MainWindow.__new__(MainWindow)
+        window._run_primary_action = lambda: calls.append("start")
+        window._continue_translation = lambda: None
+
+        with (
+            patch("src.ui.main_window.ttk.Frame", side_effect=make_widget),
+            patch("src.ui.main_window.ttk.Button", side_effect=make_button),
+            patch("src.ui.main_window.ttk.Menubutton", side_effect=make_widget),
+            patch("src.ui.main_window.ttk.Label", side_effect=make_widget),
+            patch("src.ui.main_window.ttk.Progressbar", side_effect=make_widget),
+            patch("src.ui.main_window.tk.Menu", Menu),
+            patch("src.ui.main_window.tk.DoubleVar", return_value=object()),
+        ):
+            window.create_control_panel(object())
+
+        self.assertIs(buttons[0], window.start_translation_btn)
+        self.assertEqual(buttons[0].options["text"], "开始翻译")
+        self.assertEqual(buttons[0].options["state"], tk.DISABLED)
+        self.assertEqual(buttons[0].pack_options["side"], tk.LEFT)
+        self.assertEqual(buttons[1].options["text"], "翻译未完成行")
+        buttons[0].options["command"]()
+        self.assertEqual(calls, ["start"])
+
     def test_shortcuts_bind_control_and_command_variants(self):
         class Root:
             def __init__(self):
@@ -260,6 +318,38 @@ class _Widget:
 
     def pack_forget(self):
         self.hidden = True
+
+
+class TranslationControlTests(unittest.TestCase):
+    def test_imported_pending_content_enables_start_translation(self):
+        window = MainWindow.__new__(MainWindow)
+        window._table_loading = False
+        window._document = TranslationDocument()
+        window._document.replace(["source"], [""])
+        window._api_configured = True
+        window._review_filter_var = SimpleNamespace(get=lambda: "全部")
+        window.file_importer = SimpleNamespace(current_mapping_dir=None)
+        window.translate_btn = _Widget()
+        window.start_translation_btn = _Widget()
+
+        window.refresh_action_state()
+
+        self.assertEqual(window.start_translation_btn.options["state"], tk.NORMAL)
+        self.assertEqual(window.translate_btn.options["text"], "翻译未完成行")
+
+    def test_translation_controller_keeps_start_button_in_sync(self):
+        controller = TranslationController.__new__(TranslationController)
+        controller.start_btn = _Widget()
+        controller.translate_btn = _Widget()
+        controller.continue_btn = _Widget()
+        controller.stop_btn = _Widget()
+
+        controller._set_control_states(tk.DISABLED, tk.DISABLED, tk.NORMAL)
+
+        self.assertEqual(controller.start_btn.options["state"], tk.DISABLED)
+        self.assertEqual(controller.translate_btn.options["state"], tk.DISABLED)
+        self.assertEqual(controller.continue_btn.options["state"], tk.DISABLED)
+        self.assertEqual(controller.stop_btn.options["state"], tk.NORMAL)
 
 
 class _Tree:

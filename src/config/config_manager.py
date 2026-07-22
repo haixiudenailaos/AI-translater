@@ -26,6 +26,7 @@ from .image_ocr import (
 )
 from .translation_profile import (
     DEFAULT_QUEUE_ADAPTIVE_CONCURRENCY,
+    DEFAULT_QUEUE_CONCURRENCY_PRESET,
     DEFAULT_QUEUE_HARD_REQUEST_CAP,
     DEFAULT_QUEUE_MAX_ACTIVE_TASKS,
     DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS,
@@ -116,6 +117,7 @@ class ConfigManager:
             "translation_concurrency": DEFAULT_TRANSLATION_CONCURRENCY,
             "queue_batch_lines": DEFAULT_QUEUE_TRANSLATION_BATCH_LINES,
             "queue_translation_concurrency": DEFAULT_QUEUE_TRANSLATION_CONCURRENCY,
+            "queue_concurrency_preset": DEFAULT_QUEUE_CONCURRENCY_PRESET,
             # 队列翻译并发优化阶段 1（QUEUE_TRANSLATION_CONCURRENCY_OPTIMIZATION_PLAN.md §3）：
             # 全局公平调度器策略参数。详细说明见 translation_profile.py。
             "queue_max_in_flight_requests": DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS,

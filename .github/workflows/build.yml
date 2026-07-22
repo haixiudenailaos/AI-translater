@@ -146,6 +146,14 @@ jobs:
         shell: pwsh
         run: |
           $exe = "dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64.exe"
+          $functional = Start-Process -FilePath $exe -ArgumentList "--packaged-smoke-test" -PassThru
+          if (-not $functional.WaitForExit(60000)) {
+            Stop-Process -Id $functional.Id -Force
+            throw "Packaged dependency smoke test timed out"
+          }
+          if ($functional.ExitCode -ne 0) {
+            throw "Packaged dependency smoke test failed with code $($functional.ExitCode)"
+          }
           $process = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 15
           if ($process.HasExited) {

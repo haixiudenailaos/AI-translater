@@ -11,27 +11,20 @@ from ..config.image_ocr import SILICONFLOW_OCR_DEFAULT_MODEL
 from ..config.translation_profile import (
     DEEPSEEK_V4_FLASH_MODEL,
     DEFAULT_QUEUE_ADAPTIVE_CONCURRENCY,
-    DEFAULT_QUEUE_HARD_REQUEST_CAP,
     DEFAULT_QUEUE_MAX_ACTIVE_TASKS,
     DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS,
     DEFAULT_QUEUE_PER_TASK_SOFT_LIMIT,
-    DEFAULT_QUEUE_RPM_LIMIT,
-    DEFAULT_QUEUE_TPM_LIMIT,
-    DEFAULT_QUEUE_TRANSLATION_BATCH_LINES,
     DEFAULT_TRANSLATION_BATCH_LINES,
     DEFAULT_TRANSLATION_CONCURRENCY,
-    MAX_QUEUE_HARD_REQUEST_CAP,
-    MAX_QUEUE_MAX_ACTIVE_TASKS,
-    MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS,
-    MAX_QUEUE_PER_TASK_SOFT_LIMIT,
-    MAX_QUEUE_RPM_LIMIT,
-    MAX_QUEUE_TPM_LIMIT,
-    MAX_QUEUE_TRANSLATION_BATCH_LINES,
+    MAX_QUEUE_CUSTOM_CONCURRENCY,
     MAX_STABLE_TRANSLATION_BATCH_LINES,
     OPENAI_COMPATIBLE_PROVIDER,
+    QUEUE_CONCURRENCY_CUSTOM,
+    QUEUE_CONCURRENCY_PRESETS,
     SILICONFLOW_DEEPSEEK_V32_MODEL,
     apply_text_translation_profile,
     default_base_url_for_provider,
+    detect_queue_concurrency_preset,
     normalize_openai_base_url,
 )
 from ..config.volcengine_image import (
@@ -43,6 +36,13 @@ from .form_validation import FormValidator
 from .theme import COLORS
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 from .window_geometry import WindowGeometryTracker
+
+
+_QUEUE_CONCURRENCY_LABELS = {
+    "small": "小批次（2 个请求）",
+    "medium": "中批次（4 个请求，推荐）",
+    "large": "大批次（8 个请求）",
+}
 
 
 class SettingsWindow:
@@ -183,6 +183,25 @@ class SettingsWindow:
         """P2-5：整表校验。返回 ``(ok, first_message, first_failed_widget)``。"""
         result = self._form_validator.validate_all()
         return result.ok, result.first_message or "", result.first_failed_widget
+
+    def _on_queue_concurrency_preset_changed(self) -> None:
+        """Keep the custom field and selected global concurrency in sync."""
+        preset = self.queue_concurrency_preset_var.get()
+        preset_concurrency = QUEUE_CONCURRENCY_PRESETS.get(preset)
+        if preset_concurrency is None:
+            self.queue_custom_concurrency_spin.configure(state="normal")
+            return
+        self.queue_custom_concurrency_var.set(preset_concurrency)
+        self.queue_custom_concurrency_spin.configure(state="disabled")
+
+    def _selected_queue_concurrency(self) -> int:
+        preset = self.queue_concurrency_preset_var.get()
+        if preset in QUEUE_CONCURRENCY_PRESETS:
+            return QUEUE_CONCURRENCY_PRESETS[preset]
+        return max(
+            1,
+            min(MAX_QUEUE_CUSTOM_CONCURRENCY, self.queue_custom_concurrency_var.get()),
+        )
 
     def _set_testing_busy(self, busy: bool) -> None:
         """P2-5：testing busy 状态。testing 期间禁用所有测试按钮，避免重复启动。
@@ -649,206 +668,78 @@ class SettingsWindow:
             row=7, column=1, padx=10, pady=8, sticky=tk.E
         )
 
-        # 队列翻译并发优化阶段 1：队列翻译调度参数（QUEUE_TRANSLATION_CONCURRENCY_OPTIMIZATION_PLAN.md §3）
-        # 这些参数构造 QueuePolicy，影响全局公平调度器和共享 ProviderLimiter。
+        # 主界面和后台队列共享同一个 Provider 并发额度。设置页只暴露常用
+        # 档位与一个自定义值，其余调度细节由程序管理。
         queue_sep = ttk.Separator(trans_frame, orient=tk.HORIZONTAL)
         queue_sep.grid(row=8, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(10, 4))
         ttk.Label(
             trans_frame,
-            text="文本翻译全局调度（主界面 + 后台队列）",
+            text="文本翻译全局并发（主界面 + 后台队列）",
             font=("TkDefaultFont", 9, "bold"),
         ).grid(row=9, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(0, 4))
 
-        # 最大在途请求数（ProviderLimiter configured_max）
-        ttk.Label(trans_frame, text="全局最大在途请求:").grid(
-            row=10, column=0, sticky=tk.W, padx=10, pady=4
+        ttk.Label(trans_frame, text="并发批次:").grid(
+            row=10, column=0, sticky=tk.NW, padx=10, pady=8
         )
-        self.queue_max_in_flight_var = tk.IntVar(
-            value=self.app_config.get(
-                "queue_max_in_flight_requests", DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS
-            )
+        concurrency_frame = ttk.Frame(trans_frame)
+        concurrency_frame.grid(row=10, column=1, padx=10, pady=4, sticky=tk.EW)
+
+        configured_concurrency = self.app_config.get(
+            "queue_max_in_flight_requests", DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS
         )
-        q_max_in_flight_spin = ttk.Spinbox(
-            trans_frame,
+        try:
+            configured_concurrency = int(configured_concurrency)
+        except (TypeError, ValueError):
+            configured_concurrency = DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS
+        configured_concurrency = max(
+            1, min(MAX_QUEUE_CUSTOM_CONCURRENCY, configured_concurrency)
+        )
+        self.queue_concurrency_preset_var = tk.StringVar(
+            value=detect_queue_concurrency_preset(self.app_config)
+        )
+        self.queue_custom_concurrency_var = tk.IntVar(value=configured_concurrency)
+        # Compatibility alias for code that inspected the old settings field.
+        self.queue_max_in_flight_var = self.queue_custom_concurrency_var
+
+        for column, (preset, label) in enumerate(_QUEUE_CONCURRENCY_LABELS.items()):
+            ttk.Radiobutton(
+                concurrency_frame,
+                text=label,
+                value=preset,
+                variable=self.queue_concurrency_preset_var,
+                command=self._on_queue_concurrency_preset_changed,
+            ).grid(row=0, column=column, padx=(0, 12), pady=4, sticky=tk.W)
+
+        ttk.Radiobutton(
+            concurrency_frame,
+            text="自定义",
+            value=QUEUE_CONCURRENCY_CUSTOM,
+            variable=self.queue_concurrency_preset_var,
+            command=self._on_queue_concurrency_preset_changed,
+        ).grid(row=1, column=0, padx=(0, 12), pady=4, sticky=tk.W)
+        custom_value_frame = ttk.Frame(concurrency_frame)
+        custom_value_frame.grid(row=1, column=1, columnspan=2, pady=4, sticky=tk.W)
+        self.queue_custom_concurrency_spin = ttk.Spinbox(
+            custom_value_frame,
             from_=1,
-            to=MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS,
+            to=MAX_QUEUE_CUSTOM_CONCURRENCY,
             increment=1,
-            textvariable=self.queue_max_in_flight_var,
-            width=33,
+            textvariable=self.queue_custom_concurrency_var,
+            width=8,
         )
-        q_max_in_flight_spin.grid(row=10, column=1, padx=10, pady=4, sticky=tk.EW)
+        self.queue_custom_concurrency_spin.grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(custom_value_frame, text="个并发请求").grid(
+            row=0, column=1, padx=(8, 0), sticky=tk.W
+        )
         self._register_spin(
-            q_max_in_flight_spin,
-            self.queue_max_in_flight_var,
+            self.queue_custom_concurrency_spin,
+            self.queue_custom_concurrency_var,
             1,
-            MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS,
-            "queue_max_in_flight",
-            "全局最大在途请求",
+            MAX_QUEUE_CUSTOM_CONCURRENCY,
+            "queue_custom_concurrency",
+            "自定义并发请求数",
         )
-
-        # 硬上限（ThreadPoolExecutor max_workers）
-        ttk.Label(trans_frame, text="硬并发上限:").grid(
-            row=11, column=0, sticky=tk.W, padx=10, pady=4
-        )
-        self.queue_hard_cap_var = tk.IntVar(
-            value=self.app_config.get("queue_hard_request_cap", DEFAULT_QUEUE_HARD_REQUEST_CAP)
-        )
-        q_hard_cap_spin = ttk.Spinbox(
-            trans_frame,
-            from_=1,
-            to=MAX_QUEUE_HARD_REQUEST_CAP,
-            increment=1,
-            textvariable=self.queue_hard_cap_var,
-            width=33,
-        )
-        q_hard_cap_spin.grid(row=11, column=1, padx=10, pady=4, sticky=tk.EW)
-        self._register_spin(
-            q_hard_cap_spin,
-            self.queue_hard_cap_var,
-            1,
-            MAX_QUEUE_HARD_REQUEST_CAP,
-            "queue_hard_cap",
-            "硬并发上限",
-        )
-
-        # 最大活跃任务数
-        ttk.Label(trans_frame, text="最大活跃任务:").grid(
-            row=12, column=0, sticky=tk.W, padx=10, pady=4
-        )
-        self.queue_max_active_var = tk.IntVar(
-            value=self.app_config.get("queue_max_active_tasks", DEFAULT_QUEUE_MAX_ACTIVE_TASKS)
-        )
-        q_max_active_spin = ttk.Spinbox(
-            trans_frame,
-            from_=1,
-            to=MAX_QUEUE_MAX_ACTIVE_TASKS,
-            increment=1,
-            textvariable=self.queue_max_active_var,
-            width=33,
-        )
-        q_max_active_spin.grid(row=12, column=1, padx=10, pady=4, sticky=tk.EW)
-        self._register_spin(
-            q_max_active_spin,
-            self.queue_max_active_var,
-            1,
-            MAX_QUEUE_MAX_ACTIVE_TASKS,
-            "queue_max_active",
-            "最大活跃任务",
-        )
-
-        # 每任务软上限（round-robin 第一轮）
-        ttk.Label(trans_frame, text="每任务软上限:").grid(
-            row=13, column=0, sticky=tk.W, padx=10, pady=4
-        )
-        self.queue_per_task_soft_var = tk.IntVar(
-            value=self.app_config.get(
-                "queue_per_task_soft_limit", DEFAULT_QUEUE_PER_TASK_SOFT_LIMIT
-            )
-        )
-        q_per_task_spin = ttk.Spinbox(
-            trans_frame,
-            from_=1,
-            to=MAX_QUEUE_PER_TASK_SOFT_LIMIT,
-            increment=1,
-            textvariable=self.queue_per_task_soft_var,
-            width=33,
-        )
-        q_per_task_spin.grid(row=13, column=1, padx=10, pady=4, sticky=tk.EW)
-        self._register_spin(
-            q_per_task_spin,
-            self.queue_per_task_soft_var,
-            1,
-            MAX_QUEUE_PER_TASK_SOFT_LIMIT,
-            "queue_per_task_soft",
-            "每任务软上限",
-        )
-
-        # 队列批次行数
-        ttk.Label(trans_frame, text="队列批次行数:").grid(
-            row=14, column=0, sticky=tk.W, padx=10, pady=4
-        )
-        self.queue_batch_lines_var = tk.IntVar(
-            value=self.app_config.get("queue_batch_lines", DEFAULT_QUEUE_TRANSLATION_BATCH_LINES)
-        )
-        q_batch_lines_spin = ttk.Spinbox(
-            trans_frame,
-            from_=1,
-            to=MAX_QUEUE_TRANSLATION_BATCH_LINES,
-            increment=1,
-            textvariable=self.queue_batch_lines_var,
-            width=33,
-        )
-        q_batch_lines_spin.grid(row=14, column=1, padx=10, pady=4, sticky=tk.EW)
-        self._register_spin(
-            q_batch_lines_spin,
-            self.queue_batch_lines_var,
-            1,
-            MAX_QUEUE_TRANSLATION_BATCH_LINES,
-            "queue_batch_lines",
-            "队列批次行数",
-        )
-
-        # RPM 限制
-        ttk.Label(trans_frame, text="RPM 限制 (0=不限):").grid(
-            row=15, column=0, sticky=tk.W, padx=10, pady=4
-        )
-        self.queue_rpm_var = tk.IntVar(
-            value=self.app_config.get("queue_rpm_limit", DEFAULT_QUEUE_RPM_LIMIT)
-        )
-        q_rpm_spin = ttk.Spinbox(
-            trans_frame,
-            from_=0,
-            to=MAX_QUEUE_RPM_LIMIT,
-            increment=10,
-            textvariable=self.queue_rpm_var,
-            width=33,
-        )
-        q_rpm_spin.grid(row=15, column=1, padx=10, pady=4, sticky=tk.EW)
-        self._register_spin(
-            q_rpm_spin,
-            self.queue_rpm_var,
-            0,
-            MAX_QUEUE_RPM_LIMIT,
-            "queue_rpm",
-            "RPM 限制",
-        )
-
-        # TPM 限制
-        ttk.Label(trans_frame, text="TPM 限制 (0=不限):").grid(
-            row=16, column=0, sticky=tk.W, padx=10, pady=4
-        )
-        self.queue_tpm_var = tk.IntVar(
-            value=self.app_config.get("queue_tpm_limit", DEFAULT_QUEUE_TPM_LIMIT)
-        )
-        q_tpm_spin = ttk.Spinbox(
-            trans_frame,
-            from_=0,
-            to=MAX_QUEUE_TPM_LIMIT,
-            increment=1000,
-            textvariable=self.queue_tpm_var,
-            width=33,
-        )
-        q_tpm_spin.grid(row=16, column=1, padx=10, pady=4, sticky=tk.EW)
-        self._register_spin(
-            q_tpm_spin,
-            self.queue_tpm_var,
-            0,
-            MAX_QUEUE_TPM_LIMIT,
-            "queue_tpm",
-            "TPM 限制",
-        )
-
-        # 自适应并发（AIMD）
-        self.queue_adaptive_var = tk.BooleanVar(
-            value=self.app_config.get(
-                "queue_adaptive_concurrency", DEFAULT_QUEUE_ADAPTIVE_CONCURRENCY
-            )
-        )
-        ttk.Checkbutton(
-            trans_frame,
-            text="启用自适应并发（AIMD：429 减半，连续成功 +1）",
-            variable=self.queue_adaptive_var,
-        ).grid(row=17, column=0, columnspan=2, sticky=tk.W, padx=10, pady=4)
+        self._on_queue_concurrency_preset_changed()
 
     def create_volc_tab(self, notebook):
         """创建 V1.5 AI 图片翻译设置页面。"""
@@ -1400,6 +1291,10 @@ class SettingsWindow:
             new_app_config = self.app_config.copy()
             new_app_config.pop("batch_max_input_tokens", None)
             new_app_config.pop("queue_batch_max_input_tokens", None)
+            queue_preset = self.queue_concurrency_preset_var.get()
+            if queue_preset not in QUEUE_CONCURRENCY_PRESETS:
+                queue_preset = QUEUE_CONCURRENCY_CUSTOM
+            queue_concurrency = self._selected_queue_concurrency()
             new_app_config.update(
                 {
                     "target_language": self.target_lang_var.get(),
@@ -1408,15 +1303,14 @@ class SettingsWindow:
                     "auto_save": self.auto_save_var.get(),
                     "ui_font_size": self.ui_font_size_var.get(),
                     "translation_prompt": self.prompt_text.get(1.0, tk.END).strip(),
-                    # 队列翻译并发优化阶段 1：保存 QueuePolicy 参数
-                    "queue_max_in_flight_requests": self.queue_max_in_flight_var.get(),
-                    "queue_hard_request_cap": self.queue_hard_cap_var.get(),
-                    "queue_max_active_tasks": self.queue_max_active_var.get(),
-                    "queue_per_task_soft_limit": self.queue_per_task_soft_var.get(),
-                    "queue_batch_lines": self.queue_batch_lines_var.get(),
-                    "queue_rpm_limit": self.queue_rpm_var.get(),
-                    "queue_tpm_limit": self.queue_tpm_var.get(),
-                    "queue_adaptive_concurrency": self.queue_adaptive_var.get(),
+                    "queue_concurrency_preset": queue_preset,
+                    "queue_max_in_flight_requests": queue_concurrency,
+                    "queue_hard_request_cap": queue_concurrency,
+                    "queue_max_active_tasks": max(
+                        DEFAULT_QUEUE_MAX_ACTIVE_TASKS, queue_concurrency
+                    ),
+                    "queue_per_task_soft_limit": DEFAULT_QUEUE_PER_TASK_SOFT_LIMIT,
+                    "queue_adaptive_concurrency": DEFAULT_QUEUE_ADAPTIVE_CONCURRENCY,
                     "vision_model_name": ocr_model,
                     "image_text_translation_enabled": self.image_text_enabled_var.get(),
                     "image_gen_provider": "volcengine",
