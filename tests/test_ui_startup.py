@@ -206,7 +206,7 @@ class MainWindowLayoutTests(unittest.TestCase):
         self.assertEqual(right.grid_options["column"], 2)
         self.assertEqual(window.settings_btn.pack_options["side"], tk.RIGHT)
 
-    def test_control_panel_places_start_translation_at_bottom_left(self):
+    def test_control_panel_groups_translation_actions_without_duplicate_primary_button(self):
         class LayoutWidget:
             def __init__(self, parent=None, **options):
                 self.parent = parent
@@ -242,6 +242,7 @@ class MainWindowLayoutTests(unittest.TestCase):
 
         window = MainWindow.__new__(MainWindow)
         window._run_primary_action = lambda: calls.append("start")
+        window._retranslate_all = lambda: calls.append("retranslate")
         window._continue_translation = lambda: None
 
         with (
@@ -259,9 +260,12 @@ class MainWindowLayoutTests(unittest.TestCase):
         self.assertEqual(buttons[0].options["text"], "开始翻译")
         self.assertEqual(buttons[0].options["state"], tk.DISABLED)
         self.assertEqual(buttons[0].pack_options["side"], tk.LEFT)
-        self.assertEqual(buttons[1].options["text"], "翻译未完成行")
+        self.assertIs(window.translate_btn, window.start_translation_btn)
+        self.assertEqual(buttons[1].options["text"], "重新翻译")
+        self.assertEqual(buttons[1].options["state"], tk.DISABLED)
         buttons[0].options["command"]()
-        self.assertEqual(calls, ["start"])
+        buttons[1].options["command"]()
+        self.assertEqual(calls, ["start", "retranslate"])
 
     def test_shortcuts_bind_control_and_command_variants(self):
         class Root:
@@ -331,16 +335,19 @@ class TranslationControlTests(unittest.TestCase):
         window.file_importer = SimpleNamespace(current_mapping_dir=None)
         window.translate_btn = _Widget()
         window.start_translation_btn = _Widget()
+        window.retranslate_btn = _Widget()
 
         window.refresh_action_state()
 
         self.assertEqual(window.start_translation_btn.options["state"], tk.NORMAL)
         self.assertEqual(window.translate_btn.options["text"], "翻译未完成行")
+        self.assertEqual(window.retranslate_btn.options["state"], tk.DISABLED)
 
     def test_translation_controller_keeps_start_button_in_sync(self):
         controller = TranslationController.__new__(TranslationController)
         controller.start_btn = _Widget()
         controller.translate_btn = _Widget()
+        controller.retranslate_btn = _Widget()
         controller.continue_btn = _Widget()
         controller.stop_btn = _Widget()
 
@@ -348,6 +355,7 @@ class TranslationControlTests(unittest.TestCase):
 
         self.assertEqual(controller.start_btn.options["state"], tk.DISABLED)
         self.assertEqual(controller.translate_btn.options["state"], tk.DISABLED)
+        self.assertEqual(controller.retranslate_btn.options["state"], tk.DISABLED)
         self.assertEqual(controller.continue_btn.options["state"], tk.DISABLED)
         self.assertEqual(controller.stop_btn.options["state"], tk.NORMAL)
 

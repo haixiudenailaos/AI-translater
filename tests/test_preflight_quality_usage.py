@@ -172,6 +172,24 @@ def test_main_window_preflight_runs_silently_when_no_risks(monkeypatch):
     assert dialogs == []
 
 
+def test_retranslation_preflight_estimates_every_non_empty_source(monkeypatch):
+    project = _project(["first", "second"], ["译文一", "译文二"])
+    project.completed_indices.update({0, 1})
+    project.manually_edited_indices.add(1)
+    window = _preflight_window(
+        project,
+        {"target_language": "中文", "batch_lines": 20, "preflight_confirm_warnings": True},
+    )
+    monkeypatch.setattr(
+        "src.ui.main_window.messagebox.showerror",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected error")),
+    )
+
+    assert window._run_preflight("retranslate")
+    assert window._last_preflight_report.pending_lines == 2
+    assert window._last_preflight_report.translated_lines == 0
+
+
 def test_main_window_preflight_stops_when_user_rejects_warning(monkeypatch):
     window = _preflight_window(
         _project(["x" * 2_001], [""]),
