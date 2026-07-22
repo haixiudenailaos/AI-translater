@@ -102,7 +102,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
-          python -m build --wheel
+          python -m pip wheel . --no-deps --wheel-dir dist
           python -m venv /tmp/ai-translater-wheel-smoke
           /tmp/ai-translater-wheel-smoke/bin/python -m pip install dist/*.whl
           cd /tmp
