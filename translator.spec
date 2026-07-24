@@ -12,6 +12,27 @@ from pathlib import Path
 # 项目根目录
 project_root = Path(SPECPATH)
 
+# Python 3.14 on Windows can import ``_tkinter`` while PyInstaller's Tcl/Tk
+# probe still fails during analysis. Keep a local fallback so GUI modules and
+# their runtime data are not silently excluded from the executable.
+_tcl_tk_datas = []
+_tcl_tk_binaries = []
+if sys.platform == 'win32':
+    _python_root = Path(sys.base_prefix)
+    _tcl_root = _python_root / 'tcl' / 'tcl8.6'
+    _tk_root = _python_root / 'tcl' / 'tk8.6'
+    if _tcl_root.exists() and _tk_root.exists():
+        _tcl_tk_datas.extend(
+            [
+                (str(_tcl_root), '_tcl_data'),
+                (str(_tk_root), '_tk_data'),
+            ]
+        )
+    for _dll_name in ('tcl86t.dll', 'tk86t.dll'):
+        _dll_path = _python_root / 'DLLs' / _dll_name
+        if _dll_path.exists():
+            _tcl_tk_binaries.append((str(_dll_path), '.'))
+
 # ── 字体资源（文本翻译 UI 渲染需要中文字体）──────────
 _font_datas = []
 _fonts_dir = project_root / 'assets' / 'fonts'
@@ -27,14 +48,15 @@ a = Analysis(
     pathex=[
         str(project_root),
     ],
-    binaries=[],
+    binaries=_tcl_tk_binaries,
     datas=[
         # PERF §11.3：仅保留真正的非 Python 资源；src 模块由 Analysis/PYZ 收集。
         # 配置文件目录（仅包含示例文件和基础配置）
         ('config/api_config_sample.json', 'config'),
         ('config/glossary_sample.json', 'config'),
     ]
-    + _font_datas,
+    + _font_datas
+    + _tcl_tk_datas,
     hiddenimports=[
         # 文本翻译核心模块
         'src.bootstrap',
@@ -86,7 +108,7 @@ a = Analysis(
         'tkinter.messagebox',
         'tkinter.filedialog',
     ],
-    hookspath=[],
+    hookspath=[str(project_root / 'hooks')],
     hooksconfig={},
     runtime_hooks=['hooks/runtime_hook_resources.py'],
     excludes=[

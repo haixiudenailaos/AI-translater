@@ -343,24 +343,47 @@ class SettingsWindowValidationTests(unittest.TestCase):
     def test_form_validator_registered_for_all_spinboxes(self):
         """所有 spinbox 都应注册到 form_validator。"""
         dialog = self._make_dialog()
-        # 10 个整数 spinbox，以及火山 API 地址和模型两个必填文本字段。
+        # 4 个整数 spinbox，以及火山 API 地址和模型两个必填文本字段。
         registered_names = [f.name for f in dialog._form_validator._fields]
         expected = {
             "batch_lines",
             "translation_concurrency",
             "ui_font_size",
-            "queue_max_in_flight",
-            "queue_hard_cap",
-            "queue_max_active",
-            "queue_per_task_soft",
-            "queue_batch_lines",
-            "queue_rpm",
-            "queue_tpm",
+            "queue_custom_concurrency",
             "volc_base_url",
             "volc_model",
         }
         self.assertEqual(set(registered_names), expected)
         self.assertEqual(len(registered_names), len(expected))
+
+    def test_queue_concurrency_presets_update_custom_value_and_state(self):
+        dialog = self._make_dialog()
+
+        self.assertEqual(dialog.queue_concurrency_preset_var.get(), "medium")
+        self.assertEqual(dialog.queue_custom_concurrency_var.get(), 4)
+        self.assertEqual(str(dialog.queue_custom_concurrency_spin.cget("state")), "disabled")
+
+        dialog.queue_concurrency_preset_var.set("large")
+        dialog._on_queue_concurrency_preset_changed()
+        self.assertEqual(dialog.queue_custom_concurrency_var.get(), 8)
+
+        dialog.queue_concurrency_preset_var.set("custom")
+        dialog._on_queue_concurrency_preset_changed()
+        self.assertEqual(str(dialog.queue_custom_concurrency_spin.cget("state")), "normal")
+
+    def test_save_settings_persists_large_concurrency_preset(self):
+        dialog = self._make_dialog()
+        dialog.queue_concurrency_preset_var.set("large")
+        dialog._on_queue_concurrency_preset_changed()
+
+        with patch("src.ui.settings_window.messagebox.showinfo"):
+            dialog.save_settings()
+
+        saved_app = self.config_manager.save_app_calls[-1]
+        self.assertEqual(saved_app["queue_concurrency_preset"], "large")
+        self.assertEqual(saved_app["queue_max_in_flight_requests"], 8)
+        self.assertEqual(saved_app["queue_hard_request_cap"], 8)
+        self.assertEqual(saved_app["queue_max_active_tasks"], 8)
 
     def test_api_form_does_not_expose_or_submit_max_tokens(self):
         dialog = self._make_dialog()
@@ -466,16 +489,15 @@ class SettingsWindowValidationTests(unittest.TestCase):
             self.assertEqual(str(btn.cget("state")), "normal")
 
     def test_test_buttons_registered_in_busy_list(self):
-        """三个测试按钮都应纳入 _test_buttons 列表。"""
+        """当前设置页的两个测试按钮都应纳入 _test_buttons 列表。"""
         dialog = self._make_dialog()
-        self.assertEqual(len(dialog._test_buttons), 3)
+        self.assertEqual(len(dialog._test_buttons), 2)
         texts = sorted(str(btn.cget("text")) for btn in dialog._test_buttons)
         self.assertEqual(
             texts,
             sorted(
                 [
                     "测试连接",
-                    "检测可用性",
                     "测试 AI 图片翻译连接",
                 ]
             ),

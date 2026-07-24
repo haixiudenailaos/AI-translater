@@ -29,6 +29,15 @@ def test_continue_translation_command_is_rejected_while_run_is_active():
     assert messages == ["翻译任务正在运行或停止中，请等待当前任务结束"]
 
 
+def test_retranslation_command_is_rejected_while_run_is_active():
+    controller, messages = _running_controller()
+    controller.get_table_data = lambda: (_ for _ in ()).throw(AssertionError("must not read data"))
+
+    controller.retranslate_all()
+
+    assert messages == ["翻译任务正在运行或停止中，请等待当前任务结束"]
+
+
 def test_selected_translation_command_is_rejected_while_run_is_active():
     controller, messages = _running_controller()
     controller.translation_table = object()

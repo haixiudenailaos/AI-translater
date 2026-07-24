@@ -7,6 +7,7 @@
 import hashlib
 import re
 import threading
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Callable, List
@@ -27,6 +28,7 @@ from ..config.translation_profile import (
     MAX_QUEUE_TRANSLATION_INPUT_TOKENS,
     MAX_STABLE_TRANSLATION_BATCH_LINES,
     MAX_STABLE_TRANSLATION_INPUT_TOKENS,
+    SMALL_MODEL_MODE_CONFIG_KEY,
     apply_text_translation_profile,
 )
 from ..utils.logger import get_logger
@@ -48,6 +50,24 @@ logger = get_logger(__name__)
 # PERF-001：预编译行号标记正则，避免在热路径重复编译
 _LINE_MARKER_RE = re.compile(r"\[LINE_\d+\]")
 _LINE_MARKER_PARSE_RE = re.compile(r"^\[LINE_(\d+)\](.*)$")
+_SMALL_MODEL_PROVIDER_REJECTION_MESSAGE = (
+    "小模型逐行翻译的并发批次过大，已被服务商拒绝。"
+    "翻译已停止；当前并发已限制为 1，请稍后重试或检查服务商限制。"
+)
+
+
+def _small_model_terminal_error_message(error: TranslationRequestError) -> str:
+    """Translate stream/protocol rejection details into an actionable UI message."""
+    message = str(error)
+    lowered = message.lower()
+    stream_rejection_markers = (
+        "connectionterminated",
+        "end_stream",
+        "pseudo-header in trailer",
+    )
+    if error.status_code == 429 or any(marker in lowered for marker in stream_rejection_markers):
+        return _SMALL_MODEL_PROVIDER_REJECTION_MESSAGE
+    return message or "小模型逐行翻译失败，翻译已停止。"
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +300,8 @@ class TranslatorEngine:
             MAX_QUEUE_TRANSLATION_BATCH_LINES,
             max(1, int(app_config.get("queue_batch_lines", DEFAULT_QUEUE_TRANSLATION_BATCH_LINES))),
         )
+        if app_config.get(SMALL_MODEL_MODE_CONFIG_KEY, False):
+            batch_lines = 1
         input_token_budget = min(
             MAX_QUEUE_TRANSLATION_INPUT_TOKENS,
             max(
@@ -345,6 +367,7 @@ class TranslatorEngine:
         total_lines = len(lines)
         app_config = self.config_manager.get_app_config()
         api_config = self.config_manager.get_api_config()
+        small_model_mode = bool(app_config.get(SMALL_MODEL_MODE_CONFIG_KEY, False))
         if batch_lines_override is None:
             batch_lines = min(
                 MAX_STABLE_TRANSLATION_BATCH_LINES,
@@ -352,6 +375,8 @@ class TranslatorEngine:
             )
         else:
             batch_lines = max(1, int(batch_lines_override))
+        if small_model_mode:
+            batch_lines = 1
         if input_token_budget_override is None:
             configured_input_budget = min(
                 MAX_STABLE_TRANSLATION_INPUT_TOKENS,
@@ -368,12 +393,21 @@ class TranslatorEngine:
         context_window = max(4096, int(api_config.get("context_window_tokens", 32768)))
         context_safe_budget = max(512, context_window - DEFAULT_OUTPUT_TOKEN_RESERVE - 1024)
         input_token_budget = min(configured_input_budget, context_safe_budget)
-        if concurrency_override is None:
+        if small_model_mode:
+            from ..config.translation_profile import build_queue_policy_from_app_config
+
+            concurrency = build_queue_policy_from_app_config(app_config).max_in_flight_requests
+        elif concurrency_override is None:
             concurrency = max(
                 1,
                 min(
                     8,
-                    int(app_config.get("translation_concurrency", DEFAULT_TRANSLATION_CONCURRENCY)),
+                    int(
+                        app_config.get(
+                            "translation_concurrency",
+                            DEFAULT_TRANSLATION_CONCURRENCY,
+                        )
+                    ),
                 ),
             )
         else:
@@ -419,6 +453,42 @@ class TranslatorEngine:
         shared_limiter = self._get_shared_limiter(api_config)
 
         batch_ranges = self._build_batch_ranges(lines, batch_lines, input_token_budget)
+        limiter_consumer_id: str | None = None
+        if shared_limiter is not None:
+            limiter_consumer_id = f"main:{uuid.uuid4().hex}"
+            shared_limiter.register_consumer(limiter_consumer_id, priority=0)
+        limiter_demand_lock = threading.Lock()
+        remaining_limiter_requests = len(batch_ranges)
+        fatal_error_event = threading.Event()
+        fatal_error_lock = threading.Lock()
+        fatal_error_message: str | None = None
+
+        def mark_limiter_request_sent() -> None:
+            """Release the main run's reserved share once every request is sent."""
+            nonlocal remaining_limiter_requests
+            if shared_limiter is None or limiter_consumer_id is None:
+                return
+            with limiter_demand_lock:
+                remaining_limiter_requests = max(0, remaining_limiter_requests - 1)
+                has_no_more_requests = remaining_limiter_requests == 0
+            if has_no_more_requests:
+                shared_limiter.set_consumer_demand(limiter_consumer_id, False)
+
+        def abort_small_model_translation(error: TranslationRequestError) -> None:
+            """Stop dispatch and cancel sibling streams after the first batch error."""
+            nonlocal fatal_error_message
+            if not small_model_mode:
+                return
+            should_cancel = False
+            with fatal_error_lock:
+                if fatal_error_message is None:
+                    fatal_error_message = _small_model_terminal_error_message(error)
+                    fatal_error_event.set()
+                    should_cancel = True
+            if should_cancel and self.api is not None:
+                cancel_requests = getattr(self.api, "cancel_requests", None)
+                if callable(cancel_requests):
+                    cancel_requests()
 
         # 结果容器：与原文行数对齐，失败行保持空字符串
         all_translated_lines: List[str] = [""] * total_lines
@@ -482,10 +552,12 @@ class TranslatorEngine:
                 if shared_limiter is not None:
                     limiter_acquired = shared_limiter.acquire(
                         estimated_tokens=plan.estimated_input_tokens,
-                        cancelled=lambda: self.is_stopped,
+                        consumer_id=limiter_consumer_id,
+                        cancelled=lambda: self.is_stopped or fatal_error_event.is_set(),
                     )
                     if not limiter_acquired:
                         raise TranslationCancelled()
+                    mark_limiter_request_sent()
                 try:
                     result = self._translate_batch(
                         batch_source_lines,
@@ -495,7 +567,13 @@ class TranslatorEngine:
                         emit_stream_progress,
                         run_context,
                     )
+                    if small_model_mode and result.status != TranslationStatus.SUCCEEDED:
+                        raise TranslationRequestError(
+                            result.error_message or "小模型逐行翻译未返回有效译文",
+                            failed_indices=list(range(len(batch_source_lines))),
+                        )
                 except TranslationRequestError as exc:
+                    abort_small_model_translation(exc)
                     if shared_limiter is not None:
                         if exc.status_code == 429:
                             shared_limiter.record_rate_limited(
@@ -514,7 +592,7 @@ class TranslatorEngine:
                     return result
                 finally:
                     if shared_limiter is not None and limiter_acquired:
-                        shared_limiter.release()
+                        shared_limiter.release(consumer_id=limiter_consumer_id)
 
             return executor.submit(
                 _run_batch,
@@ -528,7 +606,11 @@ class TranslatorEngine:
             max_workers=concurrency, thread_name_prefix="translation-batch"
         )
         try:
-            while (next_batch < len(batch_ranges) or in_flight) and not self.is_stopped:
+            while (
+                (next_batch < len(batch_ranges) or in_flight)
+                and not self.is_stopped
+                and not fatal_error_event.is_set()
+            ):
                 self.pause_event.wait()
                 if self.is_stopped:
                     break
@@ -542,6 +624,7 @@ class TranslatorEngine:
                     next_batch < len(batch_ranges)
                     and len(in_flight) < recommended
                     and not self.is_stopped
+                    and not fatal_error_event.is_set()
                 ):
                     plan = batch_ranges[next_batch]
                     in_flight[submit_batch(executor, plan)] = plan
@@ -568,13 +651,17 @@ class TranslatorEngine:
                             batch_end - 1,
                             exc,
                         )
+                        if fatal_error_event.is_set():
+                            break
                         continue
                     except TranslationCancelled:
-                        self.is_stopped = True
+                        if not fatal_error_event.is_set():
+                            self.is_stopped = True
                         break
 
                     if batch_result.status == TranslationStatus.CANCELLED:
-                        self.is_stopped = True
+                        if not fatal_error_event.is_set():
+                            self.is_stopped = True
                         break
 
                     for index, translated in enumerate(batch_result.lines):
@@ -626,10 +713,25 @@ class TranslatorEngine:
         finally:
             for future in in_flight:
                 future.cancel()
-            executor.shutdown(wait=not self.is_stopped, cancel_futures=True)
+            executor.shutdown(
+                wait=not (self.is_stopped or fatal_error_event.is_set()),
+                cancel_futures=True,
+            )
+            if shared_limiter is not None and limiter_consumer_id is not None:
+                shared_limiter.unregister_consumer(limiter_consumer_id)
 
         # 根据停止状态和成功情况决定最终状态
-        if self.is_stopped:
+        if fatal_error_message is not None:
+            status = TranslationStatus.FAILED
+            last_error = fatal_error_message
+            failed_indices = sorted(
+                set(failed_indices).union(
+                    index
+                    for index, translated in enumerate(all_translated_lines)
+                    if not translated.strip()
+                )
+            )
+        elif self.is_stopped:
             status = TranslationStatus.CANCELLED
         elif not failed_indices:
             status = TranslationStatus.SUCCEEDED

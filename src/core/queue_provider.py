@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Hashable
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Callable
@@ -93,6 +94,160 @@ class _LimiterState:
     cooldown_started_at: float = 0.0
 
 
+@dataclass(slots=True)
+class _ConsumerState:
+    """A registered translation task competing for the shared request budget."""
+
+    priority: int
+    order: int
+    persistent: bool
+    active: bool = True
+    demanding: bool = True
+    in_flight: int = 0
+
+
+_ANONYMOUS_CONSUMER = "__anonymous__"
+
+
+class _GlobalRequestGate:
+    """Application-wide fair request budget shared by every Provider limiter."""
+
+    def __init__(self, *, configured_max: int, hard_cap: int) -> None:
+        self._lock = threading.Lock()
+        self._configured_max = min(max(1, int(configured_max)), max(1, int(hard_cap)))
+        self._hard_cap = max(1, int(hard_cap))
+        self._in_flight = 0
+        self._consumers: dict[Hashable, _ConsumerState] = {}
+        self._next_consumer_order = 0
+        self.wake_event = threading.Event()
+
+    @property
+    def available_capacity(self) -> int:
+        with self._lock:
+            return max(0, self._configured_max - self._in_flight)
+
+    def register_consumer(self, consumer_id: Hashable, *, priority: int) -> None:
+        with self._lock:
+            self._register_consumer_locked(
+                consumer_id,
+                priority=priority,
+                persistent=True,
+            )
+        self.wake_event.set()
+
+    def unregister_consumer(self, consumer_id: Hashable) -> None:
+        with self._lock:
+            state = self._consumers.get(consumer_id)
+            if state is None:
+                return
+            state.active = False
+            state.demanding = False
+            if state.in_flight == 0:
+                self._consumers.pop(consumer_id, None)
+        self.wake_event.set()
+
+    def set_consumer_demand(self, consumer_id: Hashable, demanding: bool) -> None:
+        with self._lock:
+            state = self._consumers.get(consumer_id)
+            if state is None or not state.active:
+                return
+            state.demanding = bool(demanding)
+        self.wake_event.set()
+
+    def available_capacity_for(self, consumer_id: Hashable) -> int:
+        with self._lock:
+            state = self._consumers.get(consumer_id)
+            if state is None or not state.active:
+                return 0
+            consumer_limit = self._consumer_limit_locked(consumer_id)
+            return max(
+                0,
+                min(
+                    self._configured_max - self._in_flight,
+                    consumer_limit - state.in_flight,
+                ),
+            )
+
+    def try_acquire(
+        self,
+        consumer_id: Hashable,
+        *,
+        priority: int,
+        persistent: bool,
+    ) -> bool:
+        with self._lock:
+            consumer = self._register_consumer_locked(
+                consumer_id,
+                priority=priority,
+                persistent=persistent,
+            )
+            if self._in_flight >= self._configured_max:
+                return False
+            if consumer.in_flight >= self._consumer_limit_locked(consumer_id):
+                return False
+            self._in_flight += 1
+            consumer.in_flight += 1
+            return True
+
+    def release(self, consumer_id: Hashable) -> None:
+        with self._lock:
+            consumer = self._consumers.get(consumer_id)
+            if consumer is not None and consumer.in_flight > 0:
+                consumer.in_flight -= 1
+                self._in_flight -= 1
+                if consumer.in_flight == 0 and (not consumer.persistent or not consumer.active):
+                    self._consumers.pop(consumer_id, None)
+        self.wake_event.set()
+
+    def update_limits(self, *, configured_max: int, hard_cap: int) -> None:
+        if configured_max < 1 or hard_cap < 1:
+            return
+        with self._lock:
+            self._hard_cap = max(1, int(hard_cap))
+            self._configured_max = min(max(1, int(configured_max)), self._hard_cap)
+        self.wake_event.set()
+
+    def _register_consumer_locked(
+        self,
+        consumer_id: Hashable,
+        *,
+        priority: int,
+        persistent: bool,
+    ) -> _ConsumerState:
+        state = self._consumers.get(consumer_id)
+        if state is None:
+            state = _ConsumerState(
+                priority=int(priority),
+                order=self._next_consumer_order,
+                persistent=persistent,
+            )
+            self._next_consumer_order += 1
+            self._consumers[consumer_id] = state
+        else:
+            state.active = True
+            state.demanding = True
+            state.priority = min(state.priority, int(priority))
+            state.persistent = state.persistent or persistent
+        return state
+
+    def _consumer_limit_locked(self, consumer_id: Hashable) -> int:
+        active = sorted(
+            (
+                (registered.priority, registered.order, registered_id)
+                for registered_id, registered in self._consumers.items()
+                if registered.active and registered.demanding
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        if not active:
+            return self._configured_max
+        base, remainder = divmod(self._configured_max, len(active))
+        for position, (_priority, _order, registered_id) in enumerate(active):
+            if registered_id == consumer_id:
+                return base + (1 if position < remainder else 0)
+        return 0
+
+
 def parse_retry_after(value: str | None) -> float | None:
     """解析 ``Retry-After`` 头，支持秒数和 HTTP-date（RFC 7231）。
 
@@ -154,6 +309,7 @@ class ProviderLimiter:
         backoff: RetryPolicy | None = None,
         clock: callable = time.monotonic,
         wall_clock: callable = time.time,
+        request_gate: _GlobalRequestGate | None = None,
     ) -> None:
         if configured_max < 1 or hard_cap < 1:
             raise ValueError("configured_max 和 hard_cap 必须 >= 1")
@@ -170,6 +326,9 @@ class ProviderLimiter:
             hard_cap=hard_cap,
         )
         self._in_flight = 0
+        self._consumers: dict[Hashable, _ConsumerState] = {}
+        self._next_consumer_order = 0
+        self._request_gate = request_gate
         # RPM/TPM token bucket（可选，0 表示不限制）。
         self._rpm_limit = max(0, int(rpm_limit))
         self._tpm_limit = max(0, int(tpm_limit))
@@ -178,7 +337,9 @@ class ProviderLimiter:
         self._tpm_window_start = self._wall_clock()
         self._tpm_tokens = 0
         # 唤醒通道：cooldown 结束或槽位释放时通知 Coordinator。
-        self._wake_event = threading.Event()
+        self._wake_event = (
+            request_gate.wake_event if request_gate is not None else threading.Event()
+        )
 
     # ── 查询（Coordinator 调度前调用） ───────────────────
 
@@ -202,7 +363,33 @@ class ProviderLimiter:
         with self._lock:
             if self._clock() < self._state.blocked_until:
                 return 0
-            return max(0, self._state.current_limit - self._in_flight)
+            provider_capacity = max(0, self._state.current_limit - self._in_flight)
+        if self._request_gate is None:
+            return provider_capacity
+        return min(provider_capacity, self._request_gate.available_capacity)
+
+    def available_capacity_for(self, consumer_id: Hashable) -> int:
+        """Return the slots currently available to one registered task."""
+        with self._lock:
+            if self._clock() < self._state.blocked_until:
+                return 0
+            state = self._consumers.get(consumer_id)
+            if state is None or not state.active:
+                return 0
+            task_limit = self._consumer_limit_locked(consumer_id)
+            provider_capacity = max(
+                0,
+                min(
+                    self._state.current_limit - self._in_flight,
+                    task_limit - state.in_flight,
+                ),
+            )
+        if self._request_gate is None:
+            return provider_capacity
+        return min(
+            provider_capacity,
+            self._request_gate.available_capacity_for(consumer_id),
+        )
 
     def is_blocked(self) -> bool:
         with self._lock:
@@ -231,11 +418,107 @@ class ProviderLimiter:
                 "total_429": s.total_429,
                 "total_timeouts": s.total_timeouts,
                 "total_success": s.total_success,
+                "consumers": [
+                    {
+                        "id": str(consumer_id),
+                        "active": consumer.active,
+                        "demanding": consumer.demanding,
+                        "in_flight": consumer.in_flight,
+                        "share": (
+                            self._consumer_limit_locked(consumer_id) if consumer.active else 0
+                        ),
+                    }
+                    for consumer_id, consumer in self._consumers.items()
+                ],
             }
+
+    # ── 公平消费者登记 ───────────────────────────────────
+
+    def register_consumer(self, consumer_id: Hashable, *, priority: int = 10) -> None:
+        """Register one active translation task for a fair share of the limit."""
+        with self._lock:
+            self._register_consumer_locked(
+                consumer_id,
+                priority=priority,
+                persistent=True,
+            )
+        if self._request_gate is not None:
+            self._request_gate.register_consumer(consumer_id, priority=priority)
+        self._wake_event.set()
+
+    def unregister_consumer(self, consumer_id: Hashable) -> None:
+        """Stop reserving a share; in-flight requests may still release normally."""
+        with self._lock:
+            state = self._consumers.get(consumer_id)
+            if state is None:
+                return
+            state.active = False
+            state.demanding = False
+            if state.in_flight == 0:
+                self._consumers.pop(consumer_id, None)
+        if self._request_gate is not None:
+            self._request_gate.unregister_consumer(consumer_id)
+        self._wake_event.set()
+
+    def set_consumer_demand(self, consumer_id: Hashable, demanding: bool) -> None:
+        """Declare whether a registered task still has an unsent request."""
+        with self._lock:
+            state = self._consumers.get(consumer_id)
+            if state is None or not state.active:
+                return
+            state.demanding = bool(demanding)
+        if self._request_gate is not None:
+            self._request_gate.set_consumer_demand(consumer_id, demanding)
+        self._wake_event.set()
+
+    def _register_consumer_locked(
+        self,
+        consumer_id: Hashable,
+        *,
+        priority: int,
+        persistent: bool,
+    ) -> _ConsumerState:
+        state = self._consumers.get(consumer_id)
+        if state is None:
+            state = _ConsumerState(
+                priority=int(priority),
+                order=self._next_consumer_order,
+                persistent=persistent,
+            )
+            self._next_consumer_order += 1
+            self._consumers[consumer_id] = state
+        else:
+            state.active = True
+            state.demanding = True
+            state.priority = min(state.priority, int(priority))
+            state.persistent = state.persistent or persistent
+        return state
+
+    def _consumer_limit_locked(self, consumer_id: Hashable) -> int:
+        active = sorted(
+            (
+                (registered.priority, registered.order, registered_id)
+                for registered_id, registered in self._consumers.items()
+                if registered.active and registered.demanding
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        if not active:
+            return self._state.current_limit
+        base, remainder = divmod(self._state.current_limit, len(active))
+        for position, (_priority, _order, registered_id) in enumerate(active):
+            if registered_id == consumer_id:
+                return base + (1 if position < remainder else 0)
+        return 0
 
     # ── 槽位获取（Worker 调用） ──────────────────────────
 
-    def try_acquire(self, *, estimated_tokens: int = 0) -> bool:
+    def try_acquire(
+        self,
+        *,
+        estimated_tokens: int = 0,
+        consumer_id: Hashable | None = None,
+    ) -> bool:
         """非阻塞尝试获取一个请求槽位。
 
         成功返回 True；被 cooldown 阻塞、达到 current_limit 或 RPM/TPM 超限
@@ -247,11 +530,20 @@ class ProviderLimiter:
         窗口到期时自动重置。``estimated_tokens`` 在获取时预扣，超限则拒绝。
         """
         with self._lock:
+            normalized_consumer = _ANONYMOUS_CONSUMER if consumer_id is None else consumer_id
+            gate_consumer = self._gate_consumer_id(consumer_id)
+            consumer = self._register_consumer_locked(
+                normalized_consumer,
+                priority=10,
+                persistent=consumer_id is not None,
+            )
             now = self._clock()
             wall_now = self._wall_clock()
             if now < self._state.blocked_until:
                 return False
             if self._in_flight >= self._state.current_limit:
+                return False
+            if consumer.in_flight >= self._consumer_limit_locked(normalized_consumer):
                 return False
             # RPM 检查
             if self._rpm_limit > 0:
@@ -267,8 +559,15 @@ class ProviderLimiter:
                     self._tpm_tokens = 0
                 if self._tpm_tokens + max(0, int(estimated_tokens)) > self._tpm_limit:
                     return False
+            if self._request_gate is not None and not self._request_gate.try_acquire(
+                gate_consumer,
+                priority=consumer.priority,
+                persistent=consumer_id is not None,
+            ):
+                return False
             # 通过：扣减预算
             self._in_flight += 1
+            consumer.in_flight += 1
             if self._rpm_limit > 0:
                 self._rpm_count += 1
             if self._tpm_limit > 0:
@@ -279,6 +578,7 @@ class ProviderLimiter:
         self,
         *,
         estimated_tokens: int = 0,
+        consumer_id: Hashable | None = None,
         cancelled: Callable[[], bool] | None = None,
         poll_interval: float = 0.1,
     ) -> bool:
@@ -290,19 +590,36 @@ class ProviderLimiter:
         """
         interval = max(0.01, float(poll_interval))
         while cancelled is None or not cancelled():
-            if self.try_acquire(estimated_tokens=estimated_tokens):
+            if self.try_acquire(
+                estimated_tokens=estimated_tokens,
+                consumer_id=consumer_id,
+            ):
                 return True
             self._wake_event.wait(timeout=interval)
             self._wake_event.clear()
         return False
 
-    def release(self) -> None:
+    def release(self, *, consumer_id: Hashable | None = None) -> None:
         """释放一个请求槽位。幂等：与 try_acquire 配对调用。"""
+        released = False
         with self._lock:
-            if self._in_flight > 0:
+            normalized_consumer = _ANONYMOUS_CONSUMER if consumer_id is None else consumer_id
+            consumer = self._consumers.get(normalized_consumer)
+            if consumer is not None and consumer.in_flight > 0:
+                consumer.in_flight -= 1
                 self._in_flight -= 1
+                released = True
+                if consumer.in_flight == 0 and (not consumer.persistent or not consumer.active):
+                    self._consumers.pop(normalized_consumer, None)
             # 释放槽位后通知等待的 Coordinator。
+        if released and self._request_gate is not None:
+            self._request_gate.release(self._gate_consumer_id(consumer_id))
         self._wake_event.set()
+
+    def _gate_consumer_id(self, consumer_id: Hashable | None) -> Hashable:
+        if consumer_id is not None:
+            return consumer_id
+        return (self._key, _ANONYMOUS_CONSUMER)
 
     # ── 结果上报（Worker 调用） ──────────────────────────
 
@@ -384,13 +701,26 @@ class ProviderLimiter:
 
     def update_configured_max(self, new_max: int) -> None:
         """配置变化时更新 configured_max，current_limit 同步调整。"""
-        if new_max < 1:
+        with self._lock:
+            hard_cap = self._state.hard_cap
+        self.update_limits(configured_max=new_max, hard_cap=hard_cap)
+
+    def update_limits(self, *, configured_max: int, hard_cap: int) -> None:
+        """Apply a new global limit without erasing an active AIMD reduction."""
+        if configured_max < 1 or hard_cap < 1:
             return
         with self._lock:
             s = self._state
-            s.configured_max = min(new_max, s.hard_cap)
-            # current_limit 不超过新的 configured_max；也不低于 1。
-            s.current_limit = max(1, min(s.current_limit, s.configured_max))
+            previous_configured = s.configured_max
+            was_at_configured_max = s.current_limit >= previous_configured
+            s.hard_cap = max(1, int(hard_cap))
+            s.configured_max = min(max(1, int(configured_max)), s.hard_cap)
+            if was_at_configured_max and s.configured_max > previous_configured:
+                s.current_limit = s.configured_max
+            else:
+                # Do not undo a 429-triggered AIMD reduction when the setting
+                # itself did not increase.
+                s.current_limit = max(1, min(s.current_limit, s.configured_max))
         self._wake_event.set()
 
     # ── 等待（Coordinator 调用） ─────────────────────────
@@ -418,6 +748,7 @@ class ProviderLimiterRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._limiters: dict[ProviderRuntimeKey, ProviderLimiter] = {}
+        self._request_gate = _GlobalRequestGate(configured_max=1, hard_cap=1)
 
     def get_or_create(
         self,
@@ -429,6 +760,10 @@ class ProviderLimiterRegistry:
         tpm_limit: int = 0,
     ) -> ProviderLimiter:
         with self._lock:
+            self._request_gate.update_limits(
+                configured_max=configured_max,
+                hard_cap=hard_cap,
+            )
             limiter = self._limiters.get(key)
             if limiter is None:
                 limiter = ProviderLimiter(
@@ -437,12 +772,24 @@ class ProviderLimiterRegistry:
                     hard_cap=hard_cap,
                     rpm_limit=rpm_limit,
                     tpm_limit=tpm_limit,
+                    request_gate=self._request_gate,
                 )
                 self._limiters[key] = limiter
             else:
-                # 已存在：更新 configured_max（用户可能改了设置）。
-                limiter.update_configured_max(configured_max)
+                # 已存在：用户可能同时修改 configured_max 与 hard_cap。
+                limiter.update_limits(configured_max=configured_max, hard_cap=hard_cap)
             return limiter
+
+    def update_limits(self, *, configured_max: int, hard_cap: int) -> None:
+        """Apply a changed global setting to every existing Provider runtime."""
+        with self._lock:
+            self._request_gate.update_limits(
+                configured_max=configured_max,
+                hard_cap=hard_cap,
+            )
+            limiters = tuple(self._limiters.values())
+        for limiter in limiters:
+            limiter.update_limits(configured_max=configured_max, hard_cap=hard_cap)
 
     def all_metrics(self) -> list[dict]:
         with self._lock:

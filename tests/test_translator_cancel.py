@@ -35,9 +35,11 @@ class FakeApi:
         self.return_none = return_none
         self.call_count = 0
         self.cancelled = False
+        self.prompts = []
 
     def translate_stream(self, prompt, callback):
         self.call_count += 1
+        self.prompts.append(prompt)
         if self.raise_exc is not None:
             raise self.raise_exc
         if self.return_none:
@@ -86,11 +88,20 @@ class SequenceApi:
 class FakeConfigManager:
     """提供 translator 所需的最小配置接口。"""
 
-    def __init__(self, batch_lines: int = 20, model_name: str = "gpt-4"):
+    def __init__(
+        self,
+        batch_lines: int = 20,
+        model_name: str = "gpt-4",
+        small_model_mode: bool = False,
+        global_concurrency: int = 4,
+    ):
         self._app_config = {
             "target_language": "中文",
             "translation_prompt": "请翻译以下文本",
             "batch_lines": batch_lines,
+            "small_model_mode": small_model_mode,
+            "queue_max_in_flight_requests": global_concurrency,
+            "queue_hard_request_cap": global_concurrency,
         }
         self._api_config = {"model_name": model_name}
 
@@ -104,8 +115,18 @@ class FakeConfigManager:
         return ""
 
 
-def _make_engine(batch_lines: int = 20, api=None) -> TranslatorEngine:
-    cm = FakeConfigManager(batch_lines=batch_lines)
+def _make_engine(
+    batch_lines: int = 20,
+    api=None,
+    *,
+    small_model_mode: bool = False,
+    global_concurrency: int = 4,
+) -> TranslatorEngine:
+    cm = FakeConfigManager(
+        batch_lines=batch_lines,
+        small_model_mode=small_model_mode,
+        global_concurrency=global_concurrency,
+    )
     engine = TranslatorEngine(cm)
     if api is not None:
         engine.api = api  # 预注入 fake api，绕过 _init_api
@@ -309,6 +330,73 @@ class TestTranslateFlow:
         assert result.status == TranslationStatus.SUCCEEDED
         assert result.lines == ["你好", "世界", "你好", "世界"]
         assert result.failed_indices == []
+
+    def test_small_model_mode_sends_exactly_one_source_line_per_request(self):
+        api = FakeApi(response_text="逐行译文")
+        engine = _make_engine(batch_lines=20, api=api, small_model_mode=True)
+
+        completed = []
+        engine._translate(
+            "first\nsecond\nthird",
+            _no_op_progress,
+            lambda result: completed.append(result),
+        )
+
+        assert api.call_count == 3
+        assert completed[0].status == TranslationStatus.SUCCEEDED
+        assert completed[0].lines == ["逐行译文", "逐行译文", "逐行译文"]
+        assert all("[LINE_002]" not in prompt for prompt in api.prompts)
+
+    def test_small_model_stream_rejection_stops_after_first_failed_request(self):
+        api = SequenceApi(
+            [
+                (
+                    "",
+                    False,
+                    TranslationRequestError("流式翻译异常: <ConnectionTerminated error_code:9>"),
+                )
+            ]
+        )
+        engine = _make_engine(
+            api=api,
+            small_model_mode=True,
+            global_concurrency=1,
+        )
+        completed = []
+
+        engine._translate(
+            "first\nsecond\nthird",
+            _no_op_progress,
+            completed.append,
+        )
+
+        assert api.call_count == 1
+        assert api.cancelled is True
+        assert completed[0].status == TranslationStatus.FAILED
+        assert set(completed[0].failed_indices) == {0, 1, 2}
+        assert "并发批次过大" in (completed[0].error_message or "")
+        assert "服务商拒绝" in (completed[0].error_message or "")
+
+    def test_small_model_generic_stream_error_is_not_reported_as_provider_rejection(self):
+        api = SequenceApi([("", False, TranslationRequestError("流式翻译异常: EmptyStreamError"))])
+        engine = _make_engine(
+            api=api,
+            small_model_mode=True,
+            global_concurrency=1,
+        )
+        completed = []
+
+        engine._translate(
+            "first\nsecond",
+            _no_op_progress,
+            completed.append,
+        )
+
+        error_message = completed[0].error_message or ""
+        assert completed[0].status == TranslationStatus.FAILED
+        assert "EmptyStreamError" in error_message
+        assert "并发批次过大" not in error_message
+        assert "服务商拒绝" not in error_message
 
     def test_cancel_between_batches_preserves_successful(self, monkeypatch):
         """第一批完成后取消：CANCELLED 状态，已确认译文保留，未翻译为空

@@ -195,6 +195,12 @@ class ConcurrentTranslationManager:
         """
         self._progress_callback = callback
 
+    def refresh_policy(self, policy: QueuePolicy | None = None) -> None:
+        """Apply current global concurrency and batching settings in place."""
+        updated = policy or build_queue_policy_from_app_config(self.config_manager.get_app_config())
+        self._policy = updated
+        self._coordinator.update_policy(updated)
+
     def close(self) -> None:
         """关闭管理器：取消所有任务、释放 API 资源、关闭 Coordinator。幂等。"""
         with self._meta_lock:

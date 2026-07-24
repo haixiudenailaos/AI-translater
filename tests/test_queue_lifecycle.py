@@ -279,6 +279,48 @@ class TestQueuePolicyFromConfig:
         assert policy.hard_request_cap == DEFAULT_QUEUE_HARD_REQUEST_CAP
         assert policy.max_batch_lines > 0
 
+    def test_small_model_mode_forces_single_line_queue_batches(self):
+        from src.config.translation_profile import build_queue_policy_from_app_config
+
+        policy = build_queue_policy_from_app_config(
+            {"small_model_mode": True, "queue_batch_lines": 200}
+        )
+
+        assert policy.max_batch_lines == 1
+        assert policy.max_in_flight_requests == 1
+        assert policy.hard_request_cap == 1
+
+    def test_user_facing_concurrency_presets_cover_common_api_tiers(self):
+        from src.config.translation_profile import (
+            QUEUE_CONCURRENCY_CUSTOM,
+            QUEUE_CONCURRENCY_PRESETS,
+            detect_queue_concurrency_preset,
+        )
+
+        assert QUEUE_CONCURRENCY_PRESETS == {"small": 2, "medium": 4, "large": 8}
+        assert detect_queue_concurrency_preset({}) == "medium"
+        assert detect_queue_concurrency_preset({"queue_max_in_flight_requests": 8}) == "large"
+        assert (
+            detect_queue_concurrency_preset({"queue_max_in_flight_requests": 7})
+            == QUEUE_CONCURRENCY_CUSTOM
+        )
+        assert (
+            detect_queue_concurrency_preset(
+                {
+                    "queue_concurrency_preset": QUEUE_CONCURRENCY_CUSTOM,
+                    "queue_max_in_flight_requests": 4,
+                }
+            )
+            == QUEUE_CONCURRENCY_CUSTOM
+        )
+
+    def test_large_preset_builds_eight_request_policy(self):
+        from src.config.translation_profile import build_queue_policy_from_app_config
+
+        policy = build_queue_policy_from_app_config({"queue_concurrency_preset": "large"})
+        assert policy.max_in_flight_requests == 8
+        assert policy.hard_request_cap >= policy.max_in_flight_requests
+
     def test_legacy_concurrency_fallback(self):
         """旧字段 queue_translation_concurrency 在新字段缺失时作为 fallback。"""
         from src.config.translation_profile import (

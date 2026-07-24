@@ -16,5 +16,6 @@
     }
   },
   "batch_lines": 10,
-  "translation_concurrency": 1
+  "translation_concurrency": 1,
+  "small_model_mode": false
 }

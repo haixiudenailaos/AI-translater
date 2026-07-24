@@ -55,6 +55,18 @@ jobs:
         if: matrix.python-version == '3.12'
         run: python -m pytest --cov=src --cov-branch --cov-report=term-missing --cov-report=xml
 
+      # Block regressions in the transactional configuration, project
+      # persistence, and image request-boundary modules while legacy typing is
+      # migrated incrementally through the non-blocking full-repository report.
+      - name: Type check enforced core modules
+        if: matrix.python-version == '3.12'
+        run: >
+          python -m pyright
+          --pythonversion 3.12
+          --pythonplatform Linux
+          src/config/config_manager.py
+          src/infrastructure/project_repository.py
+          src/core/image_translator.py
       # Existing legacy annotations still produce errors. Keep the report
       # visible on every PR while the blocking scope is expanded incrementally.
       - name: Type check report
@@ -89,7 +101,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
-          python -m build --wheel
+          python -m pip wheel . --no-deps --wheel-dir dist
           python -m venv /tmp/ai-translater-wheel-smoke
           /tmp/ai-translater-wheel-smoke/bin/python -m pip install dist/*.whl
           cd /tmp
@@ -133,6 +145,14 @@ jobs:
         shell: pwsh
         run: |
           $exe = "dist/${{ env.APP_NAME }}-${{ env.APP_VERSION }}-Windows-x64.exe"
+          $functional = Start-Process -FilePath $exe -ArgumentList "--packaged-smoke-test" -PassThru
+          if (-not $functional.WaitForExit(60000)) {
+            Stop-Process -Id $functional.Id -Force
+            throw "Packaged dependency smoke test timed out"
+          }
+          if ($functional.ExitCode -ne 0) {
+            throw "Packaged dependency smoke test failed with code $($functional.ExitCode)"
+          }
           $process = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 15
           if ($process.HasExited) {

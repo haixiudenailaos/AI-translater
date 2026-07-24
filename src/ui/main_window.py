@@ -22,6 +22,10 @@ from ..application.preflight import PreflightSeverity, build_preflight_report
 from ..application.quality_review import inspect_quality
 from ..application.translation_document import TranslationDocument
 from ..application.usage import UsageStatistics
+from ..config.translation_profile import (
+    SMALL_MODEL_MODE_CONFIG_KEY,
+    build_queue_policy_from_app_config,
+)
 from ..domain.project import TranslationProject
 from ..domain.translation import TranslationOptions
 from ..utils.logger import get_logger
@@ -93,6 +97,9 @@ class MainWindow:
         self._search_var = tk.StringVar()
         self._search_case_var = tk.BooleanVar(value=False)
         self._search_regex_var = tk.BooleanVar(value=False)
+        self._small_model_mode_var = tk.BooleanVar(
+            value=bool(self.config_manager.get_app_config().get(SMALL_MODEL_MODE_CONFIG_KEY, False))
+        )
         # 新手指导自动展示仅在首次 API 状态返回后评估一次
         self._onboarding_auto_evaluated = False
 
@@ -146,7 +153,9 @@ class MainWindow:
             translation_table=self.translation_table,
             progress_var=self.progress_var,
             progress_bar=self.progress_bar,
+            start_btn=self.start_translation_btn,
             translate_btn=self.translate_btn,
+            retranslate_btn=self.retranslate_btn,
             continue_btn=self.continue_btn,
             stop_btn=self.stop_btn,
             status_updater=self.update_status,
@@ -163,6 +172,8 @@ class MainWindow:
             on_save_success=self._mark_clean_after_save,
             preflight_callback=self._run_preflight,
             on_run_terminal=self._record_translation_usage,
+            on_retranslated=self._on_rows_retranslated,
+            mode_toggle=self.small_model_mode_btn,
         )
 
         # PERF §8：自动保存协调器（generation 状态机 + 单飞 + debounce）。
@@ -193,7 +204,7 @@ class MainWindow:
             targets={
                 "settings": lambda: self.settings_btn,
                 "import": lambda: self.import_file_btn,
-                "translate": lambda: self.translate_btn,
+                "translate": lambda: self.start_translation_btn,
                 "review": lambda: self.review_filter,
             },
             actions={
@@ -492,33 +503,68 @@ class MainWindow:
         control_frame = ttk.Frame(parent)
         control_frame.pack(fill=tk.X, pady=(0, 5))
 
-        left_control = ttk.Frame(control_frame)
-        left_control.pack(side=tk.LEFT)
+        action_row = ttk.Frame(control_frame)
+        action_row.pack(fill=tk.X, pady=(0, 6))
 
-        self.translate_btn = ttk.Button(
-            left_control, text="翻译未完成行", command=self._run_primary_action
+        left_control = ttk.Frame(action_row)
+        left_control.pack(side=tk.LEFT)
+        ttk.Label(left_control, text="文本翻译").pack(side=tk.LEFT, padx=(0, 8))
+
+        self.start_translation_btn = ttk.Button(
+            left_control,
+            text="开始翻译",
+            width=14,
+            state=tk.DISABLED,
+            command=self._run_primary_action,
         )
-        self.translate_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.start_translation_btn.pack(side=tk.LEFT, padx=(0, 8))
+        # 主翻译入口会随上下文切换文案；保留旧属性名供控制器兼容使用。
+        self.translate_btn = self.start_translation_btn
+        self.retranslate_btn = ttk.Button(
+            left_control,
+            text="重新翻译",
+            width=10,
+            state=tk.DISABLED,
+            command=self._retranslate_all,
+        )
+        self.retranslate_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.continue_btn = ttk.Button(
-            left_control, text="继续翻译", command=self._continue_translation
+            left_control, text="继续翻译", width=10, command=self._continue_translation
         )
-        self.continue_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.continue_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.stop_btn = ttk.Button(
             left_control,
             text="停止",
+            width=8,
             state=tk.DISABLED,
             command=lambda: self.translation_controller.stop_translation(),
         )
-        self.stop_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.stop_btn.pack(side=tk.LEFT)
+        self.small_model_mode_btn = ttk.Checkbutton(
+            left_control,
+            text="小模型（逐行）",
+            variable=self._small_model_mode_var,
+            command=self._on_small_model_mode_changed,
+        )
+        self.small_model_mode_btn.pack(side=tk.LEFT, padx=(12, 0))
 
-        right_control = ttk.Frame(control_frame)
+        right_control = ttk.Frame(action_row)
         right_control.pack(side=tk.RIGHT)
+        ttk.Label(right_control, text="文件与图片").pack(side=tk.LEFT, padx=(0, 8))
+        self.ai_image_translate_btn = ttk.Button(
+            right_control,
+            text="图片翻译...",
+            width=12,
+            command=lambda: self.image_handler.start_image_translation(),
+        )
+        self.ai_image_translate_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.export_epub_btn = ttk.Button(
             right_control,
             text="导出 EPUB",
+            width=11,
             command=lambda: self.translation_controller.export_epub_file(),
         )
-        self.export_epub_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        self.export_epub_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.more_actions_menu = tk.Menu(right_control, tearoff=0)
         self.more_actions_menu.add_command(label="运行质检", command=self.run_quality_check)
         self.more_actions_menu.add_command(
@@ -534,34 +580,22 @@ class MainWindow:
         )
         self._epub_action_index = self.more_actions_menu.index("end")
         ttk.Menubutton(right_control, text="更多操作", menu=self.more_actions_menu).pack(
-            side=tk.RIGHT
+            side=tk.LEFT
         )
 
-        image_control = ttk.Frame(parent)
-        image_control.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(image_control, text="图片翻译:").pack(side=tk.LEFT)
-        self.ai_image_translate_btn = ttk.Button(
-            image_control,
-            text="选择翻译方式...",
-            width=16,
-            command=lambda: self.image_handler.start_image_translation(),
-        )
-        self.ai_image_translate_btn.pack(side=tk.LEFT, padx=(8, 5))
-
-        middle_control = ttk.Frame(control_frame)
-        middle_control.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(20, 20))
-        ttk.Label(middle_control, text="文本翻译:").pack(side=tk.LEFT)
+        progress_row = ttk.Frame(control_frame)
+        progress_row.pack(fill=tk.X)
+        ttk.Label(progress_row, text="文本进度").pack(side=tk.LEFT, padx=(0, 8))
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(
-            middle_control, variable=self.progress_var, maximum=100, length=200
+            progress_row, variable=self.progress_var, maximum=100, length=200
         )
-        self.progress_bar.pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
-        ttk.Label(middle_control, text=" | ").pack(side=tk.LEFT)
-        ttk.Label(middle_control, text="图片翻译:").pack(side=tk.LEFT)
-        self.image_progress_label = ttk.Label(middle_control, text="待机")
-        self.image_progress_label.pack(side=tk.LEFT, padx=(5, 0))
-        self.task_summary_label = ttk.Label(middle_control, text="")
-        self.task_summary_label.pack(side=tk.LEFT, padx=(12, 0))
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.task_summary_label = ttk.Label(progress_row, text="", width=20)
+        self.task_summary_label.pack(side=tk.LEFT, padx=(12, 16))
+        ttk.Label(progress_row, text="图片进度").pack(side=tk.LEFT, padx=(0, 8))
+        self.image_progress_label = ttk.Label(progress_row, text="待机", width=12)
+        self.image_progress_label.pack(side=tk.LEFT)
 
     def create_status_bar(self, parent):
         status_frame = ttk.Frame(parent)
@@ -678,6 +712,8 @@ class MainWindow:
             onboarding.notify("content_loaded", count=len(source_lines))
 
         self._table_loading = True
+        if hasattr(self, "start_translation_btn"):
+            self.start_translation_btn.config(state=tk.DISABLED)
         self.translate_btn.config(text="正在加载", state=tk.DISABLED)
         self.continue_btn.config(state=tk.DISABLED)
         self.update_status(f"正在加载 0/{len(source_lines)} 行")
@@ -1067,6 +1103,11 @@ class MainWindow:
 
     def _run_preflight(self, action: str) -> bool:
         project = self._build_runtime_project()
+        if action == "retranslate":
+            # 重译预检必须按全部非空原文估算，而不是把现有译文视为已完成。
+            project.translated_lines = [""] * len(project.original_lines)
+            project.completed_indices.clear()
+            project.manually_edited_indices.clear()
         app_config = self.config_manager.get_app_config()
         api_config = self.config_manager.get_api_config(load_secret=False)
         options = TranslationOptions(
@@ -1177,6 +1218,46 @@ class MainWindow:
         self._show_all_rows()
         self.translation_controller.continue_translation()
 
+    def _on_small_model_mode_changed(self):
+        enabled = bool(self._small_model_mode_var.get())
+        config = self.config_manager.get_app_config()
+        config[SMALL_MODEL_MODE_CONFIG_KEY] = enabled
+        if not self.config_manager.save_app_config(config):
+            self._small_model_mode_var.set(not enabled)
+            messagebox.showerror("保存失败", "无法保存小模型模式设置。", parent=self.root)
+            return
+        policy = self._refresh_shared_translation_policy()
+        if enabled:
+            self.update_status(
+                "已开启小模型模式：逐行翻译，"
+                f"主界面与后台队列并发 {policy.max_in_flight_requests}"
+            )
+        else:
+            self.update_status("已关闭小模型模式：恢复按设置分批翻译")
+
+    def _refresh_shared_translation_policy(self):
+        policy = build_queue_policy_from_app_config(self.config_manager.get_app_config())
+        self._provider_limiter_registry.update_limits(
+            configured_max=policy.max_in_flight_requests,
+            hard_cap=policy.hard_request_cap,
+        )
+        queue_manager = getattr(self, "_queue_manager", None)
+        refresh_policy = getattr(queue_manager, "refresh_policy", None)
+        if callable(refresh_policy):
+            refresh_policy(policy)
+        return policy
+
+    def _retranslate_all(self):
+        self._show_all_rows()
+        self.translation_controller.retranslate_all()
+
+    def _on_rows_retranslated(self, row_indices: set[int]) -> None:
+        """Keep the manual-edit filter aligned with successful retranslations."""
+        for row_index in row_indices:
+            item_id = self._table_adapter.item_id(row_index)
+            if item_id is not None:
+                self._manually_edited_items.discard(item_id)
+
     def _show_all_rows(self):
         if self._hidden_items:
             self._review_filter_var.set("全部")
@@ -1184,6 +1265,10 @@ class MainWindow:
 
     def refresh_action_state(self):
         if self._table_loading:
+            if hasattr(self, "start_translation_btn"):
+                self.start_translation_btn.config(state=tk.DISABLED)
+            if hasattr(self, "retranslate_btn"):
+                self.retranslate_btn.config(state=tk.DISABLED)
             self.translate_btn.config(text="正在加载", state=tk.DISABLED)
             return
         # PERF §7：从文档模型读取统计，避免逐行调用 Tk item()。
@@ -1226,6 +1311,17 @@ class MainWindow:
             if not pending and has_content and api_configured
             else self._run_primary_action,
         )
+        if (
+            hasattr(self, "start_translation_btn")
+            and self.start_translation_btn is not self.translate_btn
+        ):
+            start_state = tk.NORMAL if has_content and pending and api_configured else tk.DISABLED
+            self.start_translation_btn.config(state=start_state)
+        if hasattr(self, "retranslate_btn"):
+            retranslate_state = (
+                tk.NORMAL if has_content and completed and api_configured else tk.DISABLED
+            )
+            self.retranslate_btn.config(state=retranslate_state)
         if hasattr(self, "more_actions_menu"):
             menu_state = tk.NORMAL if is_epub else tk.DISABLED
             if hasattr(self, "export_epub_btn"):
@@ -1672,6 +1768,7 @@ class MainWindow:
     # ── 状态更新 ──────────────────────────────────────
 
     def _on_settings_updated(self, refresh_engine=True):
+        self._refresh_shared_translation_policy()
         if not refresh_engine:
             self.api_status_label.config(text="API: 正在检查")
             self.model_label.config(text="正在读取配置")

@@ -79,6 +79,10 @@ class TranslationController:
         on_save_success: Callable[[], None] | None = None,
         preflight_callback: Callable[[str], bool] | None = None,
         on_run_terminal: Callable[[BatchTranslationResult, str], None] | None = None,
+        start_btn=None,
+        retranslate_btn=None,
+        on_retranslated: Callable[[set[int]], None] | None = None,
+        mode_toggle=None,
     ):
         self.root = root
         self.config_manager = config_manager
@@ -88,7 +92,10 @@ class TranslationController:
         self.translation_table = translation_table
         self.progress_var = progress_var
         self.progress_bar = progress_bar
+        self.start_btn = start_btn
         self.translate_btn = translate_btn
+        self.retranslate_btn = retranslate_btn
+        self.mode_toggle = mode_toggle
         self.continue_btn = continue_btn
         self.stop_btn = stop_btn
         self.status_updater = status_updater
@@ -110,6 +117,7 @@ class TranslationController:
         self._on_save_success = on_save_success or (lambda: None)
         self._preflight_callback = preflight_callback
         self._on_run_terminal = on_run_terminal or (lambda _result, _mode: None)
+        self._on_retranslated = on_retranslated or (lambda _indices: None)
 
         # Translation state
         self.is_translating = False
@@ -146,7 +154,7 @@ class TranslationController:
         self._event_pump.start()
         # 当前运行 ID：用于丢弃旧任务的迟到事件。
         self._current_run_id: str | None = None
-        # 当前翻译模式："full" | "selected" | "missing" | None
+        # 当前翻译模式："full" | "retranslate" | "selected" | "missing" | None
         self._current_mode: str | None = None
         # 工作线程暂存的终结结果，主线程通过 run_id 取回。
         self._pending_results: dict[str, BatchTranslationResult] = {}
@@ -163,6 +171,23 @@ class TranslationController:
         self._export_poll_after_id: str | None = None
         self._export_kind: str | None = None
         self._export_success_callback: Callable[[], None] | None = None
+
+    def _set_control_states(self, translate_state, continue_state, stop_state) -> None:
+        """Keep all text-translation actions synchronized."""
+        seen: set[int] = set()
+        for button in (
+            getattr(self, "start_btn", None),
+            getattr(self, "translate_btn", None),
+            getattr(self, "retranslate_btn", None),
+        ):
+            if button is not None and id(button) not in seen:
+                button.config(state=translate_state)
+                seen.add(id(button))
+        self.continue_btn.config(state=continue_state)
+        self.stop_btn.config(state=stop_state)
+        mode_toggle = getattr(self, "mode_toggle", None)
+        if mode_toggle is not None:
+            mode_toggle.config(state=translate_state)
 
     def close(self):
         """关闭事件泵并使当前 run_id 失效。
@@ -226,9 +251,7 @@ class TranslationController:
         self._missing_translation_indices = []
         self._selected_translation_data = []
         self._revert_streaming_preview()
-        self.translate_btn.config(state=tk.NORMAL)
-        self.continue_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
+        self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         self.status_updater("已停止当前翻译，正在切换文档")
         self.schedule_save(delay_ms=0)
         return True
@@ -266,9 +289,7 @@ class TranslationController:
 
         # 更新界面状态
         self.is_translating = True
-        self.translate_btn.config(state=tk.DISABLED)
-        self.continue_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+        self._set_control_states(tk.DISABLED, tk.DISABLED, tk.NORMAL)
 
         pending_indices = [
             index
@@ -278,9 +299,7 @@ class TranslationController:
         ]
         if not pending_indices:
             self.is_translating = False
-            self.translate_btn.config(state=tk.NORMAL)
-            self.continue_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
+            self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
             messagebox.showinfo("提示", "所有非空内容均已有译文。")
             return
 
@@ -295,6 +314,56 @@ class TranslationController:
 
         # 在新线程中执行翻译
         source_content = "\n".join(source_lines[index] for index in pending_indices)
+        translation_thread = threading.Thread(
+            target=self._translate_worker, args=(source_content, run_id)
+        )
+        translation_thread.daemon = True
+        translation_thread.start()
+
+    def retranslate_all(self):
+        """Retranslate every non-empty source row after explicit confirmation.
+
+        Existing targets remain visible until each replacement is successfully
+        returned. This prevents a cancelled or failed run from erasing usable
+        translations.
+        """
+        if not self._can_start_translation():
+            return
+
+        source_lines, target_lines = self.get_table_data()
+        source_indices = [index for index, line in enumerate(source_lines) if line.strip()]
+        if not source_indices:
+            messagebox.showwarning("翻译警告", "请先输入要翻译的文本")
+            return
+
+        if not self.config_manager.is_api_configured():
+            messagebox.showwarning("配置警告", "请先配置API设置")
+            self.open_settings()
+            return
+
+        translated_count = sum(
+            1
+            for index in source_indices
+            if index < len(target_lines) and target_lines[index].strip()
+        )
+        confirmed = messagebox.askyesno(
+            "确认重新翻译",
+            f"将重新翻译全部 {len(source_indices)} 行，并覆盖其中 {translated_count} 行现有译文。\n\n"
+            "只有成功返回的新译文才会覆盖旧内容。是否继续？",
+            icon="warning",
+            parent=self.root,
+        )
+        if not confirmed or not self._confirm_preflight("retranslate"):
+            return
+
+        self.is_translating = True
+        self._set_control_states(tk.DISABLED, tk.DISABLED, tk.NORMAL)
+        self._continue_start_line = 0
+        self._continue_missing_indices = source_indices
+
+        run_id = self._new_run_id("retranslate")
+        self.status_updater(f"正在重新翻译全部 {len(source_indices)} 行...")
+        source_content = "\n".join(source_lines[index] for index in source_indices)
         translation_thread = threading.Thread(
             target=self._translate_worker, args=(source_content, run_id)
         )
@@ -346,9 +415,7 @@ class TranslationController:
 
         # 更新界面状态（不清空译文）
         self.is_translating = True
-        self.translate_btn.config(state=tk.DISABLED)
-        self.continue_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+        self._set_control_states(tk.DISABLED, tk.DISABLED, tk.NORMAL)
 
         # R2-BUG-014：记录缺失行原始索引，用于回调按索引写回（不再使用连续偏移）
         self._continue_missing_indices = need_translation_indices
@@ -386,9 +453,7 @@ class TranslationController:
             self._revert_streaming_preview()
 
             # 更新UI状态
-            self.translate_btn.config(state=tk.DISABLED)
-            self.continue_btn.config(state=tk.DISABLED)
-            self.stop_btn.config(state=tk.DISABLED)
+            self._set_control_states(tk.DISABLED, tk.DISABLED, tk.DISABLED)
             self.status_updater("正在停止翻译，已完成内容会保留")
 
             # 重置进度条为当前实际进度
@@ -469,9 +534,7 @@ class TranslationController:
 
         # 更新界面状态
         self.is_translating = True
-        self.translate_btn.config(state=tk.DISABLED)
-        self.continue_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+        self._set_control_states(tk.DISABLED, tk.DISABLED, tk.NORMAL)
 
         # 保存选中的数据（用于渲染时定位）
         self._selected_translation_data = selected_data
@@ -770,12 +833,21 @@ class TranslationController:
         if not updates:
             return {}
         accepted: dict[int, str] = {}
+        retranslated_indices: set[int] = set()
         if self._document:
             for row_index, value in updates.items():
+                if getattr(self, "_current_mode", None) == "retranslate":
+                    # 用户已明确同意覆盖；只在拿到非空新结果时解除人工保护。
+                    self._document.clear_manual_flag(row_index)
+                    retranslated_indices.add(row_index)
                 if self._document.update_target(row_index, value):
                     accepted[row_index] = value
         else:
             accepted = dict(updates)
+            if getattr(self, "_current_mode", None) == "retranslate":
+                retranslated_indices.update(updates)
+        if retranslated_indices:
+            self._on_retranslated(retranslated_indices)
         return accepted
 
     def _revert_streaming_preview(self) -> None:
@@ -924,10 +996,9 @@ class TranslationController:
 
     def _handle_full_translation_complete(self, result: BatchTranslationResult):
         """全文翻译完成：在主线程更新 UI（原 ``_on_translation_complete.update_ui``）。"""
+        is_retranslation = getattr(self, "_current_mode", None) == "retranslate"
         self.is_translating = False
-        self.translate_btn.config(state=tk.NORMAL)
-        self.continue_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
+        self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         # 复位续写标记
         self._continuing_mode = False
         self._continuing_first_insert = False
@@ -952,19 +1023,40 @@ class TranslationController:
 
         if result.status == TranslationStatus.PARTIAL:
             failed_count = len(result.failed_indices)
-            self.status_updater(f"翻译部分完成（{failed_count} 行失败）")
+            operation_name = "重新翻译" if is_retranslation else "翻译"
+            self.status_updater(f"{operation_name}部分完成（{failed_count} 行失败）")
             # 记录失败索引用于查漏
             self._last_missing_failed_indices = list(result.failed_indices)
             actionable = self._classify_translation_error(result.error_message)
             if actionable is not None and not actionable.retryable:
                 self._show_actionable_error(actionable)
                 return
-            messagebox.showwarning(
-                "翻译部分完成", f"部分内容翻译失败（{failed_count} 行）。\n将尝试补译失败行。"
-            )
+            if is_retranslation:
+                messagebox.showwarning(
+                    "重新翻译部分完成",
+                    f"{failed_count} 行未能生成新译文，已有译文已保留。\n"
+                    "仍为空的行将自动尝试补译。",
+                )
+            else:
+                messagebox.showwarning(
+                    "翻译部分完成", f"部分内容翻译失败（{failed_count} 行）。\n将尝试补译失败行。"
+                )
         else:
-            self.status_updater("翻译完成")
+            self.status_updater("重新翻译完成" if is_retranslation else "翻译完成")
             self._last_missing_failed_indices = []
+
+        if is_retranslation:
+            source_lines, target_lines = self.get_table_data()
+            has_missing = any(
+                source.strip() and (index >= len(target_lines) or not target_lines[index].strip())
+                for index, source in enumerate(source_lines)
+            )
+            if not has_missing:
+                self._missing_check_rounds = 0
+                self._last_missing_failed_indices = []
+                if result.status != TranslationStatus.PARTIAL:
+                    messagebox.showinfo("重新翻译完成", "所有非空内容已重新翻译完成。")
+                return
 
         # BUG-004：启动翻译查漏机制（带次数上限）
         self._missing_check_rounds = 0
@@ -973,9 +1065,7 @@ class TranslationController:
     def _handle_translation_failed(self, error_msg: str):
         """Restore the UI and present a safe, actionable error summary."""
         self.is_translating = False
-        self.translate_btn.config(state=tk.NORMAL)
-        self.continue_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
+        self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         # P0-2：worker 异常时回退未提交的流式预览
         self._revert_streaming_preview()
         actionable = self._classify_translation_error(error_msg) or classify_error(
@@ -1099,9 +1189,7 @@ class TranslationController:
         """选中行翻译完成：在主线程更新 UI（原 ``_on_selected_translation_complete``）。"""
         # 恢复界面状态
         self.is_translating = False
-        self.translate_btn.config(state=tk.NORMAL)
-        self.continue_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
+        self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         # P0-2：回退未提交的流式预览到文档值
         self._revert_streaming_preview()
 
@@ -1206,9 +1294,7 @@ class TranslationController:
 
         # 开始翻译
         self.is_translating = True
-        self.translate_btn.config(state=tk.DISABLED)
-        self.continue_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+        self._set_control_states(tk.DISABLED, tk.DISABLED, tk.NORMAL)
 
         # PERF：在主线程生成 run_id 并丢弃旧任务事件。
         # P0-3：捕获 run_id 并传入工作线程，避免回调签名不匹配而崩溃。
@@ -1345,9 +1431,7 @@ class TranslationController:
         ``root.after(0, ...)`` 包装（事件泵已在主线程调用）。
         """
         self.is_translating = False
-        self.translate_btn.config(state=tk.NORMAL)
-        self.continue_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
+        self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         # P0-2：回退未提交的流式预览到文档值
         self._revert_streaming_preview()
 

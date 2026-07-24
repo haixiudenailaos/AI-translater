@@ -10,6 +10,7 @@ from src.application.translation_document import TranslationDocument
 from src.config.config_manager import ConfigManager
 from src.ui.lazy_service import LazyService
 from src.ui.main_window import MainWindow
+from src.ui.translation_controller import TranslationController
 from src.ui.translation_table_adapter import TranslationTableAdapter
 
 
@@ -83,6 +84,48 @@ class ConfigStartupTests(unittest.TestCase):
 
 
 class MainWindowLayoutTests(unittest.TestCase):
+    def test_small_model_toggle_is_persisted_and_refreshes_global_policy(self):
+        class Config:
+            def __init__(self):
+                self.app = {
+                    "small_model_mode": False,
+                    "queue_max_in_flight_requests": 4,
+                    "queue_hard_request_cap": 4,
+                }
+                self.saved = []
+
+            def get_app_config(self):
+                return dict(self.app)
+
+            def save_app_config(self, config):
+                self.app = dict(config)
+                self.saved.append(dict(config))
+                return True
+
+        config = Config()
+        limiter_updates = []
+        policy_updates = []
+        statuses = []
+        window = MainWindow.__new__(MainWindow)
+        window.root = object()
+        window.config_manager = config
+        window._small_model_mode_var = SimpleNamespace(get=lambda: True)
+        window._provider_limiter_registry = SimpleNamespace(
+            update_limits=lambda **limits: limiter_updates.append(limits)
+        )
+        window._queue_manager = SimpleNamespace(refresh_policy=policy_updates.append)
+        window.update_status = statuses.append
+
+        window._on_small_model_mode_changed()
+
+        self.assertTrue(config.saved[-1]["small_model_mode"])
+        self.assertEqual(
+            limiter_updates,
+            [{"configured_max": 1, "hard_cap": 1}],
+        )
+        self.assertEqual(policy_updates[0].max_batch_lines, 1)
+        self.assertIn("主界面与后台队列并发 1", statuses[-1])
+
     def test_footer_is_reserved_before_expandable_work_area(self):
         class PackedFrame:
             def __init__(self):
@@ -205,6 +248,70 @@ class MainWindowLayoutTests(unittest.TestCase):
         self.assertEqual(right.grid_options["column"], 2)
         self.assertEqual(window.settings_btn.pack_options["side"], tk.RIGHT)
 
+    def test_control_panel_groups_translation_actions_without_duplicate_primary_button(self):
+        class LayoutWidget:
+            def __init__(self, parent=None, **options):
+                self.parent = parent
+                self.options = options
+                self.pack_options = None
+
+            def pack(self, **kwargs):
+                self.pack_options = kwargs
+
+        class Menu:
+            def __init__(self, *_args, **_kwargs):
+                self.entries = []
+
+            def add_command(self, **options):
+                self.entries.append(options)
+
+            def add_separator(self):
+                self.entries.append(None)
+
+            def index(self, _index):
+                return len(self.entries) - 1
+
+        buttons = []
+        calls = []
+
+        def make_widget(parent=None, **options):
+            return LayoutWidget(parent, **options)
+
+        def make_button(parent=None, **options):
+            widget = LayoutWidget(parent, **options)
+            buttons.append(widget)
+            return widget
+
+        window = MainWindow.__new__(MainWindow)
+        window._run_primary_action = lambda: calls.append("start")
+        window._retranslate_all = lambda: calls.append("retranslate")
+        window._continue_translation = lambda: None
+        window._on_small_model_mode_changed = lambda: None
+        window._small_model_mode_var = object()
+
+        with (
+            patch("src.ui.main_window.ttk.Frame", side_effect=make_widget),
+            patch("src.ui.main_window.ttk.Button", side_effect=make_button),
+            patch("src.ui.main_window.ttk.Checkbutton", side_effect=make_widget),
+            patch("src.ui.main_window.ttk.Menubutton", side_effect=make_widget),
+            patch("src.ui.main_window.ttk.Label", side_effect=make_widget),
+            patch("src.ui.main_window.ttk.Progressbar", side_effect=make_widget),
+            patch("src.ui.main_window.tk.Menu", Menu),
+            patch("src.ui.main_window.tk.DoubleVar", return_value=object()),
+        ):
+            window.create_control_panel(object())
+
+        self.assertIs(buttons[0], window.start_translation_btn)
+        self.assertEqual(buttons[0].options["text"], "开始翻译")
+        self.assertEqual(buttons[0].options["state"], tk.DISABLED)
+        self.assertEqual(buttons[0].pack_options["side"], tk.LEFT)
+        self.assertIs(window.translate_btn, window.start_translation_btn)
+        self.assertEqual(buttons[1].options["text"], "重新翻译")
+        self.assertEqual(buttons[1].options["state"], tk.DISABLED)
+        buttons[0].options["command"]()
+        buttons[1].options["command"]()
+        self.assertEqual(calls, ["start", "retranslate"])
+
     def test_shortcuts_bind_control_and_command_variants(self):
         class Root:
             def __init__(self):
@@ -260,6 +367,42 @@ class _Widget:
 
     def pack_forget(self):
         self.hidden = True
+
+
+class TranslationControlTests(unittest.TestCase):
+    def test_imported_pending_content_enables_start_translation(self):
+        window = MainWindow.__new__(MainWindow)
+        window._table_loading = False
+        window._document = TranslationDocument()
+        window._document.replace(["source"], [""])
+        window._api_configured = True
+        window._review_filter_var = SimpleNamespace(get=lambda: "全部")
+        window.file_importer = SimpleNamespace(current_mapping_dir=None)
+        window.translate_btn = _Widget()
+        window.start_translation_btn = _Widget()
+        window.retranslate_btn = _Widget()
+
+        window.refresh_action_state()
+
+        self.assertEqual(window.start_translation_btn.options["state"], tk.NORMAL)
+        self.assertEqual(window.translate_btn.options["text"], "翻译未完成行")
+        self.assertEqual(window.retranslate_btn.options["state"], tk.DISABLED)
+
+    def test_translation_controller_keeps_start_button_in_sync(self):
+        controller = TranslationController.__new__(TranslationController)
+        controller.start_btn = _Widget()
+        controller.translate_btn = _Widget()
+        controller.retranslate_btn = _Widget()
+        controller.continue_btn = _Widget()
+        controller.stop_btn = _Widget()
+
+        controller._set_control_states(tk.DISABLED, tk.DISABLED, tk.NORMAL)
+
+        self.assertEqual(controller.start_btn.options["state"], tk.DISABLED)
+        self.assertEqual(controller.translate_btn.options["state"], tk.DISABLED)
+        self.assertEqual(controller.retranslate_btn.options["state"], tk.DISABLED)
+        self.assertEqual(controller.continue_btn.options["state"], tk.DISABLED)
+        self.assertEqual(controller.stop_btn.options["state"], tk.NORMAL)
 
 
 class _Tree:

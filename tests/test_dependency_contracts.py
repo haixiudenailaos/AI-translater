@@ -16,6 +16,17 @@ def test_svg_converter_is_included_in_pyinstaller_build():
     assert "'cairosvg'" in spec
 
 
+def test_chardet_is_pinned_to_pyinstaller_safe_release():
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+    requirements = Path("requirements.txt").read_text(encoding="utf-8")
+    windows_lock = Path("requirements-text-win-py310.lock.txt").read_text(encoding="utf-8")
+
+    assert '"chardet==5.2.0"' in pyproject
+    assert "chardet==5.2.0" in requirements
+    assert "chardet==5.2.0" in windows_lock
+    assert "chardet==7" not in windows_lock
+
+
 def test_project_python_contract_matches_tested_release_matrix():
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     build_workflow = Path(".github/workflows/build.yml").read_text(encoding="utf-8")

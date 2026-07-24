@@ -130,6 +130,15 @@ def classify_error(
     status_code = getattr(error, "status_code", None)
     lowered = raw_message.lower()
 
+    if "并发批次过大" in raw_message and "服务商拒绝" in raw_message:
+        return ActionableError(
+            ErrorCategory.RATE_LIMIT,
+            safe_message,
+            "当前已按并发 1 运行；请稍后重试或检查服务商限制。",
+            True,
+            correlation_id,
+        )
+
     # 401/403：认证 / 授权
     if status_code in (401, 403) or any(
         token in lowered

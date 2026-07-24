@@ -24,6 +24,27 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+PACKAGED_SMOKE_TEST_ARG = "--packaged-smoke-test"
+
+
+def run_packaged_smoke_test(*, verify_gui: bool = True) -> int:
+    """Exercise code paths that previously failed only inside the frozen exe."""
+    import chardet
+
+    sample = "轻小说翻译器".encode("gb18030")
+    result = chardet.detect(sample)
+    if not result.get("encoding"):
+        return 1
+
+    if verify_gui:
+        root = tk.Tk()
+        try:
+            root.withdraw()
+            root.update_idletasks()
+        finally:
+            root.destroy()
+    return 0
+
 
 class TranslatorApp:
     def __init__(self):
@@ -233,6 +254,9 @@ class TranslatorApp:
 
 def main():
     """主函数"""
+    if PACKAGED_SMOKE_TEST_ARG in sys.argv[1:]:
+        sys.exit(run_packaged_smoke_test())
+
     try:
         app = TranslatorApp()
         app.run()

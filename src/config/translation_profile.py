@@ -6,6 +6,7 @@ from urllib.parse import urlsplit, urlunsplit
 SILICONFLOW_PROVIDER = "siliconflow"
 DEEPSEEK_PROVIDER = "deepseek"
 OPENAI_COMPATIBLE_PROVIDER = "openai_compatible"
+SMALL_MODEL_MODE_CONFIG_KEY = "small_model_mode"
 
 SILICONFLOW_DEEPSEEK_V32_MODEL = "deepseek-ai/DeepSeek-V3.2"
 DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash"
@@ -27,12 +28,23 @@ MAX_QUEUE_TRANSLATION_INPUT_TOKENS = 20000
 DEFAULT_QUEUE_TRANSLATION_CONCURRENCY = 2
 MAX_QUEUE_TRANSLATION_CONCURRENCY = 4
 
+# 面向用户的全局并发档位。2/4/8 能覆盖常见的免费、标准和高额度 API，
+# 同时保留 1-16 的自定义范围供私有部署或高配额账户使用。
+QUEUE_CONCURRENCY_CUSTOM = "custom"
+QUEUE_CONCURRENCY_PRESETS = {
+    "small": 2,
+    "medium": 4,
+    "large": 8,
+}
+DEFAULT_QUEUE_CONCURRENCY_PRESET = "medium"
+MAX_QUEUE_CUSTOM_CONCURRENCY = 16
+
 # 队列翻译并发优化阶段 1（QUEUE_TRANSLATION_CONCURRENCY_OPTIMIZATION_PLAN.md §3）：
 # 全局公平调度器的策略参数。所有并发只有一个清晰 owner——全局
 # ``ProviderLimiter.current_limit``，不再有"文件并发 × 文件内并发"两层乘法。
 #
 # - ``queue_max_in_flight_requests``：ProviderLimiter 的 configured_max，
-#   即主编辑器与后台队列在同一 Provider 上合计的在途请求上限
+#   即主编辑器与后台队列跨所有 Provider 合计的在途请求上限
 #   （AIMD 在此基础上动态调整；字段名为兼容旧配置而保留 queue_ 前缀）。
 # - ``queue_hard_request_cap``：硬上限，不可突破。ThreadPoolExecutor 的
 #   max_workers 也以此为准，避免两层并发乘法导致实际请求数失控。
@@ -43,10 +55,10 @@ MAX_QUEUE_TRANSLATION_CONCURRENCY = 4
 # - ``queue_adaptive_concurrency``：是否启用 AIMD 自适应并发。
 # - ``queue_rpm_limit`` / ``queue_tpm_limit``：Provider 级 RPM/TPM 限流，
 #   0 表示不限制。供共享 ProviderLimiter 使用。
-DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS = 2
-MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS = 4
+DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS = QUEUE_CONCURRENCY_PRESETS[DEFAULT_QUEUE_CONCURRENCY_PRESET]
+MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS = MAX_QUEUE_CUSTOM_CONCURRENCY
 DEFAULT_QUEUE_HARD_REQUEST_CAP = 4
-MAX_QUEUE_HARD_REQUEST_CAP = 8
+MAX_QUEUE_HARD_REQUEST_CAP = MAX_QUEUE_CUSTOM_CONCURRENCY
 DEFAULT_QUEUE_MAX_ACTIVE_TASKS = 4
 MAX_QUEUE_MAX_ACTIVE_TASKS = 16
 DEFAULT_QUEUE_PER_TASK_SOFT_LIMIT = 1
@@ -56,6 +68,37 @@ DEFAULT_QUEUE_RPM_LIMIT = 0
 MAX_QUEUE_RPM_LIMIT = 10000
 DEFAULT_QUEUE_TPM_LIMIT = 0
 MAX_QUEUE_TPM_LIMIT = 10_000_000
+
+
+def detect_queue_concurrency_preset(app_config: Dict[str, Any]) -> str:
+    """Return the UI preset matching an existing global concurrency value.
+
+    The explicit ``custom`` choice is preserved even when its value happens to
+    equal a preset. Older configs without a preset key are matched by value.
+    """
+    raw_concurrency = app_config.get(
+        "queue_max_in_flight_requests", DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS
+    )
+    try:
+        concurrency = int(raw_concurrency)
+    except (TypeError, ValueError):
+        concurrency = DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS
+    concurrency = max(1, min(MAX_QUEUE_CUSTOM_CONCURRENCY, concurrency))
+
+    stored_preset = app_config.get("queue_concurrency_preset")
+    if stored_preset == QUEUE_CONCURRENCY_CUSTOM:
+        return QUEUE_CONCURRENCY_CUSTOM
+    if (
+        isinstance(stored_preset, str)
+        and stored_preset in QUEUE_CONCURRENCY_PRESETS
+        and QUEUE_CONCURRENCY_PRESETS[stored_preset] == concurrency
+    ):
+        return stored_preset
+
+    for preset, preset_concurrency in QUEUE_CONCURRENCY_PRESETS.items():
+        if preset_concurrency == concurrency:
+            return preset
+    return QUEUE_CONCURRENCY_CUSTOM
 
 
 def build_queue_policy_from_app_config(app_config: Dict[str, Any]):
@@ -77,9 +120,13 @@ def build_queue_policy_from_app_config(app_config: Dict[str, Any]):
             v = default
         return max(lo, min(hi, v))
 
+    preset = app_config.get("queue_concurrency_preset")
+    preset_default = QUEUE_CONCURRENCY_PRESETS.get(
+        str(preset), DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS
+    )
     max_in_flight = _clamp(
         "queue_max_in_flight_requests",
-        DEFAULT_QUEUE_MAX_IN_FLIGHT_REQUESTS,
+        preset_default,
         1,
         MAX_QUEUE_MAX_IN_FLIGHT_REQUESTS,
     )
@@ -109,9 +156,18 @@ def build_queue_policy_from_app_config(app_config: Dict[str, Any]):
         1,
         MAX_QUEUE_TRANSLATION_CONCURRENCY,
     )
-    if "queue_max_in_flight_requests" not in app_config:
+    if (
+        "queue_max_in_flight_requests" not in app_config
+        and "queue_concurrency_preset" not in app_config
+        and "queue_translation_concurrency" in app_config
+    ):
         max_in_flight = min(max_in_flight, legacy_concurrency)
         hard_cap = max(hard_cap, min(MAX_QUEUE_HARD_REQUEST_CAP, legacy_concurrency * 2))
+
+    small_model_mode = bool(app_config.get(SMALL_MODEL_MODE_CONFIG_KEY, False))
+    if small_model_mode:
+        max_in_flight = 1
+        hard_cap = 1
 
     target_tokens = _clamp(
         "queue_batch_max_input_tokens",
@@ -132,6 +188,8 @@ def build_queue_policy_from_app_config(app_config: Dict[str, Any]):
         1,
         MAX_QUEUE_TRANSLATION_BATCH_LINES,
     )
+    if small_model_mode:
+        max_lines = 1
 
     rpm_limit = _clamp(
         "queue_rpm_limit",
