@@ -61,9 +61,7 @@ def _seed_old_data(paths):
     (mapping_dir / "content_mapping.json").write_text(
         json.dumps({"content_mappings": {"c1": {}}}), encoding="utf-8"
     )
-    (mapping_dir / "images.json").write_text(
-        json.dumps({"image_mappings": {}}), encoding="utf-8"
-    )
+    (mapping_dir / "images.json").write_text(json.dumps({"image_mappings": {}}), encoding="utf-8")
 
 
 class TestMigrateToEmptyTarget:
@@ -102,9 +100,7 @@ class TestMigrateToEmptyTarget:
         """仅自定义 backups 时，projects/mappings 同路径应跳过。"""
         old_paths = resolver.resolve(_storage())
         _seed_old_data(old_paths)
-        new_paths = resolver.resolve(
-            _storage(translation_backups_dir=str(tmp_path / "backups"))
-        )
+        new_paths = resolver.resolve(_storage(translation_backups_dir=str(tmp_path / "backups")))
         plan = migrator.plan(old_paths, new_paths)
         assert [item.field for item in plan] == ["translation_backups_dir"]
 
@@ -131,9 +127,7 @@ class TestConflictProtection:
 class TestFailureRecovery:
     """复制失败后可重试，旧数据仍可用；中断迁移可被识别。"""
 
-    def test_copy_failure_marks_manifest_failed(
-        self, resolver, migrator, tmp_path, monkeypatch
-    ):
+    def test_copy_failure_marks_manifest_failed(self, resolver, migrator, tmp_path, monkeypatch):
         old_paths = resolver.resolve(_storage())
         _seed_old_data(old_paths)
         new_paths = resolver.resolve(_storage(data_root=str(tmp_path / "new_root")))

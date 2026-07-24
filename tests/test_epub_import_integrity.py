@@ -13,8 +13,8 @@ from src.core.concurrent_manager import ConcurrentTranslationManager
 from src.core.epub_processor import EpubImportCancelled, EpubImportPartialError, EPUBProcessor
 
 
-def test_asset_only_image_cache_is_reparsed_with_base64_fallback(tmp_app_paths, make_epub):
-    """旧 V1.6 资产缓存必须重解析，不能继续复用可能被改写的落盘图片。"""
+def test_missing_cache_manifest_triggers_full_reimport(tmp_app_paths, make_epub):
+    """Batch-C：import_cache_manifest.json 缺失时强制全量重解析。"""
     image_data = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
     )
@@ -24,19 +24,23 @@ def test_asset_only_image_cache_is_reparsed_with_base64_fallback(tmp_app_paths, 
     )
     processor = EPUBProcessor(app_paths=tmp_app_paths)
     first = processor.import_epub(str(epub_path), extract_images=True)
-    images_file = Path(first["images_file"])
-    old_payload = json.loads(images_file.read_text(encoding="utf-8"))
-    old_payload.pop("schema_version", None)
-    for info in old_payload["image_mappings"].values():
-        info.pop("base64_data", None)
-    images_file.write_text(json.dumps(old_payload), encoding="utf-8")
+    mapping_dir = Path(first["mapping_dir"])
 
+    # 删除 cache manifest，模拟旧版工作区
+    cache_manifest = mapping_dir / "import_cache_manifest.json"
+    cache_manifest.unlink(missing_ok=True)
+
+    # 应触发全量重解析（不得因为 images.json 存在就直接复用）
     second = processor.import_epub(str(epub_path), extract_images=True)
     repaired = json.loads(Path(second["images_file"]).read_text(encoding="utf-8"))
     info = repaired["image_mappings"]["Images/page.png"]
 
-    assert repaired["schema_version"] == 2
-    assert base64.b64decode(info["base64_data"].split(",", 1)[1]) == image_data
+    from src.infrastructure.image_asset_store import IMAGE_MAPPING_SCHEMA_VERSION
+
+    assert repaired["schema_version"] == IMAGE_MAPPING_SCHEMA_VERSION
+    assert (mapping_dir / info["local_path"]).is_file()
+    # Batch-C: 正常文件系统下不应有 base64_data
+    assert "base64_data" not in info
 
 
 def test_chapter_parse_failure_preserves_previous_complete_mapping(

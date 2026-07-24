@@ -98,7 +98,11 @@ class SiliconFlowAPI(BaseAPI):
     # ── 增强 vision_query（带 debug 日志）──────────────
 
     def vision_query(
-        self, image_base64: str, mime_type: str, prompt: str, model_override: str = None
+        self,
+        image_base64: str,
+        mime_type: str,
+        prompt: str,
+        model_override: str | None = None,
     ) -> str | None:
         logger.debug("[vision_query] ====== 开始视觉查询 ======")
         logger.debug(

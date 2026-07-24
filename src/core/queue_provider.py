@@ -307,8 +307,8 @@ class ProviderLimiter:
         rpm_limit: int = 0,
         tpm_limit: int = 0,
         backoff: RetryPolicy | None = None,
-        clock: callable = time.monotonic,
-        wall_clock: callable = time.time,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         request_gate: _GlobalRequestGate | None = None,
     ) -> None:
         if configured_max < 1 or hard_cap < 1:

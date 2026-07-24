@@ -7,13 +7,9 @@
 本模块与之保持一致；运行时代码只读本模块。
 """
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 
 def display_version() -> str:
-    """面向用户展示的 major.minor 版本号（如 "1.6"）。
-
-    构建产物名、窗口标题使用此短版本，避免把补丁号带入面向用户的展示。
-    """
-    parts = __version__.split(".")
-    return ".".join(parts[:2])
+    """返回面向用户展示的完整语义版本号。"""
+    return __version__

@@ -382,6 +382,25 @@ def execute_batch_job(
         )
 
     batch_lines = list(job.source_lines)
+
+    # Batch-D: track per-job retry attempts via on_retryable_response hook.
+    # The hook fires before each retry delay in BaseAPI, giving the shared
+    # ProviderLimiter an early signal on the first 429/timeout.
+    _retry_count = 0
+
+    def _on_retryable(status_code: int, retry_after: float | None) -> None:
+        nonlocal _retry_count
+        _retry_count += 1
+        if status_code == 429:
+            limiter.record_rate_limited(retry_after_seconds=retry_after)
+        else:
+            # network / timeout / other 5xx — treat like a timeout event
+            limiter.record_timeout()
+
+    _api = getattr(engine, "api", None)
+    if _api is not None and hasattr(_api, "set_on_retryable_response"):
+        _api.set_on_retryable_response(_on_retryable)
+
     try:
         # 复用 engine._translate_batch 的协议构造、行号标记解析和 Hunyuan 路径。
         # progress_callback 置空：Coordinator 从 Snapshot 驱动 UI，不接收逐 token 回调。
@@ -407,7 +426,7 @@ def execute_batch_job(
             source_indices=job.source_indices,
             translated_lines=tuple(result.lines),
             failed_relative_indices=tuple(result.failed_indices),
-            retry_count=0,
+            retry_count=_retry_count,
             rate_limited=False,
             retry_after_seconds=None,
             request_seconds=request_seconds,
@@ -424,7 +443,7 @@ def execute_batch_job(
             source_indices=job.source_indices,
             translated_lines=tuple(),
             failed_relative_indices=tuple(range(len(batch_lines))),
-            retry_count=0,
+            retry_count=_retry_count,
             rate_limited=False,
             retry_after_seconds=None,
             request_seconds=request_seconds,
@@ -434,16 +453,20 @@ def execute_batch_job(
     except TranslationRequestError as exc:
         request_seconds = time.monotonic() - started_at
         rate_limited = exc.status_code == 429
-        if rate_limited:
-            # 立即上报 429，让共享 Limiter 在 Provider 范围统一 cooldown（§8.2）
-            limiter.record_rate_limited(
-                retry_after_seconds=exc.retry_after_seconds,
-            )
-        elif exc.status_code in (408, 504) or "timeout" in str(exc).lower():
-            limiter.record_timeout()
-        else:
-            # 其他失败不计入限流指标，但重置成功计数阻止立即恢复
-            limiter.record_timeout()
+        # Batch-D: hook already notified limiter for intermediate retry 429s.
+        # Only notify here if no hook notification occurred (e.g. max_attempts=1
+        # or the final attempt after retries exhausted without hook firing).
+        if _retry_count == 0:
+            if rate_limited:
+                # 立即上报 429，让共享 Limiter 在 Provider 范围统一 cooldown（§8.2）
+                limiter.record_rate_limited(
+                    retry_after_seconds=exc.retry_after_seconds,
+                )
+            elif exc.status_code in (408, 504) or "timeout" in str(exc).lower():
+                limiter.record_timeout()
+            else:
+                # 其他失败不计入限流指标，但重置成功计数阻止立即恢复
+                limiter.record_timeout()
         # P1-UX-3：转换为 ActionableError，记录原始异常到脱敏日志
         actionable = classify_error(exc)
         log_classified_error(
@@ -462,7 +485,7 @@ def execute_batch_job(
             source_indices=job.source_indices,
             translated_lines=tuple(),
             failed_relative_indices=tuple(range(len(batch_lines))),
-            retry_count=0,
+            retry_count=_retry_count,
             rate_limited=rate_limited,
             retry_after_seconds=exc.retry_after_seconds,
             request_seconds=request_seconds,
@@ -494,7 +517,7 @@ def execute_batch_job(
             source_indices=job.source_indices,
             translated_lines=tuple(),
             failed_relative_indices=tuple(range(len(batch_lines))),
-            retry_count=0,
+            retry_count=_retry_count,
             rate_limited=False,
             retry_after_seconds=None,
             request_seconds=request_seconds,
@@ -505,6 +528,10 @@ def execute_batch_job(
             error_retryable=actionable.retryable,
             correlation_id=actionable.correlation_id,
         )
+    finally:
+        # Batch-D: always clear hook to avoid cross-job interference
+        if _api is not None and hasattr(_api, "set_on_retryable_response"):
+            _api.set_on_retryable_response(None)
 
 
 # ── 内部任务槽（Coordinator 私有，受 _lock 保护） ──────
@@ -600,12 +627,15 @@ class QueueTranslationCoordinator:
         limiter_registry: ProviderLimiterRegistry | None = None,
         project_repository=None,
         fingerprint_mismatch_callback=None,
+        cache_dir=None,
     ) -> None:
         self._config_manager = config_manager
         self._policy = policy
         self._file_handler = file_handler
         self._epub_processor = epub_processor
         self._app_paths = app_paths
+        # STORAGE-7：后台队列与主编辑器使用同一解析后的缓存目录。
+        self._cache_dir = cache_dir
 
         # P1-UX-2：TXT 跨重启续传仓库。None 时降级为旧行为（仅写 _译文.txt）。
         self._project_repository = project_repository
@@ -1272,7 +1302,10 @@ class QueueTranslationCoordinator:
         # API client creation and context construction can allocate sockets or
         # initialize a provider runtime. Keep that work outside the coordinator
         # state lock, then validate the attempt before accepting its result.
-        engine = TranslatorEngine(self._config_manager)
+        if self._cache_dir is None:
+            engine = TranslatorEngine(self._config_manager)
+        else:
+            engine = TranslatorEngine(self._config_manager, cache_dir=self._cache_dir)
         slot.engine = engine
         preparation_error: Exception | None = None
         preparation_stage = "engine_init"

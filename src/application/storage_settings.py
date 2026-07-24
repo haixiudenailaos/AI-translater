@@ -27,9 +27,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Protocol
 
 from ..infrastructure.storage_migration import (
     MigrationConflictError,
@@ -46,6 +47,52 @@ from ..infrastructure.storage_paths import (
 
 logger = logging.getLogger(__name__)
 
+StorageConfig = dict[str, object]
+
+
+class StorageConfigManager(Protocol):
+    """Configuration dependency needed by the storage settings use case."""
+
+    def get_storage_config(self) -> StorageConfig:
+        """Return an independent, normalized storage configuration."""
+        ...
+
+    def update_storage_config(self, storage: StorageConfig) -> bool:
+        """Persist a normalized storage configuration."""
+        ...
+
+
+class StoragePathDefaults(Protocol):
+    """Platform paths consumed by the infrastructure resolver."""
+
+    data_dir: Path
+    workspace_dir: Path
+
+
+class StorageMigrationPort(Protocol):
+    """Migration operations orchestrated by the storage settings use case."""
+
+    def has_migratable_data(
+        self, old_paths: ResolvedStoragePaths, new_paths: ResolvedStoragePaths
+    ) -> bool:
+        """Whether changing the configured paths requires migration."""
+        ...
+
+    def migrate(
+        self,
+        old_paths: ResolvedStoragePaths,
+        new_paths: ResolvedStoragePaths,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> MigrationResult:
+        """Migrate application-owned data or raise a migration error."""
+        ...
+
+
+def _empty_storage_issues() -> list[StoragePathIssue]:
+    return []
+
+
 # ApplyResult.status 取值
 STATUS_UNCHANGED = "unchanged"
 STATUS_SAVED = "saved"
@@ -59,7 +106,7 @@ class StorageApplyResult:
 
     status: str
     message: str = ""
-    issues: List[StoragePathIssue] = field(default_factory=list)
+    issues: list[StoragePathIssue] = field(default_factory=_empty_storage_issues)
     migration: MigrationResult | None = None
     #: True 表示需要重启应用才能生效（本版本固定策略）
     needs_restart: bool = False
@@ -79,11 +126,17 @@ class StorageSettingsService:
             未提供时按“无任务”处理（测试与无队列环境）。
     """
 
-    def __init__(self, config_manager, app_paths, *, is_task_active=None):
+    def __init__(
+        self,
+        config_manager: StorageConfigManager,
+        app_paths: StoragePathDefaults,
+        *,
+        is_task_active: Callable[[], bool] | None = None,
+    ) -> None:
         self._config_manager = config_manager
         self._app_paths = app_paths
         self._resolver = StoragePathResolver(app_paths)
-        self._migrator = StorageMigrator()
+        self._migrator: StorageMigrationPort = StorageMigrator()
         self._is_task_active = is_task_active
 
     # ── 查询 ────────────────────────────────────────
@@ -92,7 +145,7 @@ class StorageSettingsService:
     def resolver(self) -> StoragePathResolver:
         return self._resolver
 
-    def current_storage(self) -> Dict[str, Any]:
+    def current_storage(self) -> StorageConfig:
         """当前生效的 storage 配置段（归一化后）。"""
         return self._config_manager.get_storage_config()
 
@@ -100,17 +153,35 @@ class StorageSettingsService:
         """当前生效配置对应的解析路径。"""
         return self._resolver.resolve(self.current_storage())
 
-    def default_storage(self) -> Dict[str, Any]:
+    def default_storage(self) -> StorageConfig:
         """平台默认配置（全部为空 = 跟随平台默认目录）。"""
         from ..config.storage_config import DEFAULT_STORAGE_CONFIG
 
         return dict(DEFAULT_STORAGE_CONFIG)
 
+    def single_root_candidate(self, root: str) -> StorageConfig:
+        """生成设置页使用的“单一缓存根目录”配置。
+
+        新界面只让用户选择一个根目录。缓存、翻译中间记录和译文备份
+        都由 :class:`StoragePathResolver` 在该目录下自动派生。旧版本允许
+        分别覆盖三个子目录；这里主动清空这些覆盖值，使用户新选择的
+        根目录成为唯一入口，同时仍保留底层对旧配置的读取兼容。
+        """
+        candidate = self.current_storage()
+        candidate["data_root"] = root.strip()
+        for path_field in (
+            "cache_dir",
+            "translation_records_dir",
+            "translation_backups_dir",
+        ):
+            candidate[path_field] = ""
+        return candidate
+
     # ── 预览与校验 ──────────────────────────────────
 
     def preview(
-        self, candidate: Dict[str, Any]
-    ) -> Tuple[ResolvedStoragePaths | None, List[StoragePathIssue], str]:
+        self, candidate: StorageConfig
+    ) -> tuple[ResolvedStoragePaths | None, list[StoragePathIssue], str]:
         """解析并校验候选配置，供设置页实时预览。
 
         Returns:
@@ -124,7 +195,7 @@ class StorageSettingsService:
         issues = self._resolver.validate(resolved)
         return resolved, issues, ""
 
-    def paths_changed(self, candidate: Dict[str, Any]) -> bool:
+    def paths_changed(self, candidate: StorageConfig) -> bool:
         """候选配置解析后的写入目录是否与当前生效目录不同。"""
         try:
             new_paths = self._resolver.resolve(candidate)
@@ -133,7 +204,7 @@ class StorageSettingsService:
         current = self.current_paths()
         return _paths_signature(new_paths) != _paths_signature(current)
 
-    def source_has_data(self, candidate: Dict[str, Any]) -> bool:
+    def source_has_data(self, candidate: StorageConfig) -> bool:
         """切换到候选配置时，旧目录中是否存在可迁移数据。"""
         try:
             new_paths = self._resolver.resolve(candidate)
@@ -145,7 +216,7 @@ class StorageSettingsService:
 
     def apply(
         self,
-        candidate: Dict[str, Any],
+        candidate: StorageConfig,
         *,
         migrate_data: bool,
         progress_callback: Callable[[str], None] | None = None,
@@ -241,7 +312,7 @@ class StorageSettingsService:
             return False
 
 
-def _paths_signature(paths: ResolvedStoragePaths) -> tuple:
+def _paths_signature(paths: ResolvedStoragePaths) -> tuple[str, ...]:
     """用于变更比较的目录签名（大小写归一化）。"""
     import os
 

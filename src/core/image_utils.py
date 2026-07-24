@@ -92,7 +92,8 @@ def canonicalize_for_ark_image_generation(raw: bytes, mime_type: str) -> tuple:
         return None, None
 
     try:
-        from PIL import Image, ImageOps
+        import PIL.Image as Image
+        import PIL.ImageOps as ImageOps
 
         with Image.open(io.BytesIO(source)) as opened:
             if getattr(opened, "n_frames", 1) > 1:
@@ -148,7 +149,7 @@ def _convert_svg(raw: bytes) -> bytes | None:
 def _convert_with_pillow(raw: bytes) -> bytes | None:
     """使用Pillow将GIF/WebP/BMP/TIFF等格式转为PNG。"""
     try:
-        from PIL import Image
+        import PIL.Image as Image
 
         img = Image.open(io.BytesIO(raw))
 

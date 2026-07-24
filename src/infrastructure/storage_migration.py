@@ -174,9 +174,7 @@ class StorageMigrator:
         conflicts = self.check_conflicts(plan)
         if conflicts:
             details = "、".join(f"{c.field}（{c.target}）" for c in conflicts)
-            raise MigrationConflictError(
-                f"新目录中已存在数据，为避免覆盖已取消迁移: {details}"
-            )
+            raise MigrationConflictError(f"新目录中已存在数据，为避免覆盖已取消迁移: {details}")
 
         result = MigrationResult(manifest_path=manifest_path)
         active: List[DirectoryMigration] = []
@@ -258,9 +256,7 @@ class StorageMigrator:
         for rel_path, size in source_files.items():
             staged_size = staged_files.get(rel_path)
             if staged_size is None or staged_size != size:
-                raise MigrationError(
-                    f"复制校验失败 {source}: 文件 {rel_path} 大小不一致"
-                )
+                raise MigrationError(f"复制校验失败 {source}: 文件 {rel_path} 大小不一致")
         return len(source_files)
 
     @staticmethod
@@ -301,9 +297,7 @@ class StorageMigrator:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.replace(path)
         except OSError as exc:
             logger.warning("写入迁移清单失败 %s: %s", path, exc)

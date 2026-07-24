@@ -165,3 +165,6 @@ V1.3/
 V1.4/
 workspace/
 .claude/
+.workbuddy/
+.pytest-*/
+tools/_patch_*.py

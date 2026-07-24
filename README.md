@@ -1,4 +1,4 @@
-# 轻小说翻译器 V1.6
+# 轻小说翻译器 V1.6.1
 
 一个基于Python和tkinter的轻小说翻译工具，支持EPUB格式文件的批量翻译处理。
 
@@ -35,8 +35,8 @@ python main.py
 
 当前 CI 构建统一桌面版本：包含 TXT/EPUB 文本翻译，以及 V1.5 风格的在线 AI 图片翻译。
 
-- **Windows**: 单文件 `LightNovelTranslator-1.6-Windows-x64.exe`。
-- **macOS**: `LightNovelTranslator-1.6-macOS.app.zip`，解压后双击 `.app`。
+- **Windows**: 单文件 `LightNovelTranslator-1.6.1-Windows-x64.exe`。
+- **macOS**: `LightNovelTranslator-1.6.1-macOS.app.zip`，解压后双击 `.app`。
 
 图片翻译提供两种方式：推荐的“OCR 预筛选 + 火山图生图”，以及直接处理全部图片。可在“图片翻译设置”中填写自定义 OpenAI 兼容 OCR 地址、模型和独立 Key；地址留空且已保存硅基流动 Key 时，默认使用硅基流动 PaddleOCR-VL-1.5 和该 Key。未配置可用 OCR 时，无文字图片也会进入 AI 图生图，调用次数和花销会更高。构建产物会作为 V1.6 分支推送和 Pull Request 的 GitHub Actions artifact 保存 30 天。
 
@@ -105,7 +105,7 @@ python main.py
 ## 🏗️ 项目结构
 
 ```
-LightNovelTranslator-V1.6/
+LightNovelTranslator-V1.6.1/
 ├── main.py                 # 主程序入口
 ├── requirements.txt        # Python依赖
 ├── translator.spec         # PyInstaller配置
@@ -134,7 +134,7 @@ pip install "pyinstaller==6.11.1"
 pyinstaller translator.spec --clean --noconfirm
 ```
 
-构建会生成单文件 `dist/LightNovelTranslatorV1.6[.exe]`。
+构建会生成单文件 `dist/LightNovelTranslatorV1.6.1[.exe]`。
 
 Windows 发布构建使用 Python 3.10 和 `requirements-text-win-py310.lock.txt`。修改发布依赖后，必须在对应平台与 Python 版本执行 `python tools/generate_dependency_locks.py <target>`，并提交更新后的 hash lock。
 

@@ -247,43 +247,66 @@ class DownloadUrlValidationTests(unittest.TestCase):
 
 
 class SafeDownloadTests(unittest.TestCase):
-    """P1-9：_safe_download_image 信任边界测试。"""
+    """P1-9：_safe_download_image 信任边界测试（httpx 实现）。"""
 
-    def _make_response(
-        self,
-        status_code=200,
-        content=None,
-        content_type="image/png",
-        location=None,
-    ):
-        """构造 mock response。"""
+    # ── Mock 构建辅助 ─────────────────────────────────────────────────────────
+
+    def _make_get_resp(self, status_code: int = 200, *, location=None):
+        """构造 httpx.Client.get() 返回的非流式响应 mock（仅用于重定向检测）。"""
+        r = unittest.mock.MagicMock()
+        r.status_code = status_code
+        r.headers = {}
+        if location is not None:
+            r.headers["location"] = location
+        return r
+
+    def _make_stream_resp(self, status_code: int = 200, content=None, content_type="image/png"):
+        """构造 client.stream() 上下文管理器内的流式响应 mock。"""
         if content is None:
             content = base64.b64decode(_CONNECTION_TEST_PNG_BASE64)
-        response = unittest.mock.MagicMock()
-        response.status_code = status_code
-        response.headers = {}
+        r = unittest.mock.MagicMock()
+        r.status_code = status_code
+        r.headers = {}
         if content_type is not None:
-            response.headers["Content-Type"] = content_type
-        if location is not None:
-            response.headers["Location"] = location
-        response.iter_content.return_value = [content]
-        response.close = unittest.mock.MagicMock()
-        return response
+            r.headers["content-type"] = content_type
+        r.iter_bytes.return_value = iter([content])
+        # 使 r 自身可用作 `with client.stream(...) as resp:` 中的 resp
+        r.__enter__ = lambda s: s
+        r.__exit__ = unittest.mock.MagicMock(return_value=False)
+        return r
+
+    def _patch_client(self, get_resp, stream_resp=None):
+        """返回 (mock_cls, mock_client) 以 patch src.core.image_translator.httpx.Client。"""
+        mock_client = unittest.mock.MagicMock()
+        mock_client.get.return_value = get_resp
+        if stream_resp is not None:
+            mock_client.stream.return_value = stream_resp
+        mock_client.__enter__ = lambda s: s
+        mock_client.__exit__ = unittest.mock.MagicMock(return_value=False)
+        mock_cls = unittest.mock.MagicMock(return_value=mock_client)
+        return mock_cls, mock_client
+
+    # ── 正常下载 ──────────────────────────────────────────────────────────────
 
     def test_valid_https_download_succeeds(self):
         """合法 HTTPS + 可信 host + 正确 MIME 下载成功。"""
-        response = self._make_response()
-        with patch("src.core.image_translator.requests.get", return_value=response):
+        get_resp = self._make_get_resp(200)
+        stream_resp = self._make_stream_resp()
+        mock_cls, _ = self._patch_client(get_resp, stream_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             data = _safe_download_image("https://ark.volces.com/img.png")
         self.assertTrue(data.startswith(b"\x89PNG"))
 
+    # ── URL 校验（HTTP 请求前拦截）────────────────────────────────────────────
+
     def test_non_https_rejected(self):
-        """非 HTTPS 被拒绝，不发起请求。"""
-        with patch("src.core.image_translator.requests.get") as mock_get:
+        """非 HTTPS 被拒绝，不发起任何请求。"""
+        mock_cls = unittest.mock.MagicMock()
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             with self.assertRaises(ImageDownloadError) as ctx:
                 _safe_download_image("http://ark.volces.com/img.png")
         self.assertIn("HTTPS", str(ctx.exception))
-        mock_get.assert_not_called()
+        mock_cls.assert_not_called()
 
     def test_non_trusted_host_rejected(self):
         """非可信 host 被拒绝。"""
@@ -291,136 +314,119 @@ class SafeDownloadTests(unittest.TestCase):
             _safe_download_image("https://evil.com/img.png")
         self.assertIn("host", str(ctx.exception).lower())
 
+    # ── HTTP 状态码 ────────────────────────────────────────────────────────────
+
+    def test_http_error_status_rejected(self):
+        """HTTP 错误状态码（404）被拒绝。"""
+        get_resp = self._make_get_resp(404)
+        mock_cls, _ = self._patch_client(get_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
+            with self.assertRaises(ImageDownloadError) as ctx:
+                _safe_download_image("https://ark.volces.com/img.png")
+        self.assertIn("404", str(ctx.exception))
+
+    # ── 重定向 ────────────────────────────────────────────────────────────────
+
     def test_redirect_to_internal_rejected(self):
-        """重定向到内网被拒绝。"""
-        # 第一次返回 302 重定向到内网地址
-        redirect_response = self._make_response(
-            status_code=302, location="https://127.0.0.1/secret"
-        )
-        with patch(
-            "src.core.image_translator.requests.get",
-            return_value=redirect_response,
-        ):
+        """重定向到内网地址被拒绝。"""
+        get_resp = self._make_get_resp(302, location="https://127.0.0.1/secret")
+        mock_cls, _ = self._patch_client(get_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             with self.assertRaises(ImageDownloadError):
                 _safe_download_image("https://ark.volces.com/img.png")
 
     def test_redirect_to_non_trusted_host_rejected(self):
         """重定向到非可信 host 被拒绝。"""
-        redirect_response = self._make_response(status_code=302, location="https://evil.com/steal")
-        with patch(
-            "src.core.image_translator.requests.get",
-            return_value=redirect_response,
-        ):
+        get_resp = self._make_get_resp(302, location="https://evil.com/steal")
+        mock_cls, _ = self._patch_client(get_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             with self.assertRaises(ImageDownloadError):
                 _safe_download_image("https://ark.volces.com/img.png")
 
     def test_redirect_to_trusted_host_followed(self):
-        """重定向到可信 host 被跟随。"""
-        redirect_response = self._make_response(
-            status_code=302, location="https://cdn.byteimg.com/img.png"
-        )
-        final_response = self._make_response(status_code=200)
-        with patch(
-            "src.core.image_translator.requests.get",
-            side_effect=[redirect_response, final_response],
-        ):
+        """重定向到可信 host 被跟随并成功下载。"""
+        get_resp = self._make_get_resp(302, location="https://cdn.byteimg.com/img.png")
+        stream_resp = self._make_stream_resp()
+        mock_cls, _ = self._patch_client(get_resp, stream_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             data = _safe_download_image("https://ark.volces.com/img.png")
         self.assertTrue(data.startswith(b"\x89PNG"))
 
+    # ── 内容校验 ──────────────────────────────────────────────────────────────
+
     def test_oversized_file_rejected(self):
         """超大文件被拒绝。"""
-        # 构造超过 50MB 的流式响应
         big_chunk = b"\x89PNG\r\n\x1a\n" + b"\x00" * (51 * 1024 * 1024)
-        response = self._make_response(content=big_chunk)
-        with patch(
-            "src.core.image_translator.requests.get",
-            return_value=response,
-        ):
+        get_resp = self._make_get_resp(200)
+        stream_resp = self._make_stream_resp(content=big_chunk)
+        mock_cls, _ = self._patch_client(get_resp, stream_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             with self.assertRaises(ImageDownloadError) as ctx:
                 _safe_download_image("https://ark.volces.com/img.png")
         self.assertIn("最大字节数", str(ctx.exception))
 
     def test_wrong_content_type_rejected(self):
         """错误 Content-Type 被拒绝。"""
-        response = self._make_response(content_type="text/html")
-        with patch(
-            "src.core.image_translator.requests.get",
-            return_value=response,
-        ):
+        get_resp = self._make_get_resp(200)
+        stream_resp = self._make_stream_resp(content_type="text/html")
+        mock_cls, _ = self._patch_client(get_resp, stream_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             with self.assertRaises(ImageDownloadError) as ctx:
                 _safe_download_image("https://ark.volces.com/img.png")
         self.assertIn("Content-Type", str(ctx.exception))
 
     def test_invalid_magic_bytes_rejected(self):
         """无效魔数被拒绝（不盲信 Content-Type）。"""
-        # Content-Type 声称是 image/png，但内容是 HTML
-        response = self._make_response(
+        get_resp = self._make_get_resp(200)
+        stream_resp = self._make_stream_resp(
             content=b"<html><body>evil</body></html>",
             content_type="image/png",
         )
-        with patch(
-            "src.core.image_translator.requests.get",
-            return_value=response,
-        ):
+        mock_cls, _ = self._patch_client(get_resp, stream_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             with self.assertRaises(ImageDownloadError) as ctx:
                 _safe_download_image("https://ark.volces.com/img.png")
         self.assertIn("无法识别", str(ctx.exception))
 
     def test_jpeg_prefix_with_corrupt_payload_is_rejected(self):
-        """仅有 JPEG 开头的损坏响应不能再被保存为翻译结果。"""
-        response = self._make_response(
+        """仅有 JPEG 开头的损坏响应被拒绝。"""
+        get_resp = self._make_get_resp(200)
+        stream_resp = self._make_stream_resp(
             content=b"\xff\xd8not-a-decodable-jpeg",
             content_type="image/jpeg",
         )
-        with patch(
-            "src.core.image_translator.requests.get",
-            return_value=response,
-        ):
+        mock_cls, _ = self._patch_client(get_resp, stream_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             with self.assertRaises(ImageDownloadError) as ctx:
                 _safe_download_image("https://ark.volces.com/img.jpg")
         self.assertIn("无法解码", str(ctx.exception))
 
-    def test_http_error_status_rejected(self):
-        """HTTP 错误状态码被拒绝。"""
-        response = self._make_response(status_code=404)
-        with patch(
-            "src.core.image_translator.requests.get",
-            return_value=response,
-        ):
-            with self.assertRaises(ImageDownloadError) as ctx:
-                _safe_download_image("https://ark.volces.com/img.png")
-        self.assertIn("404", str(ctx.exception))
+    # ── httpx 语义校验 ────────────────────────────────────────────────────────
 
     def test_streaming_download_used(self):
-        """下载使用流式读取（iter_content）。"""
-        response = self._make_response()
-        with patch(
-            "src.core.image_translator.requests.get",
-            return_value=response,
-        ):
+        """下载使用流式读取（iter_bytes）。"""
+        get_resp = self._make_get_resp(200)
+        stream_resp = self._make_stream_resp()
+        mock_cls, _ = self._patch_client(get_resp, stream_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             _safe_download_image("https://ark.volces.com/img.png")
-        # 应调用 iter_content
-        response.iter_content.assert_called_once()
+        stream_resp.iter_bytes.assert_called_once()
 
     def test_no_auto_redirect(self):
-        """不使用自动重定向（allow_redirects=False）。"""
-        response = self._make_response()
-        with patch(
-            "src.core.image_translator.requests.get",
-            return_value=response,
-        ) as mock_get:
+        """下载时使用 follow_redirects=False。"""
+        get_resp = self._make_get_resp(200)
+        stream_resp = self._make_stream_resp()
+        mock_cls, _ = self._patch_client(get_resp, stream_resp)
+        with patch("src.core.image_translator.httpx.Client", mock_cls):
             _safe_download_image("https://ark.volces.com/img.png")
-        # 验证 allow_redirects=False
-        _, kwargs = mock_get.call_args
-        self.assertFalse(kwargs.get("allow_redirects", True))
+        _, kwargs = mock_cls.call_args
+        self.assertFalse(kwargs.get("follow_redirects", True))
 
     def test_error_message_does_not_leak_url(self):
         """错误消息不泄露完整 URL（避免敏感路径泄露）。"""
-        sensitive_url = "https://ark.volces.com/secret/path/with/credentials"
-        with self.assertRaises(ImageDownloadError) as ctx:
+        with self.assertRaises(ImageDownloadError):
             _validate_download_url("http://evil.com")
-        # 错误消息是通用的，不包含具体路径
-        # 这里主要验证非可信 host 的错误不包含敏感信息
+        # 测试 _validate_download_url 的错误不包含敏感信息
 
 
 class SvgTrustBoundaryTests(unittest.TestCase):

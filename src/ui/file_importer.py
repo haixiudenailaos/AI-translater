@@ -19,7 +19,10 @@ from ..application.document_session import (
 from ..application.translation_document import TranslationDocument
 from ..core.epub_processor import EpubImportCancelled
 from ..infrastructure.mapping_repository import resolve_mapping_file
+from ..utils.logger import get_logger
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
+
+logger = get_logger(__name__)
 
 
 class FileImporter:
@@ -42,7 +45,7 @@ class FileImporter:
         epub_processor,
         table_loader: Callable,
         status_updater: Callable,
-        image_translation_starter: Callable,
+        image_translation_starter: Callable[[], None] | None,
         confirm_replace_session: Callable[[], str] | None = None,
         confirm_stop_active_translation: Callable[[], bool] | None = None,
         document: TranslationDocument | None = None,
@@ -73,6 +76,7 @@ class FileImporter:
         self.table_loader = table_loader
         self.status_updater = status_updater
         self.image_translation_starter = image_translation_starter
+        self.is_dirty_callback: Callable[[], bool] | None = None
         self._confirm_replace_session = confirm_replace_session
         self._confirm_stop_active_translation = confirm_stop_active_translation
         self._document = document
@@ -93,7 +97,7 @@ class FileImporter:
             self._ui_pump.start()
         self._txt_import_busy = False
         self._txt_import_generation = 0
-        self._disabled_control_states: list[tuple[object, str]] = []
+        self._disabled_control_states: list[tuple[tk.Widget, str]] = []
 
     def close(self) -> None:
         """P1-1：关闭 UI 回调事件泵，释放 ``after`` 调度。
@@ -141,7 +145,7 @@ class FileImporter:
         委派给 MainWindow 提供的 ``is_dirty_callback``（构造后绑定），
         默认返回 ``False`` 以兼容早期测试替身。
         """
-        callback = getattr(self, "is_dirty_callback", None)
+        callback = self.is_dirty_callback
         if callback is None:
             return False
         return bool(callback())
@@ -278,6 +282,9 @@ class FileImporter:
 
         self._commit_session(result.session)
         target_path = result.session.target_path
+        if target_path is None:
+            logger.error("TXT import succeeded without a target path: %s", src_path)
+            return
         self.status_updater(f"已导入文件: {src_path.name}（译文文件：{target_path.name}）")
 
     def _build_txt_import_result(self, src_path: Path) -> ImportResult:
@@ -555,7 +562,7 @@ class FileImporter:
         states, self._disabled_control_states = self._disabled_control_states, []
         for widget, state in states:
             try:
-                widget.config(state=state)
+                widget.config({"state": state})
             except Exception:
                 continue
 
@@ -592,6 +599,9 @@ class FileImporter:
 
         self._commit_session(result.session)
         new_mapping_dir = result.session.mapping_dir
+        if new_mapping_dir is None:
+            logger.error("EPUB import succeeded without a mapping directory: %s", src_path)
+            return
         try:
             mapping_display = new_mapping_dir.relative_to(src_path.parent)
         except ValueError:
@@ -643,7 +653,7 @@ class FileImporter:
             "（需要配置火山引擎 API Key，可稍后通过「图片翻译」手动触发）",
         )
 
-        if do_translate:
+        if do_translate and self.image_translation_starter is not None:
             self.image_translation_starter()
 
     def import_clipboard(self):

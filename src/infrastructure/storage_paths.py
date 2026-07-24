@@ -5,7 +5,7 @@
 第一、二步：所有“缓存 / 翻译中间记录 / 译文备份 / 数据根目录”的最终路径
 只由本模块计算，UI、翻译队列和导出器不得各自拼接字符串。
 
-路径解析优先级（§3.3）::
+路径解析优先级（§3.3，独立子目录仅用于兼容旧配置）::
 
     显式子目录配置 > data_root 下的默认子目录 > 平台默认 AppPaths 目录
 
@@ -118,7 +118,7 @@ class ResolvedStoragePaths:
     def display_items(self) -> List[Tuple[str, str]]:
         """供设置页预览的（中文标签, 路径字符串）列表。"""
         items = [
-            ("数据根目录", str(self.data_root)),
+            ("统一缓存根目录", str(self.data_root)),
             ("缓存目录", str(self.cache_dir)),
             ("翻译中间记录目录", str(self.translation_records_dir)),
             ("译文备份目录", str(self.translation_backups_dir)),
@@ -164,7 +164,9 @@ class StoragePathResolver:
         cache_dir = self._resolve_subdir(
             cfg,
             "cache_dir",
-            fallback=data_root / DEFAULT_CACHE_SUBDIR if custom_root else Path(app.data_dir) / DEFAULT_CACHE_SUBDIR,
+            fallback=data_root / DEFAULT_CACHE_SUBDIR
+            if custom_root
+            else Path(app.data_dir) / DEFAULT_CACHE_SUBDIR,
         )
 
         records_raw = cfg["translation_records_dir"]
@@ -189,9 +191,7 @@ class StoragePathResolver:
         )
 
         logs_raw = cfg["logs_dir"]
-        logs_dir = (
-            self.normalize_user_path("logs_dir", logs_raw).resolve() if logs_raw else None
-        )
+        logs_dir = self.normalize_user_path("logs_dir", logs_raw).resolve() if logs_raw else None
 
         projects_dir = (records_dir / PROJECTS_SUBDIR).resolve()
         if records_raw or custom_root:

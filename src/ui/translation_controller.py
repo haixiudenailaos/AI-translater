@@ -83,6 +83,7 @@ class TranslationController:
         retranslate_btn=None,
         on_retranslated: Callable[[set[int]], None] | None = None,
         mode_toggle=None,
+        backup_dir: Path | str | None = None,
     ):
         self.root = root
         self.config_manager = config_manager
@@ -90,6 +91,9 @@ class TranslationController:
         self.file_handler = file_handler
         self.epub_processor = epub_processor
         self.translation_table = translation_table
+        # STORAGE-6：仅在组合根注入数据目录后启用文件级译文备份。旧的
+        # 测试/直接构造路径保持不创建备份文件。
+        self._backup_dir = Path(backup_dir).resolve() if backup_dir is not None else None
         self.progress_var = progress_var
         self.progress_bar = progress_bar
         self.start_btn = start_btn
@@ -1499,6 +1503,7 @@ class TranslationController:
                     return False  # 用户取消
                 used_save_as = True
 
+            self._backup_existing_output(Path(file_path))
             # BUG-006：write_file 现在使用原子写入，失败时抛出异常
             self.file_handler.write_file(file_path, translated_content)
             self.status_updater(f"译文已保存: {Path(file_path).name}")
@@ -1584,6 +1589,7 @@ class TranslationController:
                 build_content=lambda: "\n".join(target_snapshot),
                 save_mapping=save_mapping if mapping_dir else None,
                 on_success=on_success,
+                backup_existing=True,
             )
             return True
         except Exception as exc:
@@ -1653,6 +1659,27 @@ class TranslationController:
     def _export_is_running(self) -> bool:
         return self._export_job is not None and self._export_job.is_running
 
+    def _backup_existing_output(self, output_path: Path) -> None:
+        """在覆盖译文前把旧版本写入用户选择的备份目录。
+
+        首次导入 TXT 时应用会预创建一个空的 ``*_译文.txt``，该空文件不
+        应产生无意义的备份。备份失败时抛出异常并阻止覆盖，确保用户不会
+        在“已启用备份”的前提下静默丢失最后一个可恢复版本。
+        """
+        backup_dir = self._backup_dir
+        if backup_dir is None:
+            return
+        path = Path(output_path)
+        if not path.is_file() or path.stat().st_size == 0:
+            return
+        try:
+            backup_path = self.file_handler.backup_file(str(path), backup_dir=backup_dir)
+        except Exception as exc:  # noqa: BLE001 - 统一成可见的保存失败
+            raise RuntimeError(f"创建译文备份失败: {exc}") from exc
+        if not backup_path:
+            raise RuntimeError("创建译文备份失败，已取消覆盖原译文")
+        logger.info("已创建译文备份: %s", backup_path)
+
     def _start_text_export(
         self,
         *,
@@ -1661,12 +1688,14 @@ class TranslationController:
         build_content: Callable[[], str],
         save_mapping: Callable[[], None] | None = None,
         on_success: Callable[[], None] | None = None,
+        backup_existing: bool = False,
     ) -> None:
         job = TextExportJob(
             output_path=output_path,
             build_content=build_content,
             write_content=lambda path, content: self.file_handler.write_file(str(path), content),
             save_mapping=save_mapping,
+            backup_existing=self._backup_existing_output if backup_existing else None,
         )
         self._export_job = job
         self._export_kind = kind
@@ -1726,6 +1755,7 @@ class TranslationController:
                 output_path=Path(out_path),
                 save_mapping=save_mapping,
                 export_to=export_to,
+                backup_existing=self._backup_existing_output,
             )
             self._export_kind = "EPUB 导出"
             self._export_success_callback = None

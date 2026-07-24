@@ -1,4 +1,4 @@
-name: Build V1.6 Desktop Artifacts
+name: Build V1.6.1 Desktop Artifacts
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
 
 env:
   APP_NAME: LightNovelTranslator
-  APP_VERSION: "1.6"
+  APP_VERSION: "1.6.1"
   # Windows release builds consume the checked-in Python 3.10 hash lock.
   PYTHON_VERSION: "3.10"
   PYINSTALLER_VERSION: "6.11.1"
@@ -55,24 +55,14 @@ jobs:
         if: matrix.python-version == '3.12'
         run: python -m pytest --cov=src --cov-branch --cov-report=term-missing --cov-report=xml
 
-      # Block regressions in the transactional configuration, project
-      # persistence, and image request-boundary modules while legacy typing is
-      # migrated incrementally through the non-blocking full-repository report.
-      - name: Type check enforced core modules
+      # The repository is now type-clean. Keep the complete check blocking so
+      # new boundary violations cannot re-enter through legacy modules.
+      - name: Type check
         if: matrix.python-version == '3.12'
         run: >
           python -m pyright
           --pythonversion 3.12
           --pythonplatform Linux
-          src/config/config_manager.py
-          src/infrastructure/project_repository.py
-          src/core/image_translator.py
-      # Existing legacy annotations still produce errors. Keep the report
-      # visible on every PR while the blocking scope is expanded incrementally.
-      - name: Type check report
-        if: matrix.python-version == '3.12'
-        continue-on-error: true
-        run: python -m pyright --pythonversion 3.12 --pythonplatform Linux
 
       - name: Upload coverage report
         if: matrix.python-version == '3.12'
@@ -108,6 +98,7 @@ jobs:
           /tmp/ai-translater-wheel-smoke/bin/python -c "import src; import src.bootstrap; print('wheel-import-ok')"
 
   build-windows:
+    needs: quality
     runs-on: windows-latest
     steps:
       - name: Check out source
@@ -133,7 +124,7 @@ jobs:
       - name: Rename and validate executable
         shell: pwsh
         run: |
-          $source = "dist/LightNovelTranslatorV1.6.exe"
+          $source = "dist/LightNovelTranslatorV1.6.1.exe"
           if (-not (Test-Path $source)) {
             throw "PyInstaller did not produce the expected executable: $source"
           }
@@ -169,6 +160,7 @@ jobs:
           retention-days: 30
 
   build-macos:
+    needs: quality
     runs-on: macos-latest
     steps:
       - name: Check out source
@@ -192,7 +184,7 @@ jobs:
       - name: Assemble macOS application
         shell: bash
         run: |
-          BINARY="dist/LightNovelTranslatorV1.6"
+          BINARY="dist/LightNovelTranslatorV1.6.1"
           if [ ! -f "$BINARY" ]; then
             echo "PyInstaller did not produce the expected binary: $BINARY"
             exit 1
@@ -220,9 +212,9 @@ jobs:
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
-            <string>1.6</string>
+            <string>1.6.1</string>
             <key>CFBundleVersion</key>
-            <string>1.6</string>
+            <string>1.6.1</string>
             <key>LSMinimumSystemVersion</key>
             <string>11.0</string>
             <key>NSHighResolutionCapable</key>
@@ -244,13 +236,16 @@ jobs:
           retention-days: 30
 
   release:
-    name: Publish V1.6 release
+    name: Publish V1.6.1 release
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/V1.6'
     permissions:
       contents: write
     steps:
+      - name: Check out release metadata
+        uses: actions/checkout@v4
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -261,8 +256,9 @@ jobs:
       - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.6
+          tag_name: v1.6.1
           target_commitish: V1.6
-          name: LightNovelTranslator v1.6
-          generate_release_notes: true
+          name: LightNovelTranslator v1.6.1
+          body_path: docs/RELEASE_NOTES_1.6.1.md
+          generate_release_notes: false
           files: release-assets/*

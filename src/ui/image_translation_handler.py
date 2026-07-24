@@ -330,9 +330,13 @@ class ImageTranslationHandler:
         """Cancel the current detection/generation run."""
         self._cancel_event.set()
 
-    def _safe_after(self, callback: Callable[[], None]) -> None:
+    def _safe_after(self, callback: Callable[[], object]) -> None:
         if not self._closed:
-            self._ui_mailbox.submit(callback)
+
+            def run_callback() -> None:
+                callback()
+
+            self._ui_mailbox.submit(run_callback)
 
     def close(self, *, timeout_seconds: float = _CLOSE_TIMEOUT_SECONDS) -> None:
         """Cancel work and release HTTP clients within one deadline."""

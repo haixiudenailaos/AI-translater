@@ -13,6 +13,7 @@ EPUB spine 文档顺序模块
 - get_item_name / get_item_media_type：ebooklib item 辅助方法
 """
 
+from collections.abc import Mapping
 from typing import Iterator
 
 from ..utils.logger import get_logger
@@ -21,6 +22,20 @@ logger = get_logger(__name__)
 
 # EPUB 容器根前缀（仅移除一级，不递归）
 _CONTAINER_PREFIXES = ("oebps/", "epub/", "ops/")
+_GET_TYPE_ATTRIBUTE = "get_type"
+
+
+def _ebooklib_item_type(attribute_name: str) -> object:
+    """Read a runtime ebooklib item constant behind one stub boundary."""
+    import ebooklib
+
+    return getattr(ebooklib, attribute_name)
+
+
+def _get_item_type(item: object) -> object | None:
+    """Return an item's ebooklib type without assuming a concrete item class."""
+    getter = getattr(item, _GET_TYPE_ATTRIBUTE, None)
+    return getter() if callable(getter) else None
 
 
 def get_item_name(item) -> str:
@@ -99,7 +114,7 @@ def normalize_chapter_id(name: str) -> str:
     return n
 
 
-def iter_spine_documents(book) -> Iterator:
+def iter_spine_documents(book, item_by_id: Mapping[str, object] | None = None) -> Iterator:
     """按 spine 阅读顺序遍历文档项目。
 
     R2-BUG-001 修复：
@@ -109,11 +124,10 @@ def iter_spine_documents(book) -> Iterator:
     - 调用方应在 spine 非空但未产出任何文档时抛出异常，避免空内容映射。
 
     1. 遍历 book.spine
-    2. 解析 idref 并取得对应文档对象
+    2. 解析 idref 并取得对应文档对象（可复用调用方已建立的 item 索引）
     3. 跳过非线性（linear="no"）或不存在的项目
     """
-    import ebooklib
-
+    document_item_type = _ebooklib_item_type("ITEM_DOCUMENT")
     seen_ids = set()
     for item in book.spine:
         try:
@@ -136,15 +150,22 @@ def iter_spine_documents(book) -> Iterator:
             # 解析 idref 取得文档对象（兼容三种形态）
             doc_item = None
             if isinstance(itemref, str):
-                try:
-                    doc_item = book.get_item_with_id(itemref)
-                except (KeyError, AttributeError):
-                    doc_item = None
+                if item_by_id is not None:
+                    doc_item = item_by_id.get(itemref)
+                else:
+                    try:
+                        doc_item = book.get_item_with_id(itemref)
+                    except (KeyError, AttributeError):
+                        doc_item = None
             elif hasattr(itemref, "idref"):
-                try:
-                    doc_item = book.get_item_with_id(itemref.idref)
-                except (KeyError, AttributeError):
-                    doc_item = None
+                item_id = itemref.idref
+                if item_by_id is not None:
+                    doc_item = item_by_id.get(item_id)
+                else:
+                    try:
+                        doc_item = book.get_item_with_id(item_id)
+                    except (KeyError, AttributeError):
+                        doc_item = None
             elif hasattr(itemref, "get_type"):
                 doc_item = itemref
 
@@ -153,7 +174,7 @@ def iter_spine_documents(book) -> Iterator:
                 continue
 
             # 仅处理文档类型
-            if doc_item.get_type() != ebooklib.ITEM_DOCUMENT:
+            if _get_item_type(doc_item) != document_item_type:
                 continue
 
             # 去重（防止 spine 中重复 idref）

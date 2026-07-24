@@ -130,9 +130,9 @@ class TranslatorApp:
         status = interrupted.get("status", "")
         messagebox.showwarning(
             "数据迁移未完成",
-            "上次切换数据目录的迁移未完成（状态：%s）。\n\n"
+            f"上次切换数据目录的迁移未完成（状态：{status}）。\n\n"
             "当前仍使用旧目录，数据未丢失。可在 设置 → 数据与存储 中重新应用，"
-            "或手动删除新目录下的 .migration 文件夹。\n\n目标目录：%s" % (status, target),
+            f"或手动删除新目录下的 .migration 文件夹。\n\n目标目录：{target}",
             parent=self.root,
         )
 

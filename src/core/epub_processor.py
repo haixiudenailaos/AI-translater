@@ -10,12 +10,26 @@ EPUB解析与映射生成模块
 import base64
 import datetime
 import hashlib
+import importlib
 import json
 import logging
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Tuple
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypedDict,
+    cast,
+)
 from zipfile import BadZipFile, ZipFile
 
+from ..infrastructure.atomic_file import write_json_atomic as _write_json_atomic
 from ..infrastructure.document_order import (
     get_item_media_type as _get_item_media_type_impl,
 )
@@ -64,6 +78,50 @@ _MAX_EPUB_MEMBERS = 10_000
 _MAX_EPUB_MEMBER_BYTES = 64 * 1024 * 1024
 _MAX_EPUB_TOTAL_BYTES = 512 * 1024 * 1024
 _MAX_EPUB_COMPRESSION_RATIO = 1_000
+# Batch-C: lightweight cache manifest to avoid parsing full images.json on cache hit
+_IMPORT_CACHE_MANIFEST_FILE = "import_cache_manifest.json"
+
+
+class EpubFormatInfo(TypedDict):
+    """JSON-serializable metadata published together with an EPUB mapping."""
+
+    metadata: dict[str, object]
+    css_styles: dict[str, str]
+    spine_order: list[str]
+    toc_structure: list[dict[str, object]]
+    manifest_items: dict[str, dict[str, object]]
+
+
+class _EpubItem(Protocol):
+    """Small structural subset used by the EPUB import pipeline."""
+
+    def get_type(self) -> object: ...
+
+    def get_content(self) -> bytes: ...
+
+
+class _EpubBook(Protocol):
+    spine: Sequence[object]
+    toc: Iterable[object]
+
+    def get_items(self) -> Iterable[_EpubItem]: ...
+
+    def get_metadata(self, namespace: str, name: str) -> list[tuple[object, ...]]: ...
+
+    def get_item_with_id(self, item_id: str) -> _EpubItem | None: ...
+
+
+class _SoupNode(Protocol):
+    name: str | None
+
+    def find_all(self, *args: object, **kwargs: object) -> list["_SoupNode"]: ...
+
+    def get_text(self) -> str: ...
+
+
+def _runtime_dependency_symbol(module_name: str, attribute_name: str) -> object:
+    """Load a runtime-only third-party symbol behind one typed boundary."""
+    return getattr(importlib.import_module(module_name), attribute_name)
 
 
 class EpubArchiveValidationError(ValueError):
@@ -170,7 +228,9 @@ class EPUBProcessor:
 
     # ── BUG-007：按 spine 处理阅读顺序 ─────────────────
 
-    def iter_spine_documents(self, book) -> Iterator:
+    def iter_spine_documents(
+        self, book, item_by_id: Mapping[str, object] | None = None
+    ) -> Iterator:
         """按 spine 阅读顺序遍历文档项目（委托到 infrastructure.document_order）。
 
         R2-BUG-001 修复：
@@ -178,7 +238,7 @@ class EPUBProcessor:
         - 明确处理 linear="no"：非线性条目不在主阅读流中，跳过并记录 debug。
         - 调用方应在 spine 非空但未产出任何文档时抛出异常，避免空内容映射。
         """
-        yield from _iter_spine_documents_impl(book)
+        yield from _iter_spine_documents_impl(book, item_by_id)
 
     @staticmethod
     def _normalize_chapter_id(name: str) -> str:
@@ -213,23 +273,33 @@ class EPUBProcessor:
         """
         _raise_if_epub_import_cancelled(cancel_requested)
         try:
-            import ebooklib
-            from bs4 import BeautifulSoup
-            from ebooklib import epub
-        except ImportError:
+            # ebooklib and BeautifulSoup do not ship complete type information.
+            # Keep their dynamic API boundary here instead of leaking it through
+            # the mapping and persistence code below.
+            read_epub = cast(
+                Callable[[str], _EpubBook],
+                _runtime_dependency_symbol("ebooklib.epub", "read_epub"),
+            )
+            beautiful_soup = cast(
+                Callable[[str, str], _SoupNode],
+                _runtime_dependency_symbol("bs4", "BeautifulSoup"),
+            )
+            item_style_type = _runtime_dependency_symbol("ebooklib", "ITEM_STYLE")
+            item_image_type = _runtime_dependency_symbol("ebooklib", "ITEM_IMAGE")
+        except (ImportError, AttributeError):
             raise Exception("需要安装ebooklib和beautifulsoup4库来支持EPUB文件解析")
 
-        epub_path = Path(epub_path)
-        if not epub_path.exists() or epub_path.suffix.lower() != ".epub":
+        epub_path_obj = Path(epub_path)
+        if not epub_path_obj.exists() or epub_path_obj.suffix.lower() != ".epub":
             raise Exception("文件不存在或不是EPUB格式")
         if progress_callback is not None:
             progress_callback("正在检查 EPUB 文件...")
-        _validate_epub_archive(epub_path, cancel_requested=cancel_requested)
+        _validate_epub_archive(epub_path_obj, cancel_requested=cancel_requested)
         _raise_if_epub_import_cancelled(cancel_requested)
 
         # 为每个EPUB创建独立的映射子文件夹
         # BUG-003：使用稳定项目 ID（文件名+路径哈希），不同目录下同名 EPUB 生成不同工作区
-        project_id = self._compute_project_id(epub_path)
+        project_id = self._compute_project_id(epub_path_obj)
 
         # STORAGE-3：映射根目录由构造时注入（默认等于 workspace_dir/mappings）
         mapping_root = self._mappings_root
@@ -243,22 +313,21 @@ class EPUBProcessor:
         content_file = resolve_mapping_file(mapping_dir, "content_mapping.json")
         images_file = resolve_mapping_file(mapping_dir, "images.json")
         format_file = resolve_mapping_file(mapping_dir, "format_info.json")
-        if content_file.exists() and images_file.exists() and format_file.exists():
+        cache_manifest_file = mapping_dir / _IMPORT_CACHE_MANIFEST_FILE
+        # Batch-C: read only the lightweight manifest (no images.json parse on hit)
+        if (
+            content_file.exists()
+            and images_file.exists()
+            and format_file.exists()
+            and cache_manifest_file.exists()
+        ):
             try:
-                old_info = json.loads(content_file.read_text(encoding="utf-8"))
-                old_images = json.loads(images_file.read_text(encoding="utf-8"))
-                cached = old_info.get("project_info", {})
-                cached_images = old_images.get("image_mappings", {})
-                image_cache_compatible = old_images.get(
-                    "schema_version"
-                ) == IMAGE_MAPPING_SCHEMA_VERSION and all(
-                    bool(info.get("base64_data")) for info in cached_images.values()
-                )
-                stat = epub_path.stat()
+                manifest = json.loads(cache_manifest_file.read_text(encoding="utf-8"))
+                stat = epub_path_obj.stat()
                 if (
-                    cached.get("source_file_size") == stat.st_size
-                    and cached.get("source_file_mtime") == stat.st_mtime
-                    and image_cache_compatible
+                    manifest.get("source_file_size") == stat.st_size
+                    and manifest.get("source_file_mtime") == stat.st_mtime
+                    and manifest.get("schema_version") == IMAGE_MAPPING_SCHEMA_VERSION
                 ):
                     logger.info(
                         "[import_epub] 源文件未变化（size=%s, mtime=%s），跳过重解析",
@@ -278,13 +347,21 @@ class EPUBProcessor:
         if progress_callback is not None:
             progress_callback("正在读取 EPUB 结构...")
         # 读取书籍
-        book = epub.read_epub(str(epub_path))
+        book = read_epub(str(epub_path_obj))
         _raise_if_epub_import_cancelled(cancel_requested)
+
+        # P2-PERF-9：EPUB items 在 manifest、CSS 和图片阶段都会被使用。
+        # ebooklib 每次 ``get_items()`` 都会重新遍历内部容器；在大型 EPUB
+        # 中先建立一次索引可避免三次完整扫描，同时保留各阶段原有处理顺序。
+        all_items = tuple(book.get_items())
+        item_by_id = {
+            str(item_id): item for item in all_items if (item_id := getattr(item, "id", None))
+        }
 
         # 数据容器
         content_mappings: Dict[str, Dict] = {}
         images_mapping: Dict[str, Dict] = {}
-        format_info: Dict[str, Dict] = {
+        format_info: EpubFormatInfo = {
             "metadata": {},
             "css_styles": {},
             "spine_order": [],
@@ -295,7 +372,7 @@ class EPUBProcessor:
         # 元数据
         try:
             # 常见DC元数据
-            md = {}
+            md: dict[str, object] = {}
             for tag in [
                 "title",
                 "creator",
@@ -316,7 +393,7 @@ class EPUBProcessor:
         # 清点manifest与spine
         try:
             # manifest
-            for item in book.get_items():
+            for item in all_items:
                 _raise_if_epub_import_cancelled(cancel_requested)
                 try:
                     name = self._get_item_name(item)
@@ -358,9 +435,10 @@ class EPUBProcessor:
                         name = itemref
 
                     # 如果是对象，尝试从book.items中查找
-                    if not name and hasattr(itemref, "idref"):
+                    item_id = getattr(itemref, "idref", None)
+                    if not name and isinstance(item_id, str):
                         try:
-                            item_obj = book.get_item_with_id(itemref.idref)
+                            item_obj = book.get_item_with_id(item_id)
                             if item_obj:
                                 name = self._get_item_name(item_obj)
                         except (KeyError, AttributeError):
@@ -414,11 +492,9 @@ class EPUBProcessor:
 
         # 提取CSS样式
         try:
-            import ebooklib
-
-            for item in book.get_items():
+            for item in all_items:
                 _raise_if_epub_import_cancelled(cancel_requested)
-                if item.get_type() == ebooklib.ITEM_STYLE:
+                if item.get_type() == item_style_type:
                     name = self._get_item_name(item)
                     if name:
                         try:
@@ -491,7 +567,9 @@ class EPUBProcessor:
         # R2-BUG-001：记录 spine 是否非空（用于遍历后校验）
         spine_non_empty = len(book.spine) > 0
 
-        for chapter_index, doc_item in enumerate(self.iter_spine_documents(book), start=1):
+        for chapter_index, doc_item in enumerate(
+            self.iter_spine_documents(book, item_by_id), start=1
+        ):
             _raise_if_epub_import_cancelled(cancel_requested)
             if progress_callback is not None:
                 progress_callback(f"正在解析第 {chapter_index} 章...")
@@ -506,7 +584,7 @@ class EPUBProcessor:
 
             try:
                 html = doc_item.get_content().decode("utf-8", errors="ignore")
-                soup = BeautifulSoup(html, "html.parser")
+                soup = beautiful_soup(html, "html.parser")
 
                 block_index_in_chapter = 0  # BUG-003：章节内块索引，用于稳定定位符
 
@@ -638,14 +716,11 @@ class EPUBProcessor:
         # 图片Base64映射
         if extract_images:
             try:
-                import ebooklib
-
                 logger.debug("[import_epub] ====== 开始提取EPUB图片 ======")
                 print("📷 开始提取EPUB图片...")
                 image_count = 0
 
-                # PERF-007：单次遍历，合并计数和提取
-                all_items = list(book.get_items())
+                # P2-PERF-9：复用导入开始时建立的一次 item 索引。
                 total_items = len(all_items)
                 logger.debug("[import_epub] EPUB共有 %d 个item", total_items)
 
@@ -669,7 +744,7 @@ class EPUBProcessor:
 
                         # 检查是否是图片
                         is_image = False
-                        if item_type == ebooklib.ITEM_IMAGE:
+                        if item_type == item_image_type:
                             logger.debug(
                                 "[import_epub] item_type == ebooklib.ITEM_IMAGE，判定为图片"
                             )
@@ -738,11 +813,13 @@ class EPUBProcessor:
 
         project_info = {
             "project_id": project_id,  # BUG-003：稳定项目 ID
-            "original_file": str(epub_path),
-            "source_file_size": epub_path.stat().st_size if epub_path.exists() else 0,
-            "source_file_mtime": epub_path.stat().st_mtime if epub_path.exists() else 0,
+            "original_file": str(epub_path_obj),
+            "source_file_size": epub_path_obj.stat().st_size if epub_path_obj.exists() else 0,
+            "source_file_mtime": epub_path_obj.stat().st_mtime if epub_path_obj.exists() else 0,
             # R2-BUG-006：保存内容哈希，导出前验证源文件未变化
-            "source_content_hash": self._compute_file_hash(epub_path) if epub_path.exists() else "",
+            "source_content_hash": self._compute_file_hash(epub_path_obj)
+            if epub_path_obj.exists()
+            else "",
             "created_at": datetime.datetime.now().isoformat(),
             "updated_at": datetime.datetime.now().isoformat(),
         }
@@ -788,6 +865,21 @@ class EPUBProcessor:
         images_file = mapping_dir / "images.json"
         format_file = mapping_dir / "format_info.json"
         logger.debug("[import_epub] ====== mapping generation 发布完成 ======")
+        # Batch-C: write lightweight manifest for fast cache hit (avoids parsing images.json)
+        try:
+            _write_json_atomic(
+                mapping_dir / _IMPORT_CACHE_MANIFEST_FILE,
+                {
+                    "source_file_size": project_info["source_file_size"],
+                    "source_file_mtime": project_info["source_file_mtime"],
+                    "schema_version": IMAGE_MAPPING_SCHEMA_VERSION,
+                    "image_count": len(images_mapping),
+                },
+            )
+        except OSError as _cache_exc:
+            logger.warning(
+                "[import_epub] 写入 cache manifest 失败，下次导入将重解析: %s", _cache_exc
+            )
 
         result = {
             "mapping_dir": str(mapping_dir),
@@ -834,8 +926,8 @@ class EPUBProcessor:
         self,
         mapping_dir: str,
         output_path: str,
-        image_map: Dict[str, str] = None,
-        image_text_map: Dict[str, Dict] = None,
+        image_map: Dict[str, str] | None = None,
+        image_text_map: Dict[str, Dict[str, object]] | None = None,
     ) -> str:
         """根据mapping重建并导出EPUB（委托到 infrastructure.exporter）。
 

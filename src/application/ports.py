@@ -185,7 +185,7 @@ class ProjectRepository(Protocol):
         """
         ...
 
-    def list_recent(self, limit: int = 20) -> list[dict]:
+    def list_recent(self, limit: int = 20) -> list[dict[str, object]]:
         """列出最近打开的项目摘要，按最后打开时间倒序"""
         ...
 

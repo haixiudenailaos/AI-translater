@@ -11,6 +11,7 @@ API 抽象基类
 """
 
 import json
+import random
 import threading
 import time
 from contextlib import contextmanager
@@ -89,6 +90,9 @@ class BaseAPI:
             "request_seconds": 0.0,
         }
         self._rate_limit_pressure = 0.0
+        # Batch-D: hook fired on every retryable HTTP response, before retry delay.
+        # Installed by queue_scheduler to notify the shared ProviderLimiter early.
+        self._on_retryable_response: Callable[[int, float | None], None] | None = None
 
         # HTTP 连接池配置
         http_limits = config.get("http_limits", {})
@@ -130,9 +134,13 @@ class BaseAPI:
         self.enable_cache = config.get("enable_cache", False)
         if self.enable_cache:
             cc = config.get("cache_config", {})
+            if not isinstance(cc, dict):
+                cc = {}
             self.cache = SmartCache(
                 max_entries=cc.get("max_entries", cc.get("max_memory_size", 1000)),
                 ttl_hours=cc.get("ttl_hours", 24),
+                cache_dir=cc.get("cache_dir"),
+                namespace=f"{config.get('provider', '')}:{config.get('model_name', '')}",
             )
         else:
             self.cache = None
@@ -342,7 +350,7 @@ class BaseAPI:
             return None
         return self._direct_translate(text)
 
-    def _direct_translate(self, text: str, context: Dict[str, Any] = None) -> str | None:
+    def _direct_translate(self, text: str, context: Dict[str, Any] | None = None) -> str | None:
         if not self.api_key:
             logger.warning("API密钥为空")
             return None
@@ -410,7 +418,10 @@ class BaseAPI:
                     return min(30.0, max(0.0, float(retry_after)))
                 except ValueError:
                     pass
-        return min(20.0, self._retry_base_delay * (2**attempt))
+        base = min(20.0, self._retry_base_delay * (2**attempt))
+        # Batch-D: ±10% jitter prevents thundering-herd retry synchronisation
+        jitter = random.uniform(-0.1, 0.1) * base
+        return max(0.0, base + jitter)
 
     def _record_attempt(self, input_tokens: int) -> None:
         with self._metrics_lock:
@@ -456,7 +467,22 @@ class BaseAPI:
             pressure = self._rate_limit_pressure
         return max(512, int(configured * 0.75)) if pressure >= 0.5 else configured
 
-    def translate_stream(self, text: str, callback=None, system_prompt: str = None) -> str | None:
+    def set_on_retryable_response(self, hook: Callable[[int, float | None], None] | None) -> None:
+        """Batch-D: Set a hook called on every retryable HTTP response.
+
+        Called BEFORE the internal retry delay with
+        ``(status_code: int, retry_after_seconds: float | None)``.
+        ``status_code == 0`` means a network/timeout exception (no HTTP status).
+        Pass ``None`` to clear.
+        """
+        self._on_retryable_response = hook
+
+    def translate_stream(
+        self,
+        text: str,
+        callback: Callable[[str], None] | None = None,
+        system_prompt: str | None = None,
+    ) -> str | None:
         if self._cancel_event.is_set():
             return None
 
@@ -498,6 +524,20 @@ class BaseAPI:
                                 and attempt < self._max_attempts - 1
                             ):
                                 self._record_retry(rate_limited=rate_limited)
+                                # Batch-D: notify shared limiter before sleep
+                                _hook = self._on_retryable_response
+                                if _hook is not None:
+                                    _ra_raw = response.headers.get("retry-after")
+                                    _ra: float | None = None
+                                    if _ra_raw:
+                                        try:
+                                            _ra = max(0.0, min(60.0, float(_ra_raw)))
+                                        except ValueError:
+                                            pass
+                                    try:
+                                        _hook(status_code, _ra)
+                                    except Exception:
+                                        pass
                                 delay = self._retry_delay(attempt, response)
                                 logger.warning(
                                     "流式请求失败 (HTTP %s)，%.1f 秒后重试 (%s/%s)",
@@ -572,6 +612,13 @@ class BaseAPI:
                 # 已产生内容时不重试，避免把同一批译文重复回放到 UI。
                 if not content_parts and attempt < self._max_attempts - 1:
                     self._record_retry()
+                    # Batch-D: notify shared limiter (status_code=0 means timeout/network)
+                    _net_hook = self._on_retryable_response
+                    if _net_hook is not None:
+                        try:
+                            _net_hook(0, None)
+                        except Exception:
+                            pass
                     self._recreate_client_if_safe()
                     delay = self._retry_delay(attempt)
                     logger.warning(
@@ -609,7 +656,11 @@ class BaseAPI:
     # ── 视觉查询 ────────────────────────────────────────
 
     def vision_query(
-        self, image_base64: str, mime_type: str, prompt: str, model_override: str = None
+        self,
+        image_base64: str,
+        mime_type: str,
+        prompt: str,
+        model_override: str | None = None,
     ) -> str | None:
         if not self.api_key:
             logger.warning("API密钥为空")
@@ -662,7 +713,7 @@ class BaseAPI:
 
     # ── 缓存辅助 ──────────────────────────────────────
 
-    def translate_with_cache(self, text: str, context: Dict[str, Any] = None) -> str | None:
+    def translate_with_cache(self, text: str, context: Dict[str, Any] | None = None) -> str | None:
         if self.cache:
             cached = self.cache.get(text, context)
             if cached:
@@ -675,10 +726,10 @@ class BaseAPI:
     def translate_stream_enhanced(
         self,
         text: str,
-        callback: Callable[[str], None] = None,
-        context: Dict[str, Any] = None,
-        stream_id: str = None,
-        system_prompt: str = None,
+        callback: Callable[[str], None] | None = None,
+        context: Dict[str, Any] | None = None,
+        stream_id: str | None = None,
+        system_prompt: str | None = None,
     ) -> str | None:
         if not self.enable_stream:
             direct_context = dict(context or {})

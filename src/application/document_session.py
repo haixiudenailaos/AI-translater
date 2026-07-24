@@ -153,7 +153,9 @@ class ImportResult:
         """面向用户的错误消息。"""
         if self.succeeded:
             return ""
-        prefix = {
+        if self.failure_kind is None:
+            return self.error_message or "Import failed"
+        prefix: str = {
             ImportFailure.SOURCE_READ_FAILED: "无法读取源文件",
             ImportFailure.TARGET_READ_FAILED: "无法读取已有译文文件",
             ImportFailure.TARGET_NOT_WRITABLE: "无法创建译文文件",

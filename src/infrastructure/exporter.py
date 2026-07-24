@@ -17,6 +17,7 @@ EPUB 导出协调模块
 """
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -47,6 +48,19 @@ from .segment_extractor import (
 )
 
 logger = get_logger(__name__)
+_BEAUTIFUL_SOUP_ATTRIBUTE = "BeautifulSoup"
+_READ_EPUB_ATTRIBUTE = "read_epub"
+_WRITE_EPUB_ATTRIBUTE = "write_epub"
+
+
+def _mapping_int(value: object, *, default: int) -> int:
+    """Safely recover integer ordering fields from persisted JSON."""
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 class SegmentCountMismatchError(Exception):
@@ -93,8 +107,10 @@ def export_epub(
         Exception: 缺少必要文件或依赖
     """
     try:
-        from bs4 import BeautifulSoup
-        from ebooklib import epub
+        epub_module = importlib.import_module("ebooklib.epub")
+        beautiful_soup = getattr(importlib.import_module("bs4"), _BEAUTIFUL_SOUP_ATTRIBUTE)
+        read_epub = getattr(epub_module, _READ_EPUB_ATTRIBUTE)
+        write_epub = getattr(epub_module, _WRITE_EPUB_ATTRIBUTE)
     except ImportError:
         raise Exception("需要安装ebooklib和beautifulsoup4库来支持EPUB导出")
 
@@ -114,7 +130,7 @@ def export_epub(
     _verify_source_fingerprint(project_info, Path(original_file))
 
     # 加载原书以保留结构
-    book = epub.read_epub(str(original_file))
+    book = read_epub(str(original_file))
     _configure_single_page_pagination(book, project_info, Path(original_file))
 
     # PERF-007：收集 spine 文档列表，避免多次遍历生成器
@@ -145,8 +161,8 @@ def export_epub(
     for item in spine_docs:
         doc_name = get_item_name(item)
         html = get_document_content(item).decode("utf-8", errors="ignore")
-        mapping_soup = BeautifulSoup(html, "html.parser")
-        soup = BeautifulSoup(html, "xml")
+        mapping_soup = beautiful_soup(html, "html.parser")
+        soup = beautiful_soup(html, "xml")
         mapping_blocks = _collect_text_blocks(mapping_soup)
         output_blocks = _collect_text_blocks(soup)
         if len(mapping_blocks) != len(output_blocks):
@@ -235,8 +251,8 @@ def export_epub(
     # 写出 EPUB
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    _ensure_toc_link_ids(book, epub)
-    epub.write_epub(str(out_path), book)
+    _ensure_toc_link_ids(book, epub_module)
+    write_epub(str(out_path), book)
     _enforce_single_page_spine(out_path)
     return str(out_path)
 
@@ -432,10 +448,11 @@ def _index_records_by_chapter(records: list[dict]) -> dict[str, list[dict]]:
         result.setdefault(chapter_id, []).append(record)
     for chapter_records in result.values():
         chapter_records.sort(
-            key=lambda record: int(
+            key=lambda record: _mapping_int(
                 record.get("block_index")
                 if record.get("block_index") is not None
-                else record.get("line_number", 0)
+                else record.get("line_number", 0),
+                default=0,
             )
         )
     return result

@@ -15,6 +15,7 @@ EPUB 图片重写模块
 """
 
 import hashlib
+import importlib
 import io
 import posixpath
 import xml.etree.ElementTree as ElementTree
@@ -35,6 +36,11 @@ _MEDIA_TYPE_EXTENSIONS = {
     "image/svg+xml": ".svg",
     "image/webp": ".webp",
 }
+_BEAUTIFUL_SOUP_ATTRIBUTE = "BeautifulSoup"
+_EPUB_ATTRIBUTE = "epub"
+_EPUB_IMAGE_ATTRIBUTE = "EpubImage"
+_ITEM_DOCUMENT_ATTRIBUTE = "ITEM_DOCUMENT"
+_PIL_IMAGE_ATTRIBUTE = "Image"
 
 
 def get_document_content(item) -> bytes:
@@ -176,7 +182,7 @@ def add_translated_images(
         - path_mapping: {original_epub_path: new_epub_path} 成功添加的图片
         - failed_count: 添加失败的图片数量（用于诊断和警告）
     """
-    from ebooklib import epub
+    epub = getattr(importlib.import_module("ebooklib"), _EPUB_ATTRIBUTE)
 
     path_mapping: Dict[str, str] = {}
     failed_images: list[tuple[str, str, str]] = []
@@ -226,7 +232,8 @@ def add_translated_images(
             # 不同目录同名文件会产生重复 UID，导致 manifest 冲突。
             new_id = _generate_image_uid(orig_path)
 
-            img_item = epub.EpubImage(
+            image_item_factory = getattr(epub, _EPUB_IMAGE_ATTRIBUTE)
+            img_item = image_item_factory(
                 uid=new_id,
                 file_name=new_epub_path,
                 media_type=media_type,
@@ -369,7 +376,7 @@ def _prepare_replacement_image(data: bytes) -> tuple[bytes | None, str | None, s
         return data, media_type, ""
 
     try:
-        from PIL import Image
+        Image = getattr(importlib.import_module("PIL"), _PIL_IMAGE_ATTRIBUTE)
     except ImportError:
         if media_type is None:
             return None, None, "无法识别结果图片格式"
@@ -481,18 +488,18 @@ def rewrite_image_references(
         skip_names: PERF-007：需跳过的文档名集合（已在导出循环中合并处理，
                     避免 spine 文档被双重 DOM 解析）。
     """
-    import ebooklib
-    from bs4 import BeautifulSoup
+    beautiful_soup = getattr(importlib.import_module("bs4"), _BEAUTIFUL_SOUP_ATTRIBUTE)
+    document_item_type = getattr(importlib.import_module("ebooklib"), _ITEM_DOCUMENT_ATTRIBUTE)
 
     for item in book.get_items():
-        if item.get_type() != ebooklib.ITEM_DOCUMENT:
+        if item.get_type() != document_item_type:
             continue
         doc_name = item.get_name()
         if skip_names and doc_name in skip_names:
             continue  # PERF-007：已在导出循环中处理
         try:
             content = get_document_content(item).decode("utf-8", errors="ignore")
-            soup = BeautifulSoup(content, "xml")
+            soup = beautiful_soup(content, "xml")
             modified = False
 
             doc_path = Path(doc_name)

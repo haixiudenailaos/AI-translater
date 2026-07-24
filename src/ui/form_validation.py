@@ -186,10 +186,11 @@ class FormValidator:
         except (tk.TclError, AttributeError):
             return
         clamped = clamp_int(current, spec.lo, spec.hi, default=spec.lo)
-        try:
-            spec.var.set(clamped)
-        except (tk.TclError, AttributeError):
-            pass
+        if isinstance(spec.var, tk.IntVar):
+            try:
+                spec.var.set(clamped)
+            except tk.TclError:
+                pass
 
     def attach_focus_out_clamp(self, spec: FieldSpec) -> None:
         """为字段绑定 ``<FocusOut>`` 自动 clamp + 即时校验。
@@ -204,9 +205,12 @@ class FormValidator:
         def _on_focus_out(_event: tk.Event) -> None:
             self.clamp_field(spec)
 
+        binder = getattr(widget, "bind", None)
+        if not callable(binder):
+            return
         try:
-            widget.bind("<FocusOut>", _on_focus_out, add="+")
-        except (tk.TclError, AttributeError):
+            binder("<FocusOut>", _on_focus_out, add="+")
+        except tk.TclError:
             pass
 
 

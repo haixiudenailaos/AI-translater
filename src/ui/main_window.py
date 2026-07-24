@@ -9,6 +9,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
+from typing import cast
 
 from ..application.autosave import (
     CLEAN,
@@ -41,6 +42,26 @@ from .translation_table_adapter import TranslationTableAdapter
 logger = get_logger(__name__)
 
 
+class _LazyTextFileWriter:
+    """Preserve lazy startup while exposing the autosave worker's typed dependency."""
+
+    def __init__(self, service: LazyService) -> None:
+        self._service = service
+
+    def write_file(self, file_path: str, content: str) -> object:
+        return self._service.get().write_file(file_path, content)
+
+
+class _LazyEpubTranslationWriter:
+    """Resolve the EPUB service only when an autosave needs to persist a mapping."""
+
+    def __init__(self, service: LazyService) -> None:
+        self._service = service
+
+    def save_translations(self, mapping_dir: str, translated_lines: list[str]) -> None:
+        self._service.get().save_translations(mapping_dir, translated_lines)
+
+
 class MainWindow:
     def __init__(self, root, config_manager, app_paths=None, *, storage_paths=None):
         self.root = root
@@ -57,6 +78,7 @@ class MainWindow:
             "TranslatorEngine",
             config_manager,
             limiter_registry=self._provider_limiter_registry,
+            cache_dir=(storage_paths.cache_dir if storage_paths is not None else None),
         )
         self.file_handler = LazyService("src.utils.file_handler", "FileHandler")
         self.epub_processor = LazyService(
@@ -174,6 +196,9 @@ class MainWindow:
             on_run_terminal=self._record_translation_usage,
             on_retranslated=self._on_rows_retranslated,
             mode_toggle=self.small_model_mode_btn,
+            backup_dir=(
+                storage_paths.translation_backups_dir if storage_paths is not None else None
+            ),
         )
 
         # PERF §8：自动保存协调器（generation 状态机 + 单飞 + debounce）。
@@ -181,8 +206,8 @@ class MainWindow:
         # cancel_callback 用于实际取消已调度的 debounce/max_delay 回调（§8 D-1）。
         self._autosave = AutosaveCoordinator(
             document=self._document,
-            file_handler=self.file_handler,
-            epub_processor=self.epub_processor,
+            file_handler=_LazyTextFileWriter(self.file_handler),
+            epub_processor=_LazyEpubTranslationWriter(self.epub_processor),
             schedule_callback=self.root.after,
             result_callback=self._on_save_result,
             cancel_callback=self.root.after_cancel,
@@ -1326,9 +1351,13 @@ class MainWindow:
             menu_state = tk.NORMAL if is_epub else tk.DISABLED
             if hasattr(self, "export_epub_btn"):
                 self.export_epub_btn.config(state=menu_state)
-            self.more_actions_menu.entryconfigure(self._epub_action_index, state=menu_state)
+            if self._epub_action_index is not None:
+                self.more_actions_menu.entryconfigure(self._epub_action_index, state=menu_state)
             image_state = tk.DISABLED if self._image_translation_busy else menu_state
-            self.more_actions_menu.entryconfigure(self._ai_image_action_index, state=image_state)
+            if self._ai_image_action_index is not None:
+                self.more_actions_menu.entryconfigure(
+                    self._ai_image_action_index, state=image_state
+                )
         if hasattr(self, "ai_image_translate_btn"):
             image_state = tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
             self.ai_image_translate_btn.config(state=image_state)
@@ -1336,9 +1365,10 @@ class MainWindow:
             project_image_state = (
                 tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
             )
-            self.project_menu.entryconfigure(
-                self._project_ai_image_action_index, state=project_image_state
-            )
+            if self._project_ai_image_action_index is not None:
+                self.project_menu.entryconfigure(
+                    self._project_ai_image_action_index, state=project_image_state
+                )
         if hasattr(self, "task_summary_label"):
             self.task_summary_label.config(text=f"待翻译 {pending} · 已完成 {completed}")
 
@@ -1612,8 +1642,13 @@ class MainWindow:
                     TaskStatus.PAUSED,
                     TaskStatus.PARTIAL,
                 }
-                for task in manager.get_all_tasks():
-                    if task.status in unfinished:
+                summary_getter = getattr(manager, "get_task_summaries", None)
+                tasks = cast(
+                    list[object],
+                    summary_getter() if callable(summary_getter) else manager.get_all_tasks(),
+                )
+                for task in tasks:
+                    if getattr(task, "status", None) in unfinished:
                         return True
             except Exception:  # noqa: BLE001 - 查询失败按无任务处理
                 pass

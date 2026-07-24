@@ -113,7 +113,7 @@ class TableCellEditor:
         由调用方（MainWindow._on_cell_edited）负责更新 Treeview 和 TranslationDocument，
         确保模型与视图保持一致。
         """
-        if not self.edit_entry or not self.editing_item:
+        if not self.edit_entry or not self.editing_item or self.editing_column is None:
             return
 
         new_value = self.edit_entry.get()

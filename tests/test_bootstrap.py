@@ -72,8 +72,8 @@ class TestStorageWiring:
 
     def test_custom_data_root_honored(self, tmp_path, monkeypatch):
         """STORAGE-3：配置中的 data_root 在组合根装配后生效"""
-        from src.config.config_manager import ConfigManager
         from src.app_paths import AppPaths
+        from src.config.config_manager import ConfigManager
         from src.infrastructure.keyring_secret_store import KeyringSecretStore
 
         monkeypatch.setenv("AI_TRANSLATOR_CONFIG_DIR", str(tmp_path / "config"))
@@ -83,21 +83,20 @@ class TestStorageWiring:
         # 先写入自定义 storage 配置
         seed_paths = AppPaths.create()
         seed_config = ConfigManager(app_paths=seed_paths, secret_store=KeyringSecretStore())
-        assert seed_config.update_storage_config(
-            {"data_root": str(tmp_path / "custom_root")}
-        )
+        assert seed_config.update_storage_config({"data_root": str(tmp_path / "custom_root")})
 
         ctx = create_app_context()
         assert ctx.storage_paths.data_root == (tmp_path / "custom_root").resolve()
-        assert ctx.storage_paths.projects_dir == (
-            tmp_path / "custom_root" / "translation_records" / "projects"
-        ).resolve()
+        assert (
+            ctx.storage_paths.projects_dir
+            == (tmp_path / "custom_root" / "translation_records" / "projects").resolve()
+        )
         assert ctx.storage_paths.projects_dir.is_dir()
 
     def test_broken_storage_config_falls_back_to_default(self, tmp_path, monkeypatch):
         """磁盘状态恶化（目标在文件之下）时回退默认目录，启动不崩溃"""
-        from src.config.config_manager import ConfigManager
         from src.app_paths import AppPaths
+        from src.config.config_manager import ConfigManager
         from src.infrastructure.keyring_secret_store import KeyringSecretStore
 
         monkeypatch.setenv("AI_TRANSLATOR_CONFIG_DIR", str(tmp_path / "config"))
@@ -115,3 +114,28 @@ class TestStorageWiring:
         # 回退到平台默认目录
         assert ctx.storage_paths.is_default is True
         assert ctx.storage_paths.projects_dir.is_dir()
+
+    def test_invalid_storage_directory_conflict_falls_back_to_default(self, tmp_path, monkeypatch):
+        """手工编辑配置造成目录重合时，启动不能绕过设置页校验。"""
+        from src.app_paths import AppPaths
+        from src.config.config_manager import ConfigManager
+        from src.infrastructure.keyring_secret_store import KeyringSecretStore
+
+        monkeypatch.setenv("AI_TRANSLATOR_CONFIG_DIR", str(tmp_path / "config"))
+        monkeypatch.setenv("AI_TRANSLATOR_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("AI_TRANSLATOR_LOG_DIR", str(tmp_path / "logs"))
+
+        seed_paths = AppPaths.create()
+        seed_config = ConfigManager(app_paths=seed_paths, secret_store=KeyringSecretStore())
+        same_dir = tmp_path / "same"
+        assert seed_config.update_storage_config(
+            {
+                "cache_dir": str(same_dir),
+                "translation_backups_dir": str(same_dir),
+            }
+        )
+
+        ctx = create_app_context()
+
+        assert ctx.storage_paths.is_default is True
+        assert ctx.storage_paths.cache_dir != same_dir.resolve()

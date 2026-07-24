@@ -2,7 +2,6 @@
 """Application composition root."""
 
 from dataclasses import dataclass
-from typing import Optional
 
 from .app_paths import AppPaths
 from .config.config_manager import ConfigManager
@@ -28,9 +27,9 @@ class AppContext:
     secret_store: KeyringSecretStore
     storage_paths: ResolvedStoragePaths
     storage_resolver: StoragePathResolver
-    backup_repository: Optional[BackupRepository]
+    backup_repository: BackupRepository | None
     #: 启动时检测到的中断迁移清单（无则 None），供主窗口提示用户。
-    interrupted_migration: Optional[dict]
+    interrupted_migration: dict | None
 
 
 def _resolve_storage_paths(
@@ -50,11 +49,17 @@ def _resolve_storage_paths(
     try:
         resolved = resolver.resolve(storage)
         issues = resolver.validate(resolved)
+        errors = [issue for issue in issues if issue.is_error]
         for issue in issues:
             if issue.is_error:
                 logger.error("数据目录配置存在问题 [%s]: %s", issue.field, issue.message)
             else:
                 logger.warning("数据目录提示 [%s]: %s", issue.field, issue.message)
+        # 配置可能由旧版本、手工编辑或损坏文件写入，不能因为绕过设置页
+        # 就让“缓存/记录/备份目录重合”等错误配置在启动时继续生效。
+        if errors:
+            first = errors[0]
+            raise StoragePathError(first.field, first.path, first.message)
         resolver.ensure_directories(resolved)
         return resolved
     except StoragePathError as exc:

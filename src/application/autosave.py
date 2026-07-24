@@ -21,13 +21,32 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from queue import SimpleQueue
-from typing import Callable
+from queue import Empty, SimpleQueue
+from typing import Callable, Protocol
 
 from ..utils.logger import get_logger
 from .translation_document import TranslationDocument
 
 logger = get_logger(__name__)
+
+
+ScheduledCallback = Callable[[], None]
+ScheduleCallback = Callable[[int, ScheduledCallback], str]
+CancelCallback = Callable[[str], None]
+
+
+class TextFileWriter(Protocol):
+    """The persistence surface required by the autosave worker."""
+
+    def write_file(self, file_path: str, content: str) -> object:
+        """Persist text or raise an exception when the write fails."""
+
+
+class EpubTranslationWriter(Protocol):
+    """The EPUB mapping persistence surface required by the autosave worker."""
+
+    def save_translations(self, mapping_dir: str, translated_lines: list[str]) -> None:
+        """Persist the translated mapping or raise an exception."""
 
 
 # ── 不可变数据结构 ──────────────────────────────────────
@@ -104,11 +123,11 @@ class AutosaveCoordinator:
     def __init__(
         self,
         document: TranslationDocument,
-        file_handler,
-        epub_processor,
-        schedule_callback: Callable[[int, Callable], object],
+        file_handler: TextFileWriter,
+        epub_processor: EpubTranslationWriter,
+        schedule_callback: ScheduleCallback,
         result_callback: Callable[[SaveResult], None],
-        cancel_callback: Callable[[object], None] | None = None,
+        cancel_callback: CancelCallback | None = None,
     ) -> None:
         self._document = document
         self._file_handler = file_handler
@@ -135,6 +154,8 @@ class AutosaveCoordinator:
         # 让 _handle_result / _drain_result_inline 完成后强制置 CLEAN
         # 而非 DIRTY（即使 generation 落后），不再调度新保存
         self._discard_after_save: bool = False
+        self._target_path: Path | None = None
+        self._mapping_dir: Path | None = None
 
     @property
     def state(self) -> str:
@@ -342,8 +363,8 @@ class AutosaveCoordinator:
         # 获取目标路径和映射目录
         # 这些由调用方通过 callable 提供，这里通过 file_handler 获取
         # 实际路径由 MainWindow 在 mark_dirty 前确保 file_importer.current_target_path 有效
-        target_path = getattr(self, "_target_path", None)
-        mapping_dir = getattr(self, "_mapping_dir", None)
+        target_path = self._target_path
+        mapping_dir = self._mapping_dir
         if target_path is None:
             return
 
@@ -351,8 +372,8 @@ class AutosaveCoordinator:
         generation, target_lines = self._document.snapshot_targets()
         snapshot = SaveSnapshot(
             generation=generation,
-            target_path=Path(str(target_path)),
-            mapping_dir=Path(str(mapping_dir)) if mapping_dir else None,
+            target_path=target_path,
+            mapping_dir=mapping_dir,
             target_lines=target_lines,
         )
 
@@ -370,10 +391,10 @@ class AutosaveCoordinator:
         if begin_polling:
             self._poll_result()
 
-    def set_save_paths(self, target_path, mapping_dir) -> None:
+    def set_save_paths(self, target_path: Path | str, mapping_dir: Path | str | None) -> None:
         """设置保存路径（MainWindow 在导入文件后调用）。"""
-        self._target_path = target_path
-        self._mapping_dir = mapping_dir
+        self._target_path = Path(target_path)
+        self._mapping_dir = Path(mapping_dir) if mapping_dir is not None else None
 
     # ── 主线程：轮询结果 ─────────────────────────────────
 
@@ -383,7 +404,7 @@ class AutosaveCoordinator:
             return
         try:
             result = self._result_queue.get_nowait()
-        except Exception:
+        except Empty:
             # 队列为空，继续轮询
             self._poll_after_id = self._schedule(50, self._poll_result)
             return
@@ -450,7 +471,7 @@ class AutosaveCoordinator:
         """
         try:
             result = self._result_queue.get_nowait()
-        except Exception:
+        except Empty:
             return False
         self._flush_event.set()
         # P0-1：discard_pending 等待的保存完成：强制置 CLEAN，不调度新保存

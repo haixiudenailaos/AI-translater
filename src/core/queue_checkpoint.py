@@ -100,7 +100,7 @@ class CheckpointCoordinator:
         task_id: str,
         *,
         debounce_seconds: float = _DEBOUNCE_SECONDS,
-        clock: callable = time.monotonic,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._task_id = task_id
         self._debounce = max(0.0, float(debounce_seconds))
@@ -417,7 +417,7 @@ class ExclusiveWriteLockRegistry:
 
     def try_acquire(self, key: str) -> bool:
         """尝试获取指定 key 的写锁。成功返回 True；已被占用返回 False。"""
-        entry: _WriteLockEntry
+        entry: _WriteLockEntry | None
         with self._registry_lock:
             entry = self._entries.get(key)
             if entry is None:

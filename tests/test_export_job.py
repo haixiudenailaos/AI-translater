@@ -118,6 +118,51 @@ def test_text_export_builds_and_publishes_from_a_worker(tmp_path):
     assert not list(tmp_path.glob(".*.tmp.txt"))
 
 
+def test_text_export_backs_up_existing_output_before_replacement(tmp_path):
+    output = tmp_path / "translation.txt"
+    output.write_text("old-output", encoding="utf-8")
+    backups: list[tuple[Path, str]] = []
+
+    def backup_existing(path: Path) -> None:
+        backups.append((path, path.read_text(encoding="utf-8")))
+
+    job = TextExportJob(
+        output_path=output,
+        build_content=lambda: "new-output",
+        write_content=lambda path, content: path.write_text(content, encoding="utf-8"),
+        backup_existing=backup_existing,
+    )
+    job.start()
+
+    result = _wait_for_result(job)
+
+    assert result.succeeded
+    assert backups == [(output, "old-output")]
+    assert output.read_text(encoding="utf-8") == "new-output"
+
+
+def test_epub_export_does_not_replace_output_when_backup_fails(tmp_path):
+    output = tmp_path / "book.epub"
+    output.write_bytes(b"old-output")
+
+    def backup_fails(_path: Path) -> None:
+        raise OSError("backup disk full")
+
+    job = ExportJob(
+        output_path=output,
+        save_mapping=lambda: None,
+        export_to=_write_epub,
+        backup_existing=backup_fails,
+    )
+    job.start()
+
+    result = _wait_for_result(job)
+
+    assert not result.succeeded
+    assert result.error_message == "backup disk full"
+    assert output.read_bytes() == b"old-output"
+
+
 def test_text_export_cancellation_before_write_preserves_existing_output(tmp_path):
     output = tmp_path / "translation.txt"
     output.write_text("old-output", encoding="utf-8")

@@ -46,9 +46,7 @@ def _seed_old_data(paths):
 
 class TestPreview:
     def test_valid_candidate_resolves(self, service, tmp_path):
-        resolved, issues, error = service.preview(
-            _candidate(data_root=str(tmp_path / "root"))
-        )
+        resolved, issues, error = service.preview(_candidate(data_root=str(tmp_path / "root")))
         assert error == ""
         assert resolved is not None
         assert [i for i in issues if i.is_error] == []
@@ -57,6 +55,44 @@ class TestPreview:
         resolved, _issues, error = service.preview(_candidate(data_root="rel/path"))
         assert resolved is None
         assert "绝对路径" in error
+
+
+class TestSingleRootCandidate:
+    def test_one_root_clears_legacy_overrides(self, service, tmp_config_manager, tmp_path):
+        tmp_config_manager.update_storage_config(
+            {
+                "data_root": str(tmp_path / "old-root"),
+                "cache_dir": str(tmp_path / "old-cache"),
+                "translation_records_dir": str(tmp_path / "old-records"),
+                "translation_backups_dir": str(tmp_path / "old-backups"),
+            },
+            persist=False,
+        )
+
+        selected = tmp_path / "统一缓存"
+        candidate = service.single_root_candidate(f"  {selected}  ")
+
+        assert candidate["data_root"] == str(selected)
+        assert candidate["cache_dir"] == ""
+        assert candidate["translation_records_dir"] == ""
+        assert candidate["translation_backups_dir"] == ""
+
+        resolved, issues, error = service.preview(candidate)
+        assert error == ""
+        assert resolved is not None
+        assert [issue for issue in issues if issue.is_error] == []
+        assert resolved.cache_dir == (selected / "cache").resolve()
+        assert resolved.translation_records_dir == (selected / "translation_records").resolve()
+        assert resolved.translation_backups_dir == (selected / "translation_backups").resolve()
+
+    def test_empty_root_restores_platform_defaults(self, service):
+        candidate = service.single_root_candidate("   ")
+
+        assert candidate["data_root"] == ""
+        assert candidate["cache_dir"] == ""
+        assert candidate["translation_records_dir"] == ""
+        assert candidate["translation_backups_dir"] == ""
+        assert service.resolver.resolve(candidate).is_default is True
 
 
 class TestApplyUnchanged:
@@ -82,9 +118,7 @@ class TestApplyWithoutData:
 
 
 class TestApplyWithMigration:
-    def test_migrates_data_then_switches_config(
-        self, service, tmp_config_manager, tmp_path
-    ):
+    def test_migrates_data_then_switches_config(self, service, tmp_config_manager, tmp_path):
         old_paths = service.current_paths()
         _seed_old_data(old_paths)
         new_root = tmp_path / "new_root"
@@ -96,9 +130,7 @@ class TestApplyWithMigration:
         assert result.migration is not None
         assert result.migration.copied_file_count == 2
         # 新目录有数据
-        assert (
-            new_root / "translation_records" / "projects" / "0123456789abcdef.json"
-        ).is_file()
+        assert (new_root / "translation_records" / "projects" / "0123456789abcdef.json").is_file()
         assert (
             new_root / "translation_records" / "mappings" / "book-abc" / "content_mapping.json"
         ).is_file()
@@ -107,9 +139,7 @@ class TestApplyWithMigration:
         # 配置指向新目录
         assert tmp_config_manager.get_storage_config()["data_root"] == str(new_root)
 
-    def test_keep_old_data_without_migration(
-        self, service, tmp_config_manager, tmp_path
-    ):
+    def test_keep_old_data_without_migration(self, service, tmp_config_manager, tmp_path):
         old_paths = service.current_paths()
         _seed_old_data(old_paths)
         new_root = tmp_path / "new_root"
@@ -130,9 +160,7 @@ class TestApplyGuards:
         service = StorageSettingsService(
             tmp_config_manager, tmp_app_paths, is_task_active=lambda: True
         )
-        result = service.apply(
-            _candidate(data_root=str(tmp_path / "root")), migrate_data=False
-        )
+        result = service.apply(_candidate(data_root=str(tmp_path / "root")), migrate_data=False)
         assert result.status == STATUS_ERROR
         assert "翻译任务" in result.message
         # 配置未被修改
@@ -153,20 +181,14 @@ class TestApplyGuards:
         assert "已存在数据" in result.message
         assert tmp_config_manager.get_storage_config()["data_root"] == ""
 
-    def test_uncreatable_dir_keeps_old_config(
-        self, service, tmp_config_manager, tmp_path
-    ):
+    def test_uncreatable_dir_keeps_old_config(self, service, tmp_config_manager, tmp_path):
         blocker = tmp_path / "blocker"
         blocker.write_text("x", encoding="utf-8")
-        result = service.apply(
-            _candidate(data_root=str(blocker / "sub")), migrate_data=False
-        )
+        result = service.apply(_candidate(data_root=str(blocker / "sub")), migrate_data=False)
         assert result.status == STATUS_ERROR
         assert tmp_config_manager.get_storage_config()["data_root"] == ""
 
-    def test_validation_error_keeps_old_config(
-        self, service, tmp_config_manager, tmp_path
-    ):
+    def test_validation_error_keeps_old_config(self, service, tmp_config_manager, tmp_path):
         same = tmp_path / "same"
         result = service.apply(
             _candidate(cache_dir=str(same), translation_backups_dir=str(same)),

@@ -14,9 +14,14 @@ import tkinter as tk
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import cast
 
 from ..application.error_handling import format_diagnostic_info
-from ..core.concurrent_manager import ConcurrentTranslationManager
+from ..core.concurrent_manager import (
+    ConcurrentTranslationManager,
+    TranslationTask,
+    TranslationTaskSummary,
+)
 from ..core.epub_processor import EpubImportCancelled
 from .task_detail_window import TaskDetailWindow
 from .theme import COLORS, FONT_APP_SMALL
@@ -416,6 +421,13 @@ class ConcurrentWindow:
             f"成功: {m.total_success} | 吞吐: {throughput_text} 行/分 | ETA: {eta_text}"
         )
 
+    def _get_task_summaries(self) -> list[TranslationTaskSummary | TranslationTask]:
+        """Use the lightweight manager API, retaining compatibility with test fakes."""
+        getter = getattr(self.manager, "get_task_summaries", None)
+        if callable(getter):
+            return cast(list[TranslationTaskSummary | TranslationTask], getter())
+        return cast(list[TranslationTaskSummary | TranslationTask], self.manager.get_all_tasks())
+
     # ── 工具栏操作 ──────────────────────────────────
     def _install_fingerprint_dialog_bridge(self) -> None:
         """Route recovery decisions through the Tk callback mailbox.
@@ -591,7 +603,7 @@ class ConcurrentWindow:
         防止用户误点 "全部取消" 破坏批量任务。确认后调用
         ``manager.cancel_all()`` 取消所有未完成任务。
         """
-        tasks = self.manager.get_all_tasks()
+        tasks = self._get_task_summaries()
         if not tasks:
             messagebox.showinfo("提示", "队列为空，无可取消的任务", parent=self.win)
             return
@@ -642,7 +654,7 @@ class ConcurrentWindow:
         self.manager.cancel_all()
 
     def _remove_finished(self):
-        for task in list(self.manager.get_all_tasks()):
+        for task in self._get_task_summaries():
             if task.status in ("completed", "cancelled", "error"):
                 self.manager.remove_task(task.task_id)
         self._refresh_tree()
@@ -665,7 +677,7 @@ class ConcurrentWindow:
             )
             return
 
-        all_tasks = self.manager.get_all_tasks()
+        all_tasks = self._get_task_summaries()
         completed = [t for t in all_tasks if t.status == "completed"]
         partial_tasks = [t for t in all_tasks if t.status == "partial"]
         if not completed:
@@ -726,25 +738,25 @@ class ConcurrentWindow:
                             mapping_p = Path(task.mapping_dir)
                             epub_out = out_path / f"{Path(task.file_path).stem}_译文.epub"
 
-                            image_map = None
+                            image_map: dict[str, str] | None = None
                             result_file = mapping_p / "image_translation_result.json"
                             if result_file.exists():
                                 try:
                                     raw = json.loads(result_file.read_text(encoding="utf-8"))
                                     # R2-BUG-018：兼容新旧格式
                                     if isinstance(raw, dict) and "result_map" in raw:
-                                        image_map = raw["result_map"]
+                                        image_map = _coerce_image_map(raw["result_map"])
                                     else:
-                                        image_map = raw
+                                        image_map = _coerce_image_map(raw)
                                 except Exception:
                                     pass
 
-                            image_text_map = None
+                            image_text_map: dict[str, dict[str, object]] | None = None
                             text_trans_file = mapping_p / "image_text_translations.json"
                             if text_trans_file.exists():
                                 try:
-                                    image_text_map = json.loads(
-                                        text_trans_file.read_text(encoding="utf-8")
+                                    image_text_map = _coerce_image_text_map(
+                                        json.loads(text_trans_file.read_text(encoding="utf-8"))
                                     )
                                 except Exception:
                                     pass
@@ -829,7 +841,7 @@ class ConcurrentWindow:
 
         epub_tasks = [
             t
-            for t in self.manager.get_all_tasks()
+            for t in self._get_task_summaries()
             if t.status == "completed" and t.file_type == "epub" and t.mapping_dir
         ]
         if not epub_tasks:
@@ -1229,3 +1241,25 @@ class ConcurrentWindow:
             self.manager.cancel_task(tid)
         self.manager.remove_task(tid)
         self._refresh_tree()
+
+
+def _coerce_image_map(value: object) -> dict[str, str]:
+    """Read the optional image-replacement JSON without leaking untrusted values."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: replacement
+        for key, replacement in value.items()
+        if isinstance(key, str) and isinstance(replacement, str)
+    }
+
+
+def _coerce_image_text_map(value: object) -> dict[str, dict[str, object]]:
+    """Read per-image text metadata while retaining only JSON object entries."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        image_id: dict(metadata)
+        for image_id, metadata in value.items()
+        if isinstance(image_id, str) and isinstance(metadata, dict)
+    }

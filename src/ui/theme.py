@@ -18,6 +18,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk
+from typing import TypedDict
 
 # ── 颜色 token ───────────────────────────────────────
 # 所有颜色都经过对比度核算（白底普通文本）：
@@ -179,7 +180,14 @@ def update_font_size(font_family: str | None, font_size: int) -> None:
     configure_named_fonts(font_family, font_size)
 
 
-def accent_button_options(*, pressed: bool = False) -> dict[str, str]:
+class AccentButtonOptions(TypedDict):
+    background: str
+    activebackground: str
+    foreground: str
+    activeforeground: str
+
+
+def accent_button_options(*, pressed: bool = False) -> AccentButtonOptions:
     """返回主强调按钮的颜色配置（供 ``tk.Button`` 直接使用）。
 
     P2-2：原 ``#0D9488`` 配白字仅 3.74:1，不满足普通文本 4.5:1；改用

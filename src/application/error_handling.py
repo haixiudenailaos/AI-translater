@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from random import Random
@@ -242,7 +243,7 @@ def format_diagnostic_info(
     error: BaseException,
     actionable: ActionableError,
     *,
-    extra: dict | None = None,
+    extra: Mapping[str, object] | None = None,
 ) -> str:
     """格式化可安全复制的诊断信息字符串。
 
@@ -267,7 +268,7 @@ def log_classified_error(
     error: BaseException,
     actionable: ActionableError,
     *,
-    context: dict | None = None,
+    context: Mapping[str, object] | None = None,
 ) -> None:
     """记录分类后的错误到日志。
 

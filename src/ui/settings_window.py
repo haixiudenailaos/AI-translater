@@ -878,7 +878,7 @@ class SettingsWindow:
             "volc_base_url", "火山引擎 API 地址", self.volc_base_url_var, volc_base_url_entry
         )
 
-        self._volc_model_options = list(VOLCENGINE_IMAGE_MODEL_SUGGESTIONS)
+        self._volc_model_options: list[str] = list(VOLCENGINE_IMAGE_MODEL_SUGGESTIONS)
         current_volc_model = ai_volc_cfg.get("model", VOLCENGINE_IMAGE_DEFAULT_MODEL)
         self.volc_model_var = tk.StringVar(value=current_volc_model)
         ttk.Label(volc_frame, text="翻译模型 ID:").grid(
@@ -919,39 +919,41 @@ class SettingsWindow:
 
     # ── STORAGE-4/5：数据与存储设置页 ─────────────────────
 
-    #: (配置字段, 标签, 说明)——留空表示跟随数据根目录，数据根目录留空表示
-    #: 使用平台默认目录。logs_dir 本版本为预留字段，不暴露在界面上。
+    #: 新界面只暴露一个统一根目录。内部仍保留旧版的独立子目录字段，
+    #: 以便读取已有配置；用户保存后会归一为单根目录模式。
     STORAGE_FIELDS = (
-        ("data_root", "数据根目录:", "所有数据的默认父目录；留空使用平台默认目录"),
-        ("cache_dir", "缓存目录:", "留空跟随数据根目录（本版本缓存为内存缓存，此项预留）"),
-        ("translation_records_dir", "翻译中间记录目录:", "TXT 项目、EPUB 映射、断点续传记录；留空跟随数据根目录"),
-        ("translation_backups_dir", "译文备份目录:", "译文历史版本备份；留空跟随数据根目录"),
+        (
+            "data_root",
+            "统一缓存目录:",
+            "缓存、翻译中间记录和译文备份会自动保存到该目录下；留空使用平台默认目录",
+        ),
     )
     _STORAGE_OPEN_ATTR = {
         "data_root": "data_root",
-        "cache_dir": "cache_dir",
-        "translation_records_dir": "translation_records_dir",
-        "translation_backups_dir": "translation_backups_dir",
     }
 
     def create_storage_tab(self, notebook):
         """创建“数据与存储”设置页（STORAGE-4）。
 
-        控件行为（§5 第四步）：输入框显示当前配置值（空 = 跟随默认），
-        预览区显示最终解析路径；“打开目录”打开最终解析后的目录而非空
-        配置值；“恢复默认”清除自定义值。
+        控件行为（§5 第四步）：用户只选择一个缓存根目录（空 = 使用
+        平台默认），预览区显示程序自动派生的最终路径；“打开目录”打开
+        最终解析后的根目录；“恢复默认”清除自定义值。
         """
         storage_frame = self._create_scrollable_tab(notebook, "数据与存储")
         storage_frame.grid_columnconfigure(1, weight=1)
 
-        current = self._storage_service.current_storage()
+        service = self._storage_service
+        if service is None:
+            return
+        current = service.current_storage()
         self._storage_vars = {}
 
         tip = ttk.Label(
             storage_frame,
             text=(
-                "自定义缓存、翻译中间记录和译文备份的保存位置。留空表示跟随数据根目录；"
-                "数据根目录留空表示使用平台默认目录。修改将在下次启动应用后生效。"
+                "只需选择一个缓存根目录，程序会在其中自动管理缓存、翻译中间记录、"
+                "TXT/EPUB 项目数据和译文备份。留空表示使用平台默认目录；"
+                "修改将在下次启动应用后生效。"
             ),
             foreground=COLORS["muted"],
             justify=tk.LEFT,
@@ -989,9 +991,9 @@ class SettingsWindow:
             row += 2
 
         # 最终路径预览（§5 第四步：保存前先显示最终路径预览）
-        ttk.Label(
-            storage_frame, text="最终路径预览:", font=("TkDefaultFont", 9, "bold")
-        ).grid(row=row, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(12, 4))
+        ttk.Label(storage_frame, text="最终路径预览:", font=("TkDefaultFont", 9, "bold")).grid(
+            row=row, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(12, 4)
+        )
         row += 1
         preview_frame = ttk.Frame(storage_frame)
         preview_frame.grid(row=row, column=0, columnspan=4, padx=10, sticky=tk.EW)
@@ -1009,21 +1011,22 @@ class SettingsWindow:
 
         button_row = ttk.Frame(storage_frame)
         button_row.grid(row=row, column=0, columnspan=4, padx=10, pady=10, sticky=tk.W)
-        ttk.Button(
-            button_row, text="恢复默认", command=self._reset_storage_defaults
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            button_row, text="刷新预览", command=self._refresh_storage_preview
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(button_row, text="恢复默认", command=self._reset_storage_defaults).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(button_row, text="刷新预览", command=self._refresh_storage_preview).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
 
         self._refresh_storage_preview()
 
     def _storage_candidate_from_form(self):
-        """从表单收集候选 storage 配置（保留 schema_version 等非路径字段）。"""
-        candidate = self._storage_service.current_storage()
-        for field, _label, _hint in self.STORAGE_FIELDS:
-            candidate[field] = self._storage_vars[field].get().strip()
-        return candidate
+        """从单一目录输入生成归一化 storage 候选配置。"""
+        service = self._storage_service
+        if service is None:
+            raise RuntimeError("Storage settings are not available")
+        root = self._storage_vars["data_root"].get()
+        return service.single_root_candidate(root)
 
     def _refresh_storage_preview(self):
         """解析当前表单值并刷新最终路径预览（纯解析，不触碰磁盘）。"""
@@ -1050,7 +1053,10 @@ class SettingsWindow:
     def _browse_storage_dir(self, field):
         """选择目录并写入对应输入框（取消时不改变任何值）。"""
         current_value = self._storage_vars[field].get().strip()
-        initial = current_value or str(self._storage_service.current_paths().data_root)
+        service = self._storage_service
+        if service is None:
+            return
+        initial = current_value or str(service.current_paths().data_root)
         chosen = filedialog.askdirectory(parent=self.window, initialdir=initial)
         if not chosen:
             return
@@ -1060,6 +1066,8 @@ class SettingsWindow:
     def _open_storage_dir(self, field):
         """打开最终解析后的目录（§5 第四步：打开解析结果而非空配置值）。"""
         service = self._storage_service
+        if service is None:
+            return
         candidate = self._storage_candidate_from_form()
         resolved, _issues, resolve_error = service.preview(candidate)
         if resolve_error or resolved is None:
@@ -1069,9 +1077,7 @@ class SettingsWindow:
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            messagebox.showwarning(
-                "无法打开目录", f"创建目录失败：{exc}", parent=self.window
-            )
+            messagebox.showwarning("无法打开目录", f"创建目录失败：{exc}", parent=self.window)
             return
         try:
             if sys.platform == "win32":
@@ -1081,12 +1087,10 @@ class SettingsWindow:
             else:
                 subprocess.Popen(["xdg-open", str(target)])
         except OSError as exc:
-            messagebox.showwarning(
-                "无法打开目录", f"{exc}", parent=self.window
-            )
+            messagebox.showwarning("无法打开目录", f"{exc}", parent=self.window)
 
     def _reset_storage_defaults(self):
-        """清除所有自定义目录，恢复平台默认（§5 第四步）。"""
+        """清除自定义缓存根目录，恢复平台默认（§5 第四步）。"""
         for var in self._storage_vars.values():
             var.set("")
         self._refresh_storage_preview()
@@ -1101,9 +1105,7 @@ class SettingsWindow:
         if service is None:
             return True
         if getattr(self, "_storage_apply_busy", False):
-            messagebox.showinfo(
-                "请稍候", "数据目录设置正在应用中，请稍候。", parent=self.window
-            )
+            messagebox.showinfo("请稍候", "数据目录设置正在应用中，请稍候。", parent=self.window)
             return False
 
         candidate = self._storage_candidate_from_form()
@@ -1123,8 +1125,7 @@ class SettingsWindow:
         if warnings:
             proceed = messagebox.askyesno(
                 "数据目录提示",
-                "\n".join(f"• {issue.message}" for issue in warnings)
-                + "\n\n仍要保存吗？",
+                "\n".join(f"• {issue.message}" for issue in warnings) + "\n\n仍要保存吗？",
                 parent=self.window,
             )
             if not proceed:
@@ -1176,6 +1177,18 @@ class SettingsWindow:
         泵回主线程，不直接跨线程调用 Tk API（P1-1）。
         """
         self._storage_apply_result = None
+        # Capture the dependency before starting the worker.  The settings
+        # window can be torn down while an apply is pending, so the worker
+        # must not dereference the optional instance attribute later.
+        service = self._storage_service
+        if service is None:
+            from ..application.storage_settings import StorageApplyResult
+
+            self._storage_apply_result = StorageApplyResult(
+                status="error",
+                message="数据目录设置服务不可用",
+            )
+            return
         dialog = tk.Toplevel(self.window)
         dialog.title("应用数据目录设置")
         dialog.transient(self.window)
@@ -1184,9 +1197,7 @@ class SettingsWindow:
         # 迁移/写入进行中禁止关闭对话框，避免用户误判状态
         dialog.protocol("WM_DELETE_WINDOW", lambda: None)
 
-        ttk.Label(dialog, text="正在应用数据目录设置，请勿关闭应用...").pack(
-            padx=20, pady=(20, 4)
-        )
+        ttk.Label(dialog, text="正在应用数据目录设置，请勿关闭应用...").pack(padx=20, pady=(20, 4))
         progress_var = tk.StringVar(value="准备中...")
         ttk.Label(dialog, textvariable=progress_var, foreground=COLORS["muted"]).pack(
             padx=20, pady=(0, 8)
@@ -1200,7 +1211,7 @@ class SettingsWindow:
                 self._safe_after(lambda m=message: progress_var.set(m))
 
             try:
-                result = self._storage_service.apply(
+                result = service.apply(
                     candidate,
                     migrate_data=migrate_data,
                     progress_callback=report if migrate_data else None,
@@ -1581,7 +1592,9 @@ class SettingsWindow:
             messagebox.showwarning("配置无效", first_message, parent=self.window)
             if first_widget is not None:
                 try:
-                    first_widget.focus_set()
+                    focus_setter = getattr(first_widget, "focus_set", None)
+                    if callable(focus_setter):
+                        focus_setter()
                 except (tk.TclError, AttributeError):
                     pass
             return
@@ -1801,8 +1814,10 @@ class SettingsWindow:
             preset_data = presets[preset_name]
 
             # 加载预设数据
-            self.api_key_var.set(preset_data.get("api_key", ""))
-            model_name = preset_data.get("model_name", "")
+            api_key = preset_data.get("api_key")
+            self.api_key_var.set(api_key if isinstance(api_key, str) else "")
+            raw_model_name = preset_data.get("model_name")
+            model_name = raw_model_name if isinstance(raw_model_name, str) else ""
             self.model_var.set(self.model_display_map.get(model_name, model_name))
 
             preset_window.destroy()

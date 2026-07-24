@@ -471,7 +471,7 @@ class GlossaryWindow:
         if file_path:
             try:
                 # BUG-006：使用原子写入，失败时旧文件保持不变
-                write_json_atomic(file_path, self.glossary_data)
+                write_json_atomic(Path(file_path), self.glossary_data)
 
                 messagebox.showinfo("导出成功", f"术语库已导出到: {Path(file_path).name}")
 

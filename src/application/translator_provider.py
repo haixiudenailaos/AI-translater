@@ -10,7 +10,8 @@ TranslatorEngine 适配器
 此适配器最终会消失。
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Protocol, TypeGuard
 
 from ..domain.translation import (
     OperationStatus,
@@ -22,6 +23,40 @@ from ..utils.logger import get_logger
 from .ports import TranslationProvider
 
 logger = get_logger(__name__)
+
+
+class LegacyBatchResult(Protocol):
+    """The result shape exposed by the callback-based translation engine."""
+
+    status: OperationStatus
+    lines: Sequence[str]
+    failed_indices: Sequence[int]
+    error_message: str | None
+
+
+LegacyProgressCallback = Callable[[float, Mapping[str, object] | None], None]
+LegacyCompleteCallback = Callable[[LegacyBatchResult], None]
+
+
+class LegacyTranslatorEngine(Protocol):
+    """Minimal legacy-engine API isolated behind this transitional adapter."""
+
+    def reset(self) -> None:
+        """Reset cancellation and transient translation state."""
+
+    def translate_fast_mode(
+        self,
+        content: str,
+        progress_callback: LegacyProgressCallback,
+        complete_callback: LegacyCompleteCallback,
+    ) -> None:
+        """Translate synchronously and invoke the completion callback before returning."""
+
+    def stop(self) -> None:
+        """Request cancellation for the active translation."""
+
+    def close(self) -> None:
+        """Release resources owned by the engine."""
 
 
 class TranslatorEngineAdapter(TranslationProvider):
@@ -37,7 +72,7 @@ class TranslatorEngineAdapter(TranslationProvider):
     complete_callback 在其返回前被调用，因此适配器无需额外线程等待。
     """
 
-    def __init__(self, engine):
+    def __init__(self, engine: LegacyTranslatorEngine) -> None:
         """初始化适配器
 
         Args:
@@ -65,15 +100,17 @@ class TranslatorEngineAdapter(TranslationProvider):
             TranslationResult
         """
         content = "\n".join(lines)
-        result_holder: dict[str, object] = {}
+        result_holder: dict[str, LegacyBatchResult] = {}
 
-        def progress_callback(progress: float, batch_data: dict[str, object] | None):
+        def progress_callback(progress: float, batch_data: Mapping[str, object] | None) -> None:
             if on_progress is None:
                 return
             # 将旧式字典回调转换为 TranslationProgress
-            batch_start = batch_data.get("batch_start", 0) if batch_data else 0
+            batch_start = _coerce_progress_index(
+                batch_data.get("batch_start") if batch_data else None
+            )
             translated_lines = (
-                tuple(batch_data.get("translated_lines", []))
+                _coerce_preview_lines(batch_data.get("translated_lines"))
                 if batch_data and not batch_data.get("streaming", False)
                 else ()
             )
@@ -93,7 +130,7 @@ class TranslatorEngineAdapter(TranslationProvider):
             except Exception as e:
                 logger.warning("进度回调异常: %s", e)
 
-        def complete_callback(batch_result):
+        def complete_callback(batch_result: LegacyBatchResult) -> None:
             result_holder["result"] = batch_result
 
         # 重置引擎状态并执行翻译（同步阻塞，返回时 complete_callback 已被调用）
@@ -124,3 +161,26 @@ class TranslatorEngineAdapter(TranslationProvider):
     def close(self) -> None:
         """释放资源，幂等可多次调用"""
         self._engine.close()
+
+
+def _coerce_progress_index(value: object) -> int:
+    """Read legacy progress indexes defensively at the adapter boundary."""
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str):
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _coerce_preview_lines(value: object) -> tuple[str, ...]:
+    """Narrow legacy callback payloads to immutable preview lines."""
+    if not _is_non_text_sequence(value):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _is_non_text_sequence(value: object) -> TypeGuard[Sequence[object]]:
+    return isinstance(value, Sequence) and not isinstance(value, str | bytes)

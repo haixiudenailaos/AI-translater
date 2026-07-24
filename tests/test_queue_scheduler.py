@@ -799,3 +799,168 @@ class TestStateDisplayMap:
             assert state in STATE_DISPLAY_MAP
             assert isinstance(STATE_DISPLAY_MAP[state], str)
             assert STATE_DISPLAY_MAP[state]
+
+
+# ── Batch-D: on_retryable_response hook + retry_count tracking ───────────────
+
+
+class TestExecuteBatchJobBatchD:
+    """Batch-D: hook on_retryable_response + retry_count dans execute_batch_job."""
+
+    def _make_job(self) -> BatchJob:
+        return BatchJob(
+            task_id="t1",
+            attempt_id="a1",
+            batch_id=0,
+            source_indices=(0,),
+            source_lines=("hello",),
+            estimated_input_tokens=100,
+            run_context=_make_run_context(),
+        )
+
+    def test_hook_installed_and_cleared_on_success(self):
+        """Le hook est installé avant _translate_batch et retiré après succès."""
+        job = self._make_job()
+        engine = MockEngine()
+        limiter = _make_limiter()
+        cancel_event = threading.Event()
+
+        hook_during_call = []
+
+        def capturing_translate_batch(*args, **kwargs):
+            # Capture l'état du hook au moment de l'appel
+            hook_during_call.append(engine.api.set_on_retryable_response.call_count)
+            return BatchTranslationResult(
+                status=OperationStatus.SUCCEEDED,
+                lines=["译:hello"],
+            )
+
+        engine._translate_batch = capturing_translate_batch
+        engine.api.set_on_retryable_response = MagicMock()
+
+        outcome = execute_batch_job(job, engine, cancel_event, limiter)
+
+        # Hook installé avant l'appel (set avec un callable)
+        assert engine.api.set_on_retryable_response.call_count == 2
+        first_arg = engine.api.set_on_retryable_response.call_args_list[0][0][0]
+        assert callable(first_arg)
+        # Puis réinitialisé à None dans le finally
+        last_arg = engine.api.set_on_retryable_response.call_args_list[1][0][0]
+        assert last_arg is None
+
+        assert outcome.retry_count == 0
+        assert not outcome.cancelled
+
+    def test_hook_cleared_on_exception(self):
+        """Le hook est toujours retiré même quand _translate_batch lève une exception."""
+        job = self._make_job()
+        engine = MockEngine()
+        engine.raise_exception = TranslationRequestError("fail", status_code=500)
+        engine.api.set_on_retryable_response = MagicMock()
+        limiter = _make_limiter()
+        cancel_event = threading.Event()
+
+        execute_batch_job(job, engine, cancel_event, limiter)
+
+        # finally doit avoir appelé set_on_retryable_response(None)
+        last_arg = engine.api.set_on_retryable_response.call_args_list[-1][0][0]
+        assert last_arg is None
+
+    def test_retry_count_incremented_by_hook(self):
+        """retry_count dans BatchOutcome reflète le nombre de fois que le hook a été déclenché."""
+        job = self._make_job()
+        engine = MockEngine()
+        limiter = _make_limiter()
+        cancel_event = threading.Event()
+
+        installed_hook = []
+
+        def capturing_set(hook):
+            if hook is not None:
+                installed_hook.append(hook)
+
+        engine.api.set_on_retryable_response = MagicMock(side_effect=capturing_set)
+
+        # Simuler 2 retry via le hook avant que _translate_batch réussisse
+        call_count = [0]
+
+        def translate_with_retries(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1 and installed_hook:
+                # Déclencher le hook manuellement (simule BaseAPI qui fire le hook sur 429)
+                installed_hook[0](429, 5.0)
+                installed_hook[0](503, None)
+            return BatchTranslationResult(
+                status=OperationStatus.SUCCEEDED,
+                lines=["译:hello"],
+            )
+
+        engine._translate_batch = translate_with_retries
+
+        outcome = execute_batch_job(job, engine, cancel_event, limiter)
+
+        # 2 appels au hook = retry_count == 2
+        assert outcome.retry_count == 2
+        # Le hook a aussi notifié le limiter: 1x record_rate_limited (429) + 1x record_timeout (503)
+        assert limiter.metrics()["total_429"] == 1
+
+    def test_hook_not_installed_when_engine_has_no_api(self):
+        """Pas d'erreur si engine n'a pas d'attribut api."""
+        job = self._make_job()
+        engine = MockEngine()
+        del engine.api  # Retirer l'attribut api
+        limiter = _make_limiter()
+        cancel_event = threading.Event()
+
+        # Doit fonctionner sans exception
+        outcome = execute_batch_job(job, engine, cancel_event, limiter)
+
+        assert outcome.translated_lines == ("译:hello",)
+        assert outcome.retry_count == 0
+
+    def test_429_no_double_count_when_hook_already_notified(self):
+        """Si le hook a déjà notifié le limiter, le handler TranslationRequestError ne re-notifie pas."""
+        job = self._make_job()
+        engine = MockEngine()
+        limiter = _make_limiter()
+        cancel_event = threading.Event()
+
+        installed_hook = []
+
+        def capturing_set(hook):
+            if hook is not None:
+                installed_hook.append(hook)
+
+        engine.api.set_on_retryable_response = MagicMock(side_effect=capturing_set)
+
+        # Simuler: hook déclenché une fois sur 429 PUIS TranslationRequestError levé
+        def translate_fires_hook_then_raises(*args, **kwargs):
+            if installed_hook:
+                installed_hook[0](429, 3.0)  # hook notifie d'abord
+            raise TranslationRequestError("still 429", status_code=429, retry_after_seconds=3.0)
+
+        engine._translate_batch = translate_fires_hook_then_raises
+
+        outcome = execute_batch_job(job, engine, cancel_event, limiter)
+
+        assert outcome.rate_limited is True
+        # total_429 == 1 (via hook), pas 2 (pas double-comptage)
+        assert limiter.metrics()["total_429"] == 1
+
+    def test_429_notified_when_hook_never_fired(self):
+        """Si le hook n'a jamais déclenché (max_attempts=1), le handler notifie le limiter."""
+        job = self._make_job()
+        engine = MockEngine()
+        engine.raise_exception = TranslationRequestError(
+            "rate limited", status_code=429, retry_after_seconds=10.0
+        )
+        # Pas de set_on_retryable_response sur cet api mock
+        limiter = _make_limiter()
+        cancel_event = threading.Event()
+
+        outcome = execute_batch_job(job, engine, cancel_event, limiter)
+
+        assert outcome.rate_limited is True
+        assert outcome.retry_count == 0
+        # Le handler a notifié le limiter
+        assert limiter.metrics()["total_429"] == 1

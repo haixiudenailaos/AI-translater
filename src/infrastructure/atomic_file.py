@@ -104,8 +104,21 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     """Serialize JSON to a unique sibling temp file, then atomically replace it.
 
     P3-1：统一实现，ensure_ascii=False, indent=2。
+    P1-PERF-2：直接把 JSON 流式写入临时文件，避免先构造完整 ``str``
+    再构造完整 ``bytes``，降低大型 EPUB mapping 的峰值内存。
     """
-    write_bytes_atomic(
-        Path(path),
-        json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
     )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _atomic_replace(temporary, target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise

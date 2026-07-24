@@ -21,6 +21,13 @@ from .logger import get_logger
 logger = get_logger(__name__)
 
 
+# Detecting a legacy encoding is useful, but running chardet over an entire
+# novel makes import CPU scale with file size for no additional benefit.  The
+# sample is deliberately large enough for Chinese-language detectors while
+# keeping detection bounded for 100 MiB+ TXT files.
+_ENCODING_DETECTION_SAMPLE_BYTES = 64 * 1024
+
+
 __all__ = [
     "write_text_atomic",
     "write_json_atomic",
@@ -45,33 +52,43 @@ class FileHandler:
             with open(file_path, "rb") as f:
                 raw_data = f.read()
 
+            # UTF-8 is the normal path.  Decode it before importing/running
+            # chardet so UTF-8 and ASCII imports incur no detector cost.
+            try:
+                return raw_data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                pass
+
+            # UTF-16 text is reliably identified by its BOM.  Handle it before
+            # heuristic detection to avoid a false positive on short files.
+            if raw_data.startswith((b"\xff\xfe", b"\xfe\xff")):
+                try:
+                    return raw_data.decode("utf-16")
+                except UnicodeDecodeError:
+                    pass
+
             # Encoding detection is only needed after the user imports a file.
-            # Keeping chardet out of module scope shortens GUI startup and also
-            # lets atomic JSON helpers work without the optional detector.
+            # Keep chardet out of module scope to preserve fast GUI startup,
+            # and limit it to a fixed sample so its CPU cost is O(1).
             import chardet
 
-            detected = chardet.detect(raw_data)
-            encoding = detected.get("encoding", "utf-8")
+            detected = chardet.detect(raw_data[:_ENCODING_DETECTION_SAMPLE_BYTES])
+            encoding = str(detected.get("encoding") or "").lower()
 
-            # 如果检测到的编码不在支持列表中，使用utf-8
-            if encoding not in self.supported_encodings:
-                encoding = "utf-8"
+            # 先尝试探测结果（GB2312/GBK 等），再用项目支持列表兜底。
+            candidates: list[str] = []
+            if encoding in self.supported_encodings:
+                candidates.append(encoding)
+            candidates.extend(enc for enc in self.supported_encodings if enc not in candidates)
 
-            # 尝试用检测到的编码读取
-            try:
-                content = raw_data.decode(encoding)
-                return content
-            except UnicodeDecodeError:
-                # 如果失败，尝试其他编码
-                for enc in self.supported_encodings:
-                    try:
-                        content = raw_data.decode(enc)
-                        return content
-                    except UnicodeDecodeError:
-                        continue
+            for candidate in candidates:
+                try:
+                    return raw_data.decode(candidate)
+                except UnicodeDecodeError:
+                    continue
 
-                # 如果所有编码都失败，使用utf-8并忽略错误
-                return raw_data.decode("utf-8", errors="ignore")
+            # 所有严格解码均失败时，保留旧行为：优先可读而不是中断导入。
+            return raw_data.decode("utf-8", errors="ignore")
 
         except Exception as e:
             raise Exception(f"读取文件失败: {str(e)}")
@@ -269,9 +286,7 @@ class FileHandler:
                         f"{file_path.stem}.backup_{timestamp}{file_path.suffix}"
                     )
                 else:
-                    backup_path = file_path.with_suffix(
-                        f".backup_{timestamp}{file_path.suffix}"
-                    )
+                    backup_path = file_path.with_suffix(f".backup_{timestamp}{file_path.suffix}")
 
             # 复制文件
             import shutil

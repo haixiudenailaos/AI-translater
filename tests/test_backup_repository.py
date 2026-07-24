@@ -116,9 +116,7 @@ class TestLimits:
             assert p.exists()
 
     def test_total_size_limit_prunes_oldest(self, tmp_path):
-        small_repo = BackupRepository(
-            tmp_path / "backups", max_per_project=100, max_total_bytes=1
-        )
+        small_repo = BackupRepository(tmp_path / "backups", max_per_project=100, max_total_bytes=1)
         small_repo.create_backup(PID, _snapshot("x" * 100))
         small_repo.create_backup(PID2, {"project_id": PID2, "translated_lines": ["y" * 100]})
         total = sum(info.size_bytes for info in small_repo.list_backups())

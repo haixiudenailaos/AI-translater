@@ -144,6 +144,52 @@ def _no_op_progress(progress, data):
 class TestTranslateBatchSuccess:
     """R2-BUG-010：成功路径验证"""
 
+    def test_hyphen_line_markers_are_parsed_and_removed(self):
+        """模型将下划线改成连字符时，行号协议仍能正确解析。"""
+        response = "\n".join(f"[LINE-{index:03d}]译文{index}" for index in range(1, 14))
+        api = FakeApi(response_text=response)
+        engine = _make_engine(api=api)
+
+        result = engine._translate_batch(
+            [f"原文{index}" for index in range(1, 14)],
+            _no_op_progress,
+            0,
+            13,
+        )
+
+        assert result.status == TranslationStatus.SUCCEEDED
+        assert result.lines == [f"译文{index}" for index in range(1, 14)]
+        assert result.lines[12] == "译文13"
+
+    @pytest.mark.parametrize(
+        "response_text",
+        [
+            "[LINE 001]你好\n[LINE:002]世界\n[LINE.003]再见",
+            "  【LINE－001】你好\n【line：002】世界\n【LINE—003】再见",
+            "［ LINE _ 001 ］你好\n［LINE-002］世界\n［LINE 003］再见",
+            "- **[LINE-001]**你好\n* **[LINE_002]**世界\n> **[LINE:003]**再见",
+        ],
+    )
+    def test_common_line_marker_variants_are_parsed(self, response_text):
+        """容忍模型常见的空格、标点、全角字符及 Markdown 改写。"""
+        api = FakeApi(response_text=response_text)
+        engine = _make_engine(api=api)
+
+        result = engine._translate_batch(["hello", "world", "goodbye"], _no_op_progress, 0, 3)
+
+        assert result.status == TranslationStatus.SUCCEEDED
+        assert result.lines == ["你好", "世界", "再见"]
+
+    def test_line_marker_inside_translation_is_not_removed(self):
+        """只清理行首协议标记，不误删正文中的同形文本。"""
+        api = FakeApi(response_text="说明 [LINE-013] 是一个示例")
+        engine = _make_engine(api=api)
+
+        result = engine._translate_batch(["example"], _no_op_progress, 0, 1)
+
+        assert result.status == TranslationStatus.SUCCEEDED
+        assert result.lines == ["说明 [LINE-013] 是一个示例"]
+
     def test_stream_progress_only_contains_new_completed_lines(self):
         """PERF-001：流式事件不重建历史文本，只发送新增完整行。"""
 
@@ -176,6 +222,89 @@ class TestTranslateBatchSuccess:
             ["甲", "乙", "丙"],
         ]
         assert all("current_text" not in event for event in progress_events)
+
+    def test_stream_progress_hides_hyphen_line_markers(self):
+        """流式预览与最终结果使用相同的宽容标记清理规则。"""
+
+        class ChunkedApi(FakeApi):
+            def translate_stream(self, prompt, callback):
+                self.call_count += 1
+                chunks = ["[LINE-001]甲\n[LINE-", "002]乙"]
+                for chunk in chunks:
+                    callback(chunk)
+                return "".join(chunks)
+
+        engine = _make_engine(api=ChunkedApi())
+        progress_events = []
+
+        def progress_hook(_, data):
+            if data.get("streaming"):
+                progress_events.append(data)
+
+        result = engine._translate_batch(["one", "two"], progress_hook, 0, 2)
+
+        assert result.status == TranslationStatus.SUCCEEDED
+        assert result.lines == ["甲", "乙"]
+        assert progress_events[0]["stream_lines"] == ["甲"]
+        assert progress_events[-1]["preview_lines"] == ["甲", "乙"]
+        assert all("LINE" not in str(event["preview_lines"]) for event in progress_events)
+
+    def test_stream_progress_ignores_blank_separator_lines(self):
+        """模型在标记行之间插入空行时，流式预览仍按行号对齐。"""
+
+        class ChunkedApi(FakeApi):
+            def translate_stream(self, prompt, callback):
+                self.call_count += 1
+                chunks = [
+                    "[LINE_001]甲\n\n[LINE_002]乙\n",
+                    "\n[LINE_003]丙",
+                ]
+                for chunk in chunks:
+                    callback(chunk)
+                return "".join(chunks)
+
+        engine = _make_engine(api=ChunkedApi())
+        progress_events = []
+
+        def progress_hook(_, data):
+            if data.get("streaming"):
+                progress_events.append(data)
+
+        result = engine._translate_batch(["one", "two", "three"], progress_hook, 0, 3)
+
+        assert result.status == TranslationStatus.SUCCEEDED
+        assert result.lines == ["甲", "乙", "丙"]
+        assert progress_events[0]["stream_lines"] == ["甲", "乙"]
+        assert progress_events[0]["preview_lines"] == ["甲", "乙"]
+        assert progress_events[-1]["preview_lines"] == ["甲", "乙", "丙"]
+        assert all("" not in event["preview_lines"] for event in progress_events)
+
+    def test_stream_progress_waits_for_missing_marker_instead_of_shifting(self):
+        """后续行先出现时不应被预览到缺失行的位置。"""
+
+        class ChunkedApi(FakeApi):
+            def translate_stream(self, prompt, callback):
+                self.call_count += 1
+                chunks = [
+                    "[LINE_001]甲\n[LINE_003]丙\n",
+                    "[LINE_002]乙",
+                ]
+                for chunk in chunks:
+                    callback(chunk)
+                return "[LINE_001]甲\n[LINE_002]乙\n[LINE_003]丙"
+
+        engine = _make_engine(api=ChunkedApi())
+        progress_events = []
+
+        def progress_hook(_, data):
+            if data.get("streaming"):
+                progress_events.append(data)
+
+        result = engine._translate_batch(["one", "two", "three"], progress_hook, 0, 3)
+
+        assert result.status == TranslationStatus.SUCCEEDED
+        assert progress_events[0]["preview_lines"] == ["甲"]
+        assert progress_events[-1]["preview_lines"] == ["甲", "乙", "丙"]
 
     def test_all_lines_translated_returns_succeeded(self):
         """所有非空原文都有非空译文时返回 SUCCEEDED"""

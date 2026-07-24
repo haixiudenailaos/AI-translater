@@ -4,10 +4,11 @@
 对应 docs/USER_CUSTOMIZABLE_DATA_DIRECTORIES_IMPLEMENTATION_GUIDE.md §3.2：
 
 - ``data_root``：用户选择的数据根目录；为空表示使用平台默认目录。
+- 新设置页只写入 ``data_root``，缓存、翻译中间记录和译文备份目录均由
+  它自动派生。
 - ``cache_dir`` / ``translation_records_dir`` / ``translation_backups_dir`` /
-  ``logs_dir``：非空时覆盖 ``data_root`` 下的默认子目录；空字符串表示
-  “跟随数据根目录”，不重复写入默认绝对路径，便于更换 ``data_root`` 后
-  未单独设置的目录自动跟随移动。
+  ``logs_dir``：保留用于读取旧版独立目录配置；新设置页保存时会清空前三
+  个覆盖字段，使数据统一跟随 ``data_root``。
 - ``path_mode``：记录当前解释规则，便于将来升级配置格式。
 
 本模块只负责配置段的默认值和类型归一化，不做任何路径解析；
@@ -72,7 +73,8 @@ def normalize_storage_config(existing: Any) -> Dict[str, Any]:
 
     schema_version = existing.get("schema_version")
     merged["schema_version"] = (
-        schema_version if isinstance(schema_version, int) and not isinstance(schema_version, bool)
+        schema_version
+        if isinstance(schema_version, int) and not isinstance(schema_version, bool)
         else STORAGE_SCHEMA_VERSION
     )
 

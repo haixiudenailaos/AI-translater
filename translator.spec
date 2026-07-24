@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-轻小说翻译器 V1.6 PyInstaller 规格文件
+轻小说翻译器 V1.6.1 PyInstaller 规格文件
 
 包含 TXT/EPUB 文本翻译，以及 V1.5 风格的视觉检测和在线图片翻译。
 使用 onefile 生成单个可执行文件。
@@ -169,7 +169,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='LightNovelTranslatorV1.6',
+    name='LightNovelTranslatorV1.6.1',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

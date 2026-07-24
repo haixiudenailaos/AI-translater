@@ -73,6 +73,25 @@ class TranslationTask:
     failed_count: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class TranslationTaskSummary:
+    """A lightweight task view for bulk UI commands.
+
+    ``TranslationTask`` intentionally carries complete source and target line
+    lists for the detail window.  Commands such as cancel-all, remove-finished
+    and export-all only need identity, status and file metadata; materializing
+    the full view for every queued novel is avoidable memory churn.
+    """
+
+    task_id: str
+    file_path: str
+    file_name: str
+    file_type: str
+    status: str
+    mapping_dir: str | None
+    failed_count: int = 0
+
+
 class ConcurrentTranslationManager:
     """队列翻译管理器（命令门面 + 旧 API 兼容层）。
 
@@ -145,6 +164,7 @@ class ConcurrentTranslationManager:
             limiter_registry=limiter_registry,
             project_repository=self._project_repository,
             fingerprint_mismatch_callback=self._invoke_fingerprint_mismatch_callback,
+            cache_dir=(storage_paths.cache_dir if storage_paths is not None else None),
         )
         self._coordinator.start()
 
@@ -185,7 +205,12 @@ class ConcurrentTranslationManager:
     @property
     def tasks(self) -> Dict[str, TranslationTask]:
         """旧 API：返回 task_id -> TranslationTask 视图（每次调用重建）。"""
-        return {tid: self.get_task(tid) for tid in self._task_order if self.get_task(tid)}
+        views: Dict[str, TranslationTask] = {}
+        for task_id in self._task_order:
+            task = self.get_task(task_id)
+            if task is not None:
+                views[task_id] = task
+        return views
 
     def set_progress_callback(self, callback: Callable | None) -> None:
         """设置 UI 进度回调（状态变更 kick）。
@@ -361,6 +386,55 @@ class ConcurrentTranslationManager:
             if t is not None:
                 tasks.append(t)
         return tasks
+
+    def get_task_summaries(self) -> List[TranslationTaskSummary]:
+        """Return lightweight immutable metadata for bulk commands.
+
+        The normal path consumes the coordinator's published snapshot and
+        never copies ``source_lines`` or ``target_lines``.  A task can be added
+        just before the first snapshot is published, so a narrow coordinator
+        lookup remains as a compatibility fallback for that short interval.
+        """
+        with self._meta_lock:
+            order = list(self._task_order)
+            metadata = {task_id: dict(self._task_meta.get(task_id, {})) for task_id in order}
+
+        snapshot = self._coordinator.get_snapshot()
+        states = {task.task_id: task for task in snapshot.tasks} if snapshot is not None else {}
+        summaries: List[TranslationTaskSummary] = []
+        for task_id in order:
+            meta = metadata[task_id]
+            task_snapshot = states.get(task_id)
+            if task_snapshot is None:
+                data = self._coordinator.get_task_data(task_id)
+                if data is None:
+                    continue
+                status = str(data.get("status", "cancelled"))
+                failed_count = int(data.get("failed_count", 0))
+                file_path = str(data.get("file_path", meta.get("file_path", "")))
+                file_name = str(data.get("file_name", meta.get("file_name", "")))
+                file_type = str(data.get("file_type", meta.get("file_type", "txt")))
+                mapping_dir = data.get("mapping_dir", meta.get("mapping_dir"))
+            else:
+                status = task_snapshot.status
+                failed_count = task_snapshot.failed_count
+                file_path = str(meta.get("file_path", ""))
+                file_name = task_snapshot.file_name
+                file_type = task_snapshot.file_type
+                mapping_dir = meta.get("mapping_dir")
+
+            summaries.append(
+                TranslationTaskSummary(
+                    task_id=task_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type=file_type,
+                    status=status,
+                    mapping_dir=str(mapping_dir) if mapping_dir is not None else None,
+                    failed_count=failed_count,
+                )
+            )
+        return summaries
 
     def save_task(self, task_id: str) -> bool:
         """同步保存任务（详情页编辑后落盘）。"""

@@ -13,9 +13,10 @@
 - TranslationProject 是可变实体（翻译过程中持续更新），但关键属性通过方法保护。
 """
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Set, Tuple
+from typing import TypeGuard
 
 from .translation import OperationStatus
 
@@ -85,6 +86,18 @@ class LineEditState(str, Enum):
     TRANSLATED = "translated"
 
 
+def _new_string_list() -> list[str]:
+    return []
+
+
+def _new_int_set() -> set[int]:
+    return set()
+
+
+def _new_retry_counts() -> dict[int, int]:
+    return {}
+
+
 @dataclass
 class ModelSnapshot:
     """翻译时使用的模型与配置快照（UXF-004）
@@ -100,7 +113,7 @@ class ModelSnapshot:
     glossary_version: str = ""
     batch_size: int = 20
 
-    def to_dict(self) -> Dict[str, object]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "provider": self.provider,
             "model_name": self.model_name,
@@ -111,7 +124,7 @@ class ModelSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, object] | None = None) -> "ModelSnapshot":
+    def from_dict(cls, data: Mapping[str, object] | None = None) -> "ModelSnapshot":
         if not data:
             return cls()
         return cls(
@@ -120,7 +133,7 @@ class ModelSnapshot:
             target_language=str(data.get("target_language", "")),
             prompt_version=str(data.get("prompt_version", "")),
             glossary_version=str(data.get("glossary_version", "")),
-            batch_size=int(data.get("batch_size", 20)),
+            batch_size=_coerce_int(data.get("batch_size"), default=20),
         )
 
 
@@ -141,19 +154,19 @@ class TranslationProject:
     file_type: str  # "txt" / "epub" / "clipboard"
     mapping_dir: str
 
-    original_lines: List[str] = field(default_factory=list)
-    translated_lines: List[str] = field(default_factory=list)
+    original_lines: list[str] = field(default_factory=_new_string_list)
+    translated_lines: list[str] = field(default_factory=_new_string_list)
 
     # 行级标记：用索引集合存储，避免逐行 dataclass 开销
-    manually_edited_indices: Set[int] = field(default_factory=set)
-    failed_indices: Set[int] = field(default_factory=set)
-    completed_indices: Set[int] = field(default_factory=set)
+    manually_edited_indices: set[int] = field(default_factory=_new_int_set)
+    failed_indices: set[int] = field(default_factory=_new_int_set)
+    completed_indices: set[int] = field(default_factory=_new_int_set)
 
     # 任务状态
     status: TaskStatus = TaskStatus.PENDING
     last_operation_status: OperationStatus = OperationStatus.SUCCEEDED
     last_error: str | None = None
-    retry_counts: Dict[int, int] = field(default_factory=dict)
+    retry_counts: dict[int, int] = field(default_factory=_new_retry_counts)
 
     # 配置快照
     model_snapshot: ModelSnapshot = field(default_factory=ModelSnapshot)
@@ -161,7 +174,7 @@ class TranslationProject:
     # 图片翻译状态（EPUB）
     image_translation_done: bool = False
     image_translation_failed: bool = False
-    export_records: List[str] = field(default_factory=list)
+    export_records: list[str] = field(default_factory=_new_string_list)
 
     # 保存状态
     save_status: SaveStatus = SaveStatus.SAVED
@@ -213,13 +226,13 @@ class TranslationProject:
     def is_line_failed(self, index: int) -> bool:
         return index in self.failed_indices
 
-    def get_pending_indices(self) -> Tuple[int, ...]:
+    def get_pending_indices(self) -> tuple[int, ...]:
         """返回待翻译行索引元组（UXF-002 稀疏行模型）"""
         return self._compute_pending_indices()
 
-    def _compute_pending_indices(self) -> Tuple[int, ...]:
+    def _compute_pending_indices(self) -> tuple[int, ...]:
         """计算待翻译行索引：原文非空、未完成且非手工编辑。"""
-        pending = []
+        pending: list[int] = []
         for i, orig in enumerate(self.original_lines):
             if (
                 orig
@@ -273,9 +286,9 @@ class TranslationProject:
 
     def apply_batch_translation(
         self,
-        indices: Tuple[int, ...],
-        translated_lines: Tuple[str, ...],
-        failed_indices: Tuple[int, ...] = (),
+        indices: tuple[int, ...],
+        translated_lines: tuple[str, ...],
+        failed_indices: tuple[int, ...] = (),
     ) -> None:
         """批量写回译文（UXF-002：通过稳定索引映射，跳过手工编辑行）
 
@@ -364,7 +377,7 @@ class TranslationProject:
 
     # ── 序列化 ──────────────────────────────────
 
-    def to_dict(self) -> Dict[str, object]:
+    def to_dict(self) -> dict[str, object]:
         """序列化为可 JSON 持久化的字典"""
         return {
             "schema_version": 2,
@@ -393,7 +406,7 @@ class TranslationProject:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, object]) -> "TranslationProject":
+    def from_dict(cls, data: Mapping[str, object]) -> "TranslationProject":
         """从字典反序列化（兼容缺失字段）"""
         status_val = str(data.get("status", "pending"))
         try:
@@ -415,12 +428,13 @@ class TranslationProject:
 
         last_error_raw = data.get("last_error")
         model_snap_raw = data.get("model_snapshot")
-        translated_lines = list(data.get("translated_lines", []))  # type: ignore[arg-type]
+        original_lines = _coerce_string_list(data.get("original_lines"))
+        translated_lines = _coerce_string_list(data.get("translated_lines"))
         completed_raw = data.get("completed_indices")
-        if isinstance(completed_raw, list | tuple | set):
-            completed_indices = {int(index) for index in completed_raw}
+        if _is_json_collection(completed_raw):
+            completed_indices = _coerce_index_set(completed_raw)
         else:
-            completed_indices = set(data.get("manually_edited_indices", []) or [])
+            completed_indices = _coerce_index_set(data.get("manually_edited_indices"))
             completed_indices.update(
                 index for index, value in enumerate(translated_lines) if value and value.strip()
             )
@@ -430,23 +444,87 @@ class TranslationProject:
             source_fingerprint=str(data.get("source_fingerprint", "")),
             file_type=str(data.get("file_type", "txt")),
             mapping_dir=str(data.get("mapping_dir", "")),
-            original_lines=list(data.get("original_lines", [])),  # type: ignore[arg-type]
+            original_lines=original_lines,
             translated_lines=translated_lines,
-            manually_edited_indices=set(data.get("manually_edited_indices", []) or []),  # type: ignore[arg-type]
-            failed_indices=set(data.get("failed_indices", []) or []),  # type: ignore[arg-type]
+            manually_edited_indices=_coerce_index_set(data.get("manually_edited_indices")),
+            failed_indices=_coerce_index_set(data.get("failed_indices")),
             completed_indices=completed_indices,
             status=status,
             last_operation_status=op_status,
             last_error=str(last_error_raw) if last_error_raw else None,
-            retry_counts=dict(data.get("retry_counts", {}) or {}),  # type: ignore[arg-type]
+            retry_counts=_coerce_retry_counts(data.get("retry_counts")),
             model_snapshot=ModelSnapshot.from_dict(
-                model_snap_raw if isinstance(model_snap_raw, dict) else None
+                model_snap_raw if _is_json_mapping(model_snap_raw) else None
             ),
             image_translation_done=bool(data.get("image_translation_done", False)),
             image_translation_failed=bool(data.get("image_translation_failed", False)),
-            export_records=list(data.get("export_records", []) or []),  # type: ignore[arg-type]
+            export_records=_coerce_string_list(data.get("export_records")),
             save_status=save_status,
             created_at=str(data.get("created_at", "")),
             last_opened_at=str(data.get("last_opened_at", "")),
             last_saved_at=str(data.get("last_saved_at", "")),
         )
+
+
+def _coerce_int(value: object, *, default: int) -> int:
+    """Return an integer from persisted JSON without letting malformed values escape."""
+    if not isinstance(value, int | float | str):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_json_collection(value: object) -> TypeGuard[Iterable[object]]:
+    """Whether *value* is a collection accepted by the legacy JSON schema."""
+    return isinstance(value, list | tuple | set)
+
+
+def _is_json_mapping(value: object) -> TypeGuard[Mapping[str, object]]:
+    """Narrow an untrusted JSON value to a mapping with string keys."""
+    return isinstance(value, dict)
+
+
+def _coerce_string_list(value: object) -> list[str]:
+    """Narrow legacy JSON arrays into the domain model's string-list contract."""
+    if not _is_json_collection(value):
+        return []
+    return [str(item) for item in value]
+
+
+def _coerce_index_set(value: object) -> set[int]:
+    """Read an index collection while ignoring malformed individual entries."""
+    if not _is_json_collection(value):
+        return set()
+
+    indices: set[int] = set()
+    for item in value:
+        index = _coerce_optional_int(item)
+        if index is not None:
+            indices.add(index)
+    return indices
+
+
+def _coerce_retry_counts(value: object) -> dict[int, int]:
+    """Normalize JSON object keys and values to the project's integer retry map."""
+    if not _is_json_mapping(value):
+        return {}
+
+    retry_counts: dict[int, int] = {}
+    for raw_index, raw_count in value.items():
+        index = _coerce_optional_int(raw_index)
+        count = _coerce_optional_int(raw_count)
+        if index is not None and count is not None:
+            retry_counts[index] = count
+    return retry_counts
+
+
+def _coerce_optional_int(value: object) -> int | None:
+    """Convert supported JSON scalar values to integers without leaking ``ValueError``."""
+    if not isinstance(value, int | float | str):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

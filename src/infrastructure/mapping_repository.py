@@ -18,7 +18,7 @@ import json
 import shutil
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, List, Tuple
+from typing import Dict, List, Mapping, Tuple
 from uuid import uuid4
 
 from ..utils.file_handler import write_json_atomic
@@ -59,7 +59,7 @@ def _reachable_generation_names(manifest: dict) -> set[str]:
     gen_prefix = MAPPING_GENERATIONS_DIRNAME + "/"
     for rel_path in manifest.get("files", {}).values():
         if isinstance(rel_path, str) and rel_path.startswith(gen_prefix):
-            rest = rel_path[len(gen_prefix):]
+            rest = rel_path[len(gen_prefix) :]
             name = rest.split("/")[0]
             if name:
                 names.add(name)
@@ -88,9 +88,7 @@ def _gc_unreachable_generations(mapping_dir: Path, current_manifest: dict) -> in
             shutil.rmtree(candidate)
             removed += 1
         except OSError as exc:
-            logger.warning(
-                "generation GC: 删除目录失败，跳过 %s (%s)", candidate.name, exc
-            )
+            logger.warning("generation GC: 删除目录失败，跳过 %s (%s)", candidate.name, exc)
     if removed:
         logger.debug("generation GC: 已回收 %d 个不可达目录", removed)
     return removed
@@ -167,7 +165,7 @@ def _publish_manifest(mapping_dir: Path, generation: str, files: dict[str, str])
     )
 
 
-def _write_legacy_compatibility_copy(path: Path, payload: dict) -> None:
+def _write_legacy_compatibility_copy(path: Path, payload: Mapping[str, object]) -> None:
     """Best-effort copy for older integrations that still open top-level JSON.
 
     The manifest is the commit point. A compatibility-copy failure must not
@@ -187,9 +185,9 @@ def _write_legacy_compatibility_copy(path: Path, payload: dict) -> None:
 
 def publish_mapping_bundle(
     mapping_dir: Path,
-    content_payload: dict,
-    images_payload: dict,
-    format_payload: dict,
+    content_payload: Mapping[str, object],
+    images_payload: Mapping[str, object],
+    format_payload: Mapping[str, object],
 ) -> dict[str, Path]:
     """Write a complete EPUB mapping generation and atomically publish it.
 
@@ -203,7 +201,7 @@ def publish_mapping_bundle(
     root = Path(mapping_dir)
     root.mkdir(parents=True, exist_ok=True)
     generation, directory = _new_generation_directory(root)
-    payloads = {
+    payloads: dict[str, Mapping[str, object]] = {
         "content_mapping.json": content_payload,
         "images.json": images_payload,
         "format_info.json": format_payload,

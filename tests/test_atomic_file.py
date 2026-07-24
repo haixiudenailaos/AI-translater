@@ -112,6 +112,20 @@ class TestAtomicWriteUniqueTemp:
         assert "日本語テスト" in raw  # ensure_ascii=False
         assert json.loads(raw) == payload
 
+    def test_json_atomic_streams_without_json_dumps(self, tmp_path):
+        """大型 JSON 写入不得先构造完整的 json.dumps 字符串副本。"""
+        from unittest.mock import patch
+
+        from src.infrastructure import atomic_file as atomic_mod
+
+        target = tmp_path / "streamed.json"
+        payload = {"rows": [{"line": i, "text": "内容" * 100} for i in range(100)]}
+
+        with patch.object(atomic_mod.json, "dumps", side_effect=AssertionError("must not dump")):
+            atomic_mod.write_json_atomic(target, payload)
+
+        assert json.loads(target.read_text(encoding="utf-8")) == payload
+
     def test_atomic_write_calls_fsync(self, tmp_path):
         """P2-7：原子写入在 replace 前调用 fsync 刷盘。"""
         from unittest.mock import patch

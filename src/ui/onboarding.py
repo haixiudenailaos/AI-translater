@@ -663,8 +663,9 @@ class OnboardingController:
     def _primary_command_for(self, step: OnboardingStep) -> Callable[[], None] | None:
         if step.step_id == "welcome":
             return self.next
-        if step.target_key is not None:
-            return lambda: self._locate(step.target_key)
+        target_key = step.target_key
+        if target_key is not None:
+            return lambda target_key=target_key: self._locate(target_key)
         action_key = _ACTION_FOR_STEP.get(step.step_id)
         if action_key is not None:
             return self._actions.get(action_key)

@@ -226,7 +226,7 @@ class TkUICallbackPump:
             return
         after_idle = getattr(self._root, "after_idle", None)
         if callable(after_idle):
-            self._after_id = after_idle(self._poll)
+            self._after_id = str(after_idle(self._poll))
         else:
             self._after_id = self._root.after(_BACKLOG_FALLBACK_INTERVAL_MS, self._poll)
 

@@ -10,9 +10,5 @@ CairoSVG>=2.7.0,<3.0
 # access violation after extraction from a PyInstaller onefile bundle.
 # Keep the last pure-Python release until upstream packaging is compatible.
 chardet==5.2.0
-requests>=2.28.0
-aiohttp>=3.9.0
-openai>=1.0.0
 volcengine-python-sdk[ark]>=5.0.41,<6.0
-pydantic>=2.5.0,<3.0
 keyring>=24.0.0

@@ -8,8 +8,10 @@ import hashlib
 import re
 import threading
 import uuid
+from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, List
 
 from ..api.deepseek_api import DeepseekAPI
@@ -47,13 +49,46 @@ from .translation_result import (
 
 logger = get_logger(__name__)
 
-# PERF-001：预编译行号标记正则，避免在热路径重复编译
-_LINE_MARKER_RE = re.compile(r"\[LINE_\d+\]")
-_LINE_MARKER_PARSE_RE = re.compile(r"^\[LINE_(\d+)\](.*)$")
+# PERF-001：预编译行号标记正则，避免在热路径重复编译。
+#
+# 部分模型不会严格复现提示词中的 ``[LINE_001]``，而会改写为
+# ``[LINE-001]``、``[LINE 001]`` 或全角括号。标记本身是内部协议，
+# 因此在行首对这些等价写法做宽容解析；锚定行首则可避免误删正文中
+# 本来就存在的 ``[LINE-001]`` 字样。
+_LINE_MARKER_PATTERN = r"[\[［【]\s*LINE\s*[_\-‐‑‒–—－:：.．\s]*" r"(?P<line_number>\d+)\s*[\]］】]"
+_LINE_MARKER_RE = re.compile(_LINE_MARKER_PATTERN, re.IGNORECASE)
+_LINE_MARKER_PARSE_RE = re.compile(
+    rf"^\ufeff?[ \t]*(?:[-*+>][ \t]+)?(?:\*\*|__)?{_LINE_MARKER_PATTERN}"
+    r"(?:\*\*|__)?(?P<content>.*)$",
+    re.IGNORECASE,
+)
 _SMALL_MODEL_PROVIDER_REJECTION_MESSAGE = (
     "小模型逐行翻译的并发批次过大，已被服务商拒绝。"
     "翻译已停止；当前并发已限制为 1，请稍后重试或检查服务商限制。"
 )
+
+
+def _as_int(value: object, *, default: int, minimum: int | None = None) -> int:
+    """Convert untrusted configuration or provider advice to a safe integer."""
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        result = default
+    else:
+        try:
+            result = int(value)
+        except ValueError:
+            result = default
+    return max(minimum, result) if minimum is not None else result
+
+
+def _numeric_metrics(value: object) -> dict[str, int | float]:
+    """Accept only numeric counters from an optional provider metrics hook."""
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: metric
+        for key, metric in value.items()
+        if isinstance(key, str) and isinstance(metric, int | float) and not isinstance(metric, bool)
+    }
 
 
 def _small_model_terminal_error_message(error: TranslationRequestError) -> str:
@@ -115,10 +150,23 @@ class TranslationBatchPlan:
 
 def _clean_stream_line(line: str) -> str:
     """隐藏尚未接收完整的行号标记，避免协议文本闪现在 UI 中。"""
-    cleaned = _LINE_MARKER_RE.sub("", line)
-    if cleaned != line:
-        return cleaned
-    if "[LINE_".startswith(line) or (line.startswith("[LINE_") and "]" not in line):
+    match = _LINE_MARKER_PARSE_RE.match(line)
+    if match:
+        return match.group("content")
+
+    # 流式响应可能把标记拆在任意 chunk 边界（例如先收到 ``[LINE-``）。
+    # 只隐藏仍有可能组成行首标记的片段；一旦内容不再匹配 LINE 前缀，
+    # 就原样展示，避免吞掉普通的方括号正文。
+    candidate = line.lstrip("\ufeff \t")
+    if candidate[:1] in {"-", "*", "+", ">"}:
+        candidate = candidate[1:].lstrip(" \t")
+    if candidate.startswith(("**", "__")):
+        candidate = candidate[2:]
+    if candidate[:1] in {"[", "［", "【"}:
+        marker_body = candidate[1:].lstrip().upper()
+        if "LINE".startswith(marker_body) or marker_body.startswith("LINE"):
+            return ""
+    if not candidate or candidate in {"[", "［", "【"}:
         return ""
     return line
 
@@ -129,6 +177,7 @@ class TranslatorEngine:
         config_manager,
         *,
         limiter_registry: ProviderLimiterRegistry | None = None,
+        cache_dir: Path | str | None = None,
     ):
         self.config_manager = config_manager
         self.api = None
@@ -136,6 +185,8 @@ class TranslatorEngine:
         # 仅主编辑器注入。队列引擎由 Coordinator 在派发前直接取得同一 Limiter，
         # 因而不会在这里重复取槽。
         self._limiter_registry = limiter_registry
+        # STORAGE-7：解析后的缓存目录仅作为运行时注入，不写入 API 配置 JSON。
+        self._cache_dir = Path(cache_dir).resolve() if cache_dir is not None else None
 
         # 暂停/恢复支持
         self.pause_event = threading.Event()
@@ -159,6 +210,11 @@ class TranslatorEngine:
             self.api = None
 
         api_config = apply_text_translation_profile(self.config_manager.get_api_config())
+        cache_dir = getattr(self, "_cache_dir", None)
+        if cache_dir is not None:
+            cache_config = dict(api_config.get("cache_config", {}) or {})
+            cache_config["cache_dir"] = str(cache_dir)
+            api_config["cache_config"] = cache_config
         provider = api_config.get("provider", "siliconflow")
 
         if provider == "deepseek":
@@ -224,7 +280,7 @@ class TranslatorEngine:
         configured = max(512, int(configured_budget))
         budget_recommendation = getattr(self.api, "recommended_input_budget", None)
         if callable(budget_recommendation):
-            configured = budget_recommendation(configured)
+            configured = _as_int(budget_recommendation(configured), default=configured, minimum=512)
         context_window = max(4096, int(api_config.get("context_window_tokens", 32768)))
         context_safe_budget = max(512, context_window - DEFAULT_OUTPUT_TOKEN_RESERVE - 1024)
         return min(configured, context_safe_budget)
@@ -263,9 +319,9 @@ class TranslatorEngine:
             return {}
         metrics_getter = getattr(self.api, "get_performance_metrics", None)
         cache_getter = getattr(self.api, "get_cache_stats", None)
-        metrics = dict(metrics_getter()) if callable(metrics_getter) else {}
-        cache_stats = dict(cache_getter()) if callable(cache_getter) else {}
-        metrics["cache_hits"] = int(cache_stats.get("hits", 0))
+        metrics = _numeric_metrics(metrics_getter()) if callable(metrics_getter) else {}
+        cache_stats = _numeric_metrics(cache_getter()) if callable(cache_getter) else {}
+        metrics["cache_hits"] = _as_int(cache_stats.get("hits", 0), default=0, minimum=0)
         return metrics
 
     def close(self):
@@ -389,7 +445,11 @@ class TranslatorEngine:
             configured_input_budget = max(512, int(input_token_budget_override))
         budget_recommendation = getattr(self.api, "recommended_input_budget", None)
         if callable(budget_recommendation):
-            configured_input_budget = budget_recommendation(configured_input_budget)
+            configured_input_budget = _as_int(
+                budget_recommendation(configured_input_budget),
+                default=configured_input_budget,
+                minimum=512,
+            )
         context_window = max(4096, int(api_config.get("context_window_tokens", 32768)))
         context_safe_budget = max(512, context_window - DEFAULT_OUTPUT_TOKEN_RESERVE - 1024)
         input_token_budget = min(configured_input_budget, context_safe_budget)
@@ -416,36 +476,11 @@ class TranslatorEngine:
         # PERF §9.5：一次构造不可变运行上下文。
         # 后续所有批次复用同一份配置/提示词，避免逐批重复读取和构造。
         target_language = app_config.get("target_language", "中文")
-        base_prompt = app_config.get("translation_prompt", "")
-        glossary_prompt = self.config_manager.get_glossary_prompt()
-        model_name = api_config.get("model_name", "")
-        is_hunyuan = "Hunyuan-MT" in model_name or "hunyuan-mt" in model_name.lower()
-        system_prompt: str | None = None
-        if not is_hunyuan:
-            system_prompt = self._translation_system_prompt(
-                target_language, base_prompt, glossary_prompt
+        run_context = self.build_run_context()
+        if target_language != run_context.target_language:
+            logger.debug(
+                "translation settings changed while starting a run; using the latest snapshot"
             )
-        # PERF §9.5 D2/D3：temperature 与提示词/术语哈希一次计算，
-        # 避免 _translate_batch 在每个批次的 cache_context 块重读 api_config
-        # 并重算 SHA256（热路径哈希开销显著）。
-        run_temperature = float(api_config.get("temperature", 0.3))
-        prompt_schema_version = int(app_config.get("prompt_schema_version", 1))
-        prompt_version_input = f"schema:{prompt_schema_version}\n{base_prompt}"
-        run_prompt_version = hashlib.sha256(prompt_version_input.encode("utf-8")).hexdigest()[:16]
-        run_glossary_version = hashlib.sha256(glossary_prompt.encode("utf-8")).hexdigest()[:16]
-        run_context = TranslationRunContext(
-            provider=api_config.get("provider", ""),
-            model_name=model_name,
-            target_language=target_language,
-            base_prompt=base_prompt,
-            glossary_prompt=glossary_prompt,
-            system_prompt=system_prompt,
-            is_hunyuan=is_hunyuan,
-            temperature=run_temperature,
-            prompt_version=run_prompt_version,
-            prompt_schema_version=prompt_schema_version,
-            glossary_version=run_glossary_version,
-        )
 
         # 主编辑器与后台队列共用同一个 Provider 请求额度。主编辑器仍保留
         # translation_concurrency 作为本次任务的局部并发上限，但实际网络请求
@@ -618,7 +653,10 @@ class TranslatorEngine:
                 recommended = concurrency
                 recommendation = getattr(self.api, "recommended_concurrency", None)
                 if callable(recommendation):
-                    recommended = max(1, min(concurrency, recommendation(concurrency)))
+                    provider_recommendation = _as_int(
+                        recommendation(concurrency), default=concurrency, minimum=1
+                    )
+                    recommended = min(concurrency, provider_recommendation)
 
                 while (
                     next_batch < len(batch_ranges)
@@ -906,11 +944,16 @@ class TranslatorEngine:
                 # 单一超长行跨越大量分片时那仍会产生 O(n^2) 复制。
                 pending_parts: List[str] = []
                 preview_lines: List[str] = []
+                # 通用 LLM 的预览必须与最终解析使用同一套行号协议。
+                # 若直接按物理换行累加，模型用于排版的空白行会暂时占用
+                # 源文行位，直到批次完成后才被最终解析结果纠正。
+                marked_preview_lines: dict[int, str] = {}
+                published_prefix_count = 0
                 completed_count = 0
 
                 def stream_callback(chunk):
                     """流式回调：增量解析完整行，避免全量拼接"""
-                    nonlocal completed_count
+                    nonlocal completed_count, published_prefix_count
                     stream_buffer.append(chunk)
 
                     # 队列翻译只关心整批结果。跳过分片解析和 UI 回调可显著
@@ -918,6 +961,7 @@ class TranslatorEngine:
                     if not emit_stream_progress:
                         return
 
+                    stream_start_line = completed_count if is_hunyuan else published_prefix_count
                     chunk_parts = chunk.split("\n")
                     if len(chunk_parts) == 1:
                         pending_parts.append(chunk)
@@ -931,19 +975,50 @@ class TranslatorEngine:
 
                         if is_hunyuan:
                             new_lines = parts
+                            stream_start_line = completed_count
+                            preview_lines.extend(new_lines)
+                            completed_count += len(new_lines)
                         else:
-                            new_lines = [_clean_stream_line(line) for line in parts]
-                        preview_lines.extend(new_lines)
+                            # 只接受能够确认目标行号的完整行。空白分隔行、
+                            # Markdown 说明和其他未标记文本不会推进预览位置。
+                            for line in parts:
+                                match = _LINE_MARKER_PARSE_RE.match(line)
+                                if not match:
+                                    continue
+                                line_index = int(match.group("line_number")) - 1
+                                if 0 <= line_index < expected_lines:
+                                    marked_preview_lines[line_index] = match.group("content")
 
-                    stream_start_line = completed_count
-                    completed_count += len(new_lines)
+                            completed_count = len(marked_preview_lines)
+                            completed_prefix_count = 0
+                            while completed_prefix_count in marked_preview_lines:
+                                completed_prefix_count += 1
+
+                            stream_start_line = published_prefix_count
+                            new_lines = [
+                                marked_preview_lines[index]
+                                for index in range(published_prefix_count, completed_prefix_count)
+                            ]
+                            published_prefix_count = completed_prefix_count
 
                     partial_line = "".join(pending_parts)
-                    if not is_hunyuan:
-                        partial_line = _clean_stream_line(partial_line)
-                    current_preview = list(preview_lines)
-                    if partial_line:
-                        current_preview.append(partial_line)
+                    if is_hunyuan:
+                        current_preview = list(preview_lines)
+                        if partial_line:
+                            current_preview.append(partial_line)
+                    else:
+                        # 当前未换行的内容也只有在完整行号标记已出现后才展示。
+                        # 标记本身已完整但正文仍为空时不提前清空对应单元格。
+                        current_values = dict(marked_preview_lines)
+                        partial_match = _LINE_MARKER_PARSE_RE.match(partial_line)
+                        if partial_match and partial_match.group("content"):
+                            line_index = int(partial_match.group("line_number")) - 1
+                            if 0 <= line_index < expected_lines:
+                                current_values[line_index] = partial_match.group("content")
+
+                        current_preview = []
+                        while len(current_preview) in current_values:
+                            current_preview.append(current_values[len(current_preview)])
 
                     # 计算流式阶段的进度
                     if total_lines and total_lines > 0:
@@ -1029,7 +1104,8 @@ class TranslatorEngine:
                     response = self.api.translate_stream(legacy_prompt, stream_callback)
 
                 # 检查翻译结果是否有效
-                if not response or not response.strip():
+                response_text = response if isinstance(response, str) else ""
+                if not response_text or not response_text.strip():
                     # R2-BUG-009：用户取消时抛出 TranslationCancelled，不再返回空列表
                     if self.is_stopped:
                         raise TranslationCancelled(
@@ -1043,7 +1119,7 @@ class TranslatorEngine:
                             failed_indices=list(range(expected_lines)),
                         )
                 else:
-                    translated_content = response.strip()
+                    translated_content = response_text.strip()
 
                 # 解析翻译结果
                 if is_hunyuan:
@@ -1061,8 +1137,8 @@ class TranslatorEngine:
                     for line in all_lines:
                         match = _LINE_MARKER_PARSE_RE.match(line)
                         if match:
-                            line_num = int(match.group(1))
-                            content = match.group(2)
+                            line_num = int(match.group("line_number"))
+                            content = match.group("content")
                             line_mapping[line_num] = content
                         else:
                             if line.strip():

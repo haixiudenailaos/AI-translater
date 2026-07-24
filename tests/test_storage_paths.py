@@ -56,9 +56,10 @@ class TestDefaultResolution:
     def test_default_config_dirs_under_data_dir(self, resolver, tmp_app_paths):
         resolved = resolver.resolve(_storage())
         assert resolved.cache_dir == (tmp_app_paths.data_dir / "cache").resolve()
-        assert resolved.translation_backups_dir == (
-            tmp_app_paths.data_dir / "translation_backups"
-        ).resolve()
+        assert (
+            resolved.translation_backups_dir
+            == (tmp_app_paths.data_dir / "translation_backups").resolve()
+        )
 
 
 class TestDataRootResolution:
@@ -85,7 +86,9 @@ class TestDataRootResolution:
 
     def test_env_var_and_tilde_expansion(self, resolver, tmp_path, monkeypatch):
         monkeypatch.setenv("MY_DATA", str(tmp_path))
-        resolved = resolver.resolve(_storage(data_root="%MY_DATA%/root" if os.name == "nt" else "$MY_DATA/root"))
+        resolved = resolver.resolve(
+            _storage(data_root="%MY_DATA%/root" if os.name == "nt" else "$MY_DATA/root")
+        )
         assert resolved.data_root == (tmp_path / "root").resolve()
 
     def test_dotdot_resolved_to_absolute(self, resolver, tmp_path):
@@ -102,9 +105,7 @@ class TestOverrideResolution:
     def test_explicit_subdir_overrides_root(self, resolver, tmp_path):
         root = tmp_path / "root"
         fast_disk = tmp_path / "fast_cache"
-        resolved = resolver.resolve(
-            _storage(data_root=str(root), cache_dir=str(fast_disk))
-        )
+        resolved = resolver.resolve(_storage(data_root=str(root), cache_dir=str(fast_disk)))
         assert resolved.cache_dir == fast_disk.resolve()
         # 未覆盖的目录仍跟随 data_root
         assert resolved.translation_records_dir == (root / "translation_records").resolve()
@@ -186,8 +187,7 @@ class TestValidation:
         resolved = resolver.resolve(_storage(data_root=anchor))
         issues = resolver.validate(resolved)
         assert any(
-            not i.is_error and i.field == "data_root" and "根目录" in i.message
-            for i in issues
+            not i.is_error and i.field == "data_root" and "根目录" in i.message for i in issues
         )
 
     def test_valid_custom_dirs_pass(self, resolver, tmp_path):
@@ -268,9 +268,7 @@ class TestConfigManagerStorageSection:
         assert app_config["storage"] == DEFAULT_STORAGE_CONFIG
 
     def test_update_storage_config_persists(self, tmp_config_manager, tmp_path):
-        ok = tmp_config_manager.update_storage_config(
-            {"data_root": str(tmp_path / "新目录")}
-        )
+        ok = tmp_config_manager.update_storage_config({"data_root": str(tmp_path / "新目录")})
         assert ok is True
         storage = tmp_config_manager.get_storage_config()
         assert storage["data_root"] == str(tmp_path / "新目录")
@@ -290,9 +288,7 @@ class TestConfigManagerStorageSection:
         tmp_config_manager.update_storage_config({"data_root": "", "junk": 1})
         assert "junk" not in tmp_config_manager.get_storage_config()
 
-    def test_legacy_config_without_storage_loads_defaults(
-        self, tmp_config_manager, tmp_path
-    ):
+    def test_legacy_config_without_storage_loads_defaults(self, tmp_config_manager, tmp_path):
         """旧版本 app_config.json 没有 storage 段时自动补默认值。"""
         import json
 

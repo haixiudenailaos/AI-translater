@@ -38,10 +38,12 @@ class ExportJob:
         output_path: Path,
         save_mapping: Callable[[], None],
         export_to: Callable[[Path], Path | str],
+        backup_existing: Callable[[Path], None] | None = None,
     ) -> None:
         self._output_path = Path(output_path)
         self._save_mapping = save_mapping
         self._export_to = export_to
+        self._backup_existing = backup_existing
         self._cancel_event = threading.Event()
         self._events: queue.SimpleQueue[ExportProgress | ExportResult] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
@@ -99,6 +101,10 @@ class ExportJob:
                 self._events.put(ExportResult(None, cancelled=True))
                 return
 
+            if self._backup_existing is not None and self._output_path.is_file():
+                self._publish_stage("backup", "正在备份已有译文…")
+                self._backup_existing(self._output_path)
+
             self._publish_stage("publish", "正在安全替换目标文件…")
             os.replace(temporary_path, self._output_path)
             temporary_path = None
@@ -146,11 +152,13 @@ class TextExportJob:
         build_content: Callable[[], str],
         write_content: Callable[[Path, str], None],
         save_mapping: Callable[[], None] | None = None,
+        backup_existing: Callable[[Path], None] | None = None,
     ) -> None:
         self._output_path = Path(output_path)
         self._build_content = build_content
         self._write_content = write_content
         self._save_mapping = save_mapping
+        self._backup_existing = backup_existing
         self._cancel_event = threading.Event()
         self._events: queue.SimpleQueue[ExportProgress | ExportResult] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
@@ -206,6 +214,10 @@ class TextExportJob:
                 if self._cancel_event.is_set():
                     self._events.put(ExportResult(None, cancelled=True))
                     return
+
+            if self._backup_existing is not None and self._output_path.is_file():
+                self._publish_stage("backup", "正在备份已有译文…")
+                self._backup_existing(self._output_path)
 
             self._publish_stage("publish", "Publishing text export...")
             os.replace(temporary_path, self._output_path)

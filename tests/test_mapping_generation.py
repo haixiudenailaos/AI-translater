@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from src.infrastructure import mapping_repository as repository
-from src.infrastructure.image_asset_store import load_image_bytes, migrate_legacy_images
+from src.infrastructure.image_asset_store import (
+    IMAGE_MAPPING_SCHEMA_VERSION,
+    load_image_bytes,
+    migrate_legacy_images,
+)
 
 
 def _content_payload(translation: str = "") -> dict:
@@ -123,9 +127,7 @@ def _count_unreachable_generation_dirs(mapping_dir: Path) -> int:
     if manifest is None:
         return 0
     reachable = repository._reachable_generation_names(manifest)
-    return sum(
-        1 for p in gen_root.iterdir() if p.is_dir() and p.name not in reachable
-    )
+    return sum(1 for p in gen_root.iterdir() if p.is_dir() and p.name not in reachable)
 
 
 def test_gc_keeps_only_active_generation_after_repeated_bundle_publishes(tmp_path):
@@ -260,7 +262,7 @@ def test_legacy_image_migration_publishes_a_new_images_generation(tmp_path):
     migrated = json.loads(new_images.read_text(encoding="utf-8"))
     image_info = migrated["image_mappings"]["Images/legacy.png"]
     assert new_images != old_images
-    assert migrated["schema_version"] == 2
+    assert migrated["schema_version"] == IMAGE_MAPPING_SCHEMA_VERSION
     assert image_info["local_path"].startswith("assets/")
     assert load_image_bytes(tmp_path, image_info) == image_data
     assert repository.resolve_mapping_file(tmp_path, "content_mapping.json") == old_content
