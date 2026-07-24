@@ -238,8 +238,13 @@ class FileHandler:
         except Exception:
             return False
 
-    def backup_file(self, file_path: str) -> str | None:
-        """备份文件"""
+    def backup_file(self, file_path: str, backup_dir: "Path | str | None" = None) -> str | None:
+        """备份文件。
+
+        STORAGE-6：可选 ``backup_dir`` 指定备份目标目录（应传入
+        ``ResolvedStoragePaths.translation_backups_dir``），避免备份
+        散落在源文件旁边；缺省保持旧行为（源文件旁），兼容存量调用。
+        """
         try:
             file_path = Path(file_path)
 
@@ -247,14 +252,26 @@ class FileHandler:
                 return None
 
             # 生成备份文件名
-            backup_path = file_path.with_suffix(f".backup{file_path.suffix}")
+            if backup_dir is not None:
+                target_dir = Path(backup_dir)
+                target_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = target_dir / f"{file_path.stem}.backup{file_path.suffix}"
+            else:
+                backup_path = file_path.with_suffix(f".backup{file_path.suffix}")
 
             # 如果备份文件已存在，添加时间戳
             if backup_path.exists():
                 from datetime import datetime
 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_path = file_path.with_suffix(f".backup_{timestamp}{file_path.suffix}")
+                if backup_dir is not None:
+                    backup_path = backup_path.with_name(
+                        f"{file_path.stem}.backup_{timestamp}{file_path.suffix}"
+                    )
+                else:
+                    backup_path = file_path.with_suffix(
+                        f".backup_{timestamp}{file_path.suffix}"
+                    )
 
             # 复制文件
             import shutil
