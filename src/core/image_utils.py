@@ -154,7 +154,7 @@ def _convert_with_pillow(raw: bytes) -> bytes | None:
         img = Image.open(io.BytesIO(raw))
 
         # GIF取第一帧
-        if hasattr(img, "n_frames") and img.n_frames > 1:
+        if getattr(img, "n_frames", 1) > 1:
             img.seek(0)
 
         # 处理透明通道
