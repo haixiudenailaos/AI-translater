@@ -3,9 +3,13 @@
 设置窗口模块
 """
 
+import os
+import subprocess
+import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from ..config.image_ocr import SILICONFLOW_OCR_DEFAULT_MODEL
 from ..config.translation_profile import (
@@ -59,10 +63,20 @@ class SettingsWindow:
         parent,
         config_manager,
         callback=None,
+        *,
+        app_paths=None,
+        storage_service=None,
     ):
         self.parent = parent
         self.config_manager = config_manager
         self.callback = callback
+        # STORAGE-4：数据与存储设置页的依赖（可为 None，此时隐藏该区域）
+        self.app_paths = app_paths
+        self._storage_service = storage_service
+        # 保存成功后是否需要重启提示（数据目录变更）
+        self._storage_needs_restart = False
+        # 迁移执行中的 busy 标记，防止重复点击
+        self._storage_apply_busy = False
         # P2-5：表单字段级校验器 + testing busy 状态（防止连接测试/模块检测
         # 重复启动，避免用户在测试中误触发多次付费请求）。
         self._form_validator = FormValidator()
@@ -280,6 +294,10 @@ class SettingsWindow:
 
         # 图生图配置页面 -> 插图翻译配置页面
         self.create_volc_tab(notebook)
+
+        # STORAGE-4：数据与存储页面（仅在组合根注入 service 时可见）
+        if getattr(self, "_storage_service", None) is not None:
+            self.create_storage_tab(notebook)
 
         self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
 
@@ -1011,6 +1029,304 @@ class SettingsWindow:
         fee_tip.grid(row=15, column=0, columnspan=3, padx=10, pady=(0, 10), sticky=tk.EW)
         fee_tip.bind("<Configure>", lambda e: fee_tip.configure(wraplength=e.width - 4))
 
+    # ── STORAGE-4/5：数据与存储设置页 ─────────────────────
+
+    #: (配置字段, 标签, 说明)——留空表示跟随数据根目录，数据根目录留空表示
+    #: 使用平台默认目录。logs_dir 本版本为预留字段，不暴露在界面上。
+    STORAGE_FIELDS = (
+        ("data_root", "数据根目录:", "所有数据的默认父目录；留空使用平台默认目录"),
+        ("cache_dir", "缓存目录:", "留空跟随数据根目录（本版本缓存为内存缓存，此项预留）"),
+        ("translation_records_dir", "翻译中间记录目录:", "TXT 项目、EPUB 映射、断点续传记录；留空跟随数据根目录"),
+        ("translation_backups_dir", "译文备份目录:", "译文历史版本备份；留空跟随数据根目录"),
+    )
+    _STORAGE_OPEN_ATTR = {
+        "data_root": "data_root",
+        "cache_dir": "cache_dir",
+        "translation_records_dir": "translation_records_dir",
+        "translation_backups_dir": "translation_backups_dir",
+    }
+
+    def create_storage_tab(self, notebook):
+        """创建“数据与存储”设置页（STORAGE-4）。
+
+        控件行为（§5 第四步）：输入框显示当前配置值（空 = 跟随默认），
+        预览区显示最终解析路径；“打开目录”打开最终解析后的目录而非空
+        配置值；“恢复默认”清除自定义值。
+        """
+        storage_frame = self._create_scrollable_tab(notebook, "数据与存储")
+        storage_frame.grid_columnconfigure(1, weight=1)
+
+        current = self._storage_service.current_storage()
+        self._storage_vars = {}
+
+        tip = ttk.Label(
+            storage_frame,
+            text=(
+                "自定义缓存、翻译中间记录和译文备份的保存位置。留空表示跟随数据根目录；"
+                "数据根目录留空表示使用平台默认目录。修改将在下次启动应用后生效。"
+            ),
+            foreground=COLORS["muted"],
+            justify=tk.LEFT,
+        )
+        tip.grid(row=0, column=0, columnspan=4, padx=10, pady=(10, 8), sticky=tk.EW)
+        tip.bind("<Configure>", lambda e: tip.configure(wraplength=e.width - 4))
+
+        row = 1
+        for field, label, hint in self.STORAGE_FIELDS:
+            ttk.Label(storage_frame, text=label).grid(
+                row=row, column=0, sticky=tk.W, padx=10, pady=6
+            )
+            var = tk.StringVar(value=current.get(field, ""))
+            self._storage_vars[field] = var
+            entry = ttk.Entry(storage_frame, textvariable=var, width=48)
+            entry.grid(row=row, column=1, padx=10, pady=6, sticky=tk.EW)
+            entry.bind("<FocusOut>", lambda _e: self._refresh_storage_preview(), add="+")
+            ttk.Button(
+                storage_frame,
+                text="浏览…",
+                width=8,
+                command=lambda f=field: self._browse_storage_dir(f),
+            ).grid(row=row, column=2, padx=(0, 4), pady=6)
+            ttk.Button(
+                storage_frame,
+                text="打开目录",
+                width=10,
+                command=lambda f=field: self._open_storage_dir(f),
+            ).grid(row=row, column=3, padx=(0, 10), pady=6)
+
+            hint_label = ttk.Label(
+                storage_frame, text=hint, foreground=COLORS["muted"], justify=tk.LEFT
+            )
+            hint_label.grid(row=row + 1, column=1, columnspan=3, padx=10, sticky=tk.EW)
+            row += 2
+
+        # 最终路径预览（§5 第四步：保存前先显示最终路径预览）
+        ttk.Label(
+            storage_frame, text="最终路径预览:", font=("TkDefaultFont", 9, "bold")
+        ).grid(row=row, column=0, columnspan=4, sticky=tk.W, padx=10, pady=(12, 4))
+        row += 1
+        preview_frame = ttk.Frame(storage_frame)
+        preview_frame.grid(row=row, column=0, columnspan=4, padx=10, sticky=tk.EW)
+        preview_frame.grid_columnconfigure(0, weight=1)
+        self._storage_preview_text = tk.Text(
+            preview_frame, height=8, wrap=tk.NONE, state=tk.DISABLED
+        )
+        preview_scroll = ttk.Scrollbar(
+            preview_frame, orient=tk.VERTICAL, command=self._storage_preview_text.yview
+        )
+        self._storage_preview_text.configure(yscrollcommand=preview_scroll.set)
+        self._storage_preview_text.grid(row=0, column=0, sticky=tk.EW)
+        preview_scroll.grid(row=0, column=1, sticky=tk.NS)
+        row += 1
+
+        button_row = ttk.Frame(storage_frame)
+        button_row.grid(row=row, column=0, columnspan=4, padx=10, pady=10, sticky=tk.W)
+        ttk.Button(
+            button_row, text="恢复默认", command=self._reset_storage_defaults
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            button_row, text="刷新预览", command=self._refresh_storage_preview
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        self._refresh_storage_preview()
+
+    def _storage_candidate_from_form(self):
+        """从表单收集候选 storage 配置（保留 schema_version 等非路径字段）。"""
+        candidate = self._storage_service.current_storage()
+        for field, _label, _hint in self.STORAGE_FIELDS:
+            candidate[field] = self._storage_vars[field].get().strip()
+        return candidate
+
+    def _refresh_storage_preview(self):
+        """解析当前表单值并刷新最终路径预览（纯解析，不触碰磁盘）。"""
+        service = getattr(self, "_storage_service", None)
+        preview = getattr(self, "_storage_preview_text", None)
+        if service is None or preview is None:
+            return
+        candidate = self._storage_candidate_from_form()
+        resolved, issues, resolve_error = service.preview(candidate)
+        lines = []
+        if resolve_error:
+            lines.append(f"错误：{resolve_error}")
+        else:
+            for label, path in resolved.display_items():
+                lines.append(f"{label}：{path}")
+            for issue in issues:
+                marker = "错误" if issue.is_error else "提示"
+                lines.append(f"{marker}：{issue.message}")
+        preview.configure(state=tk.NORMAL)
+        preview.delete(1.0, tk.END)
+        preview.insert(1.0, "\n".join(lines))
+        preview.configure(state=tk.DISABLED)
+
+    def _browse_storage_dir(self, field):
+        """选择目录并写入对应输入框（取消时不改变任何值）。"""
+        current_value = self._storage_vars[field].get().strip()
+        initial = current_value or str(self._storage_service.current_paths().data_root)
+        chosen = filedialog.askdirectory(parent=self.window, initialdir=initial)
+        if not chosen:
+            return
+        self._storage_vars[field].set(chosen)
+        self._refresh_storage_preview()
+
+    def _open_storage_dir(self, field):
+        """打开最终解析后的目录（§5 第四步：打开解析结果而非空配置值）。"""
+        service = self._storage_service
+        candidate = self._storage_candidate_from_form()
+        resolved, _issues, resolve_error = service.preview(candidate)
+        if resolve_error or resolved is None:
+            messagebox.showwarning("路径无效", resolve_error, parent=self.window)
+            return
+        target = Path(getattr(resolved, self._STORAGE_OPEN_ATTR[field]))
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showwarning(
+                "无法打开目录", f"创建目录失败：{exc}", parent=self.window
+            )
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(target))  # noqa: S606 - 打开用户自己的数据目录
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except OSError as exc:
+            messagebox.showwarning(
+                "无法打开目录", f"{exc}", parent=self.window
+            )
+
+    def _reset_storage_defaults(self):
+        """清除所有自定义目录，恢复平台默认（§5 第四步）。"""
+        for var in self._storage_vars.values():
+            var.set("")
+        self._refresh_storage_preview()
+
+    def _apply_storage_settings(self) -> bool:
+        """保存数据目录设置（STORAGE-5 切换流程）。返回是否允许关闭窗口。
+
+        流程：解析校验 → （有变化且有旧数据时）询问迁移/保留/取消 →
+        后台线程执行 apply（含迁移）→ 失败保留窗口与旧配置。
+        """
+        service = getattr(self, "_storage_service", None)
+        if service is None:
+            return True
+        if getattr(self, "_storage_apply_busy", False):
+            messagebox.showinfo(
+                "请稍候", "数据目录设置正在应用中，请稍候。", parent=self.window
+            )
+            return False
+
+        candidate = self._storage_candidate_from_form()
+        resolved, issues, resolve_error = service.preview(candidate)
+        if resolve_error:
+            messagebox.showerror("数据目录无效", resolve_error, parent=self.window)
+            return False
+        errors = [issue for issue in issues if issue.is_error]
+        if errors:
+            messagebox.showerror(
+                "数据目录无效",
+                "\n".join(f"• {issue.message}" for issue in errors),
+                parent=self.window,
+            )
+            return False
+        warnings = [issue for issue in issues if not issue.is_error]
+        if warnings:
+            proceed = messagebox.askyesno(
+                "数据目录提示",
+                "\n".join(f"• {issue.message}" for issue in warnings)
+                + "\n\n仍要保存吗？",
+                parent=self.window,
+            )
+            if not proceed:
+                return False
+
+        if not service.paths_changed(candidate):
+            return True  # 目录未变化，无需写入
+
+        # 翻译任务守卫（§1：翻译进行中不允许切换正在使用的目录）
+        migrate_data = False
+        if service.source_has_data(candidate):
+            choice = messagebox.askyesnocancel(
+                "迁移旧数据",
+                "旧目录中已有翻译项目 / 映射 / 备份数据。\n\n"
+                "是：迁移到新目录（复制并校验，旧目录保留不删除）\n"
+                "否：保留原位置，新目录从空开始\n"
+                "取消：放弃本次目录修改",
+                parent=self.window,
+            )
+            if choice is None:
+                return False
+            migrate_data = bool(choice)
+
+        self._storage_apply_busy = True
+        try:
+            self._run_storage_apply(candidate, migrate_data)
+        finally:
+            self._storage_apply_busy = False
+
+        result = getattr(self, "_storage_apply_result", None)
+        if result is None:
+            return False
+        if not result.ok:
+            messagebox.showerror(
+                "数据目录保存失败",
+                result.message or "未知错误，旧配置保持不变",
+                parent=self.window,
+            )
+            return False
+        if result.needs_restart:
+            self._storage_needs_restart = True
+        return True
+
+    def _run_storage_apply(self, candidate, migrate_data):
+        """在 worker 线程执行 apply（迁移可能耗时），主线程显示进度对话框。
+
+        通过 ``wait_window`` 阻塞直到 worker 完成，结果存放在
+        ``self._storage_apply_result`` 供调用方读取。进度回调经 UI 邮箱
+        泵回主线程，不直接跨线程调用 Tk API（P1-1）。
+        """
+        self._storage_apply_result = None
+        dialog = tk.Toplevel(self.window)
+        dialog.title("应用数据目录设置")
+        dialog.transient(self.window)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        # 迁移/写入进行中禁止关闭对话框，避免用户误判状态
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        ttk.Label(dialog, text="正在应用数据目录设置，请勿关闭应用...").pack(
+            padx=20, pady=(20, 4)
+        )
+        progress_var = tk.StringVar(value="准备中...")
+        ttk.Label(dialog, textvariable=progress_var, foreground=COLORS["muted"]).pack(
+            padx=20, pady=(0, 8)
+        )
+        bar = ttk.Progressbar(dialog, mode="indeterminate", length=340)
+        bar.pack(padx=20, pady=(0, 20))
+        bar.start(12)
+
+        def worker():
+            def report(message):
+                self._safe_after(lambda m=message: progress_var.set(m))
+
+            try:
+                result = self._storage_service.apply(
+                    candidate,
+                    migrate_data=migrate_data,
+                    progress_callback=report if migrate_data else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - 兜底，绝不让 worker 静默死亡
+                from ..application.storage_settings import StorageApplyResult
+
+                result = StorageApplyResult(status="error", message=f"应用过程出错: {exc}")
+            self._storage_apply_result = result
+            self._safe_after(dialog.destroy)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.window.wait_window(dialog)
+
     def test_volc_connection(self):
         """测试插图翻译连接。
 
@@ -1456,6 +1772,11 @@ class SettingsWindow:
                 messagebox.showerror("保存失败", error_msg, parent=self.window)
                 return
 
+            # STORAGE-5：数据目录设置（校验/迁移失败时保留窗口与旧配置，
+            # 其他设置已保存不受影响）
+            if not self._apply_storage_settings():
+                return
+
             # P1-2：SESSION_ONLY 时提示密钥未持久化（不阻断流程，但仍保存成功）
             session_only_msgs = []
             if volc_result.session_only:
@@ -1464,6 +1785,11 @@ class SettingsWindow:
                 session_only_msgs.append(ocr_result.user_message)
             if api_result.session_only:
                 session_only_msgs.append(api_result.user_message)
+
+            # STORAGE-4：数据目录变更后明确提示重启生效，保证“成功提示与
+            # 实际磁盘写入位置一致”（§10 验收 7）
+            if getattr(self, "_storage_needs_restart", False):
+                session_only_msgs.append("数据目录已更新，将在下次启动应用后生效。")
 
             if session_only_msgs:
                 messagebox.showinfo(

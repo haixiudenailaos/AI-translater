@@ -90,13 +90,17 @@ class ConcurrentTranslationManager:
         app_paths=None,
         *,
         limiter_registry=None,
+        storage_paths=None,
     ):
         # ``max_concurrent`` 旧参数保留但不使用（新调度由 QueuePolicy.hard_request_cap 主导）。
         # 仅为向后兼容旧构造签名。
         self.config_manager = config_manager
         self.app_paths = app_paths
+        # STORAGE-3：统一数据目录对象（ResolvedStoragePaths），未注入时
+        # 回退到 app_paths 推导（保持旧行为）。
+        self.storage_paths = storage_paths
         self._file_handler = FileHandler()
-        self._epub_processor = EPUBProcessor(app_paths=app_paths)
+        self._epub_processor = EPUBProcessor(app_paths=app_paths, storage_paths=storage_paths)
 
         # 静态任务元数据（task_id -> dict），add_task 时填入
         self._task_meta: Dict[str, dict] = {}
@@ -105,17 +109,22 @@ class ConcurrentTranslationManager:
         self._progress_callback: Callable | None = None
         self._closed = False
 
-        # P1-UX-2：TXT 跨重启续传的项目仓库。从 app_paths.data_dir/projects
-        # 加载/保存项目状态。app_paths 为 None（旧测试路径）时不接入，
-        # Coordinator 降级为只写 _译文.txt 的旧行为。
+        # P1-UX-2：TXT 跨重启续传的项目仓库。
+        # STORAGE-3：优先从 storage_paths.projects_dir 取目录；未注入时
+        # 维持旧行为（app_paths.data_dir/projects）。两者都为 None
+        # （旧测试路径）时不接入，Coordinator 降级为只写 _译文.txt 的旧行为。
         self._project_repository = None
-        if app_paths is not None:
-            try:
-                from pathlib import Path
+        projects_dir = None
+        if storage_paths is not None:
+            projects_dir = storage_paths.projects_dir
+        elif app_paths is not None:
+            from pathlib import Path
 
+            projects_dir = Path(app_paths.data_dir) / "projects"
+        if projects_dir is not None:
+            try:
                 from ..infrastructure.project_repository import ProjectRepository
 
-                projects_dir = Path(app_paths.data_dir) / "projects"
                 self._project_repository = ProjectRepository(projects_dir)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("初始化 ProjectRepository 失败，TXT 续传降级: %s", exc)

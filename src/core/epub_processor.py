@@ -123,12 +123,19 @@ class EPUBProcessor:
     # 阶段 4：BLOCK_TAGS 委托到 segment_extractor
     BLOCK_TAGS = _BLOCK_TAGS
 
-    def __init__(self, app_paths=None):
+    def __init__(self, app_paths=None, *, storage_paths=None):
         # BUG-001：通过 AppPaths 接收统一工作区目录，避免依赖当前工作目录
         if app_paths is not None:
             self._workspace_dir = Path(app_paths.workspace_dir)
         else:
             self._workspace_dir = Path.cwd() / "workspace"
+        # STORAGE-3：EPUB 映射根目录统一来自 ResolvedStoragePaths.mappings_dir，
+        # 不再自行拼接 workspace_dir/"mappings"。未注入 storage_paths 时
+        # 保持旧行为（兼容旧测试与直接构造的调用方）。
+        if storage_paths is not None:
+            self._mappings_root = Path(storage_paths.mappings_dir)
+        else:
+            self._mappings_root = self._workspace_dir / "mappings"
 
     # ── BUG-003：稳定项目标识 ─────────────────────────
 
@@ -224,7 +231,8 @@ class EPUBProcessor:
         # BUG-003：使用稳定项目 ID（文件名+路径哈希），不同目录下同名 EPUB 生成不同工作区
         project_id = self._compute_project_id(epub_path)
 
-        mapping_root = self._workspace_dir / "mappings"
+        # STORAGE-3：映射根目录由构造时注入（默认等于 workspace_dir/mappings）
+        mapping_root = self._mappings_root
         mapping_dir = mapping_root / project_id
         mapping_dir.mkdir(parents=True, exist_ok=True)
 

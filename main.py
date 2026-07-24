@@ -85,14 +85,35 @@ class TranslatorApp:
                 self.root,
                 config_manager,
                 app_paths=app_paths,
+                storage_paths=self.app_context.storage_paths,
             )
             if self._loading_frame is not None:
                 self._loading_frame.destroy()
                 self._loading_frame = None
+            self._notify_interrupted_migration()
         except Exception as exc:
             logger.exception("应用初始化失败")
             messagebox.showerror("启动错误", f"应用启动失败: {exc}")
             self.root.destroy()
+
+    def _notify_interrupted_migration(self):
+        """STORAGE-5：提示上次未完成的数据目录迁移（§5：启动时发现
+        staging/failed 状态的清单应提示用户，不静默当作完整数据目录）。"""
+        try:
+            interrupted = getattr(self.app_context, "interrupted_migration", None)
+        except Exception:  # noqa: BLE001
+            return
+        if not interrupted:
+            return
+        target = interrupted.get("target_root", "")
+        status = interrupted.get("status", "")
+        messagebox.showwarning(
+            "数据迁移未完成",
+            "上次切换数据目录的迁移未完成（状态：%s）。\n\n"
+            "当前仍使用旧目录，数据未丢失。可在 设置 → 数据与存储 中重新应用，"
+            "或手动删除新目录下的 .migration 文件夹。\n\n目标目录：%s" % (status, target),
+            parent=self.root,
+        )
 
     def on_closing(self):
         """应用关闭时的处理（ENG-1：分阶段保存与关闭）

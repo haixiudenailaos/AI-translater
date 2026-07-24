@@ -24,6 +24,7 @@ from .image_ocr import (
     SILICONFLOW_OCR_DEFAULT_BASE_URL,
     SILICONFLOW_OCR_DEFAULT_MODEL,
 )
+from .storage_config import DEFAULT_STORAGE_CONFIG, normalize_storage_config
 from .translation_profile import (
     DEFAULT_QUEUE_ADAPTIVE_CONCURRENCY,
     DEFAULT_QUEUE_HARD_REQUEST_CAP,
@@ -136,6 +137,10 @@ class ConfigManager:
                 "completed_steps": [],
                 "auto_show": True,
             },
+            # STORAGE-1：数据目录配置段（缓存/中间记录/备份/数据根目录）。
+            # 字段语义见 config/storage_config.py；路径解析由
+            # infrastructure/storage_paths.py 统一完成，业务模块不得直接读取。
+            "storage": copy.deepcopy(DEFAULT_STORAGE_CONFIG),
         }
 
         self.default_glossary = {"terms": [], "categories": ["通用", "技术", "专业"]}
@@ -519,6 +524,11 @@ class ConfigManager:
                     merged_config["onboarding"] = self._normalize_onboarding_config(
                         merged_config.get("onboarding")
                     )
+                    # STORAGE-1：storage 段归一化（与 onboarding 同一模式，
+                    # 顶层浅合并不会处理嵌套字段）。
+                    merged_config["storage"] = normalize_storage_config(
+                        merged_config.get("storage")
+                    )
                     self._migrate_translation_prompt(config, merged_config)
                     return merged_config
         except (OSError, json.JSONDecodeError) as e:
@@ -527,6 +537,7 @@ class ConfigManager:
         result = self.default_app_config.copy()
         result["image_translation"] = self._migrate_image_translation_config(None)
         result["onboarding"] = self._normalize_onboarding_config(None)
+        result["storage"] = normalize_storage_config(None)
         result["prompt_schema_version"] = DEFAULT_PROMPT_SCHEMA_VERSION
         return result
 
@@ -623,6 +634,45 @@ class ConfigManager:
         """获取图片翻译配置段。"""
         with self._app_config_lock:
             return copy.deepcopy(self.app_config.get("image_translation", {}))
+
+    def get_storage_config(self) -> Dict[str, Any]:
+        """获取数据目录（storage）配置段（STORAGE-1）。
+
+        返回归一化后的深拷贝；调用方修改返回值不会影响内存配置。
+        业务模块不应直接消费该 dict，应通过
+        ``infrastructure.storage_paths.StoragePathResolver`` 取得最终路径。
+        """
+        with self._app_config_lock:
+            return normalize_storage_config(self.app_config.get("storage"))
+
+    def update_storage_config(self, storage: Dict[str, Any], *, persist: bool = True) -> bool:
+        """更新 storage 配置段（STORAGE-1）。
+
+        先归一化候选值，再作为 app_config 的一部分原子写回；写入失败时
+        内存配置保持不变（不发布半新半旧状态），返回 False 由调用方提示。
+
+        Args:
+            storage: 新的 storage 配置段（允许含未知键，归一化时丢弃）。
+            persist: False 时只更新内存快照（测试用），不写盘。
+
+        Returns:
+            是否成功。persist=True 时以磁盘写入结果为准。
+        """
+        candidate_section = normalize_storage_config(storage)
+        with self._app_config_lock:
+            candidate = copy.deepcopy(self.app_config)
+            candidate["storage"] = candidate_section
+            if not persist:
+                self.app_config = candidate
+                return True
+            try:
+                # BUG-006：原子写入，失败时旧文件与内存都保持不变
+                write_json_atomic(self.app_config_file, candidate)
+                self.app_config = candidate
+                return True
+            except OSError as exc:
+                logger.error("保存 storage 配置失败: %s", exc)
+                return False
 
     def get_image_ocr_runtime_config(self) -> Dict[str, Any]:
         """Resolve the OCR endpoint without exposing one provider's key to another.

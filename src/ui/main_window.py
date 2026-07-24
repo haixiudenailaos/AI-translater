@@ -38,10 +38,12 @@ logger = get_logger(__name__)
 
 
 class MainWindow:
-    def __init__(self, root, config_manager, app_paths=None):
+    def __init__(self, root, config_manager, app_paths=None, *, storage_paths=None):
         self.root = root
         self.config_manager = config_manager
         self.app_paths = app_paths
+        # STORAGE-3：统一数据目录对象（ResolvedStoragePaths），由 bootstrap 注入
+        self.storage_paths = storage_paths
         from ..core.queue_provider import ProviderLimiterRegistry
 
         # 应用级文本请求额度：主编辑器和后台队列通过同一注册表取槽。
@@ -54,7 +56,10 @@ class MainWindow:
         )
         self.file_handler = LazyService("src.utils.file_handler", "FileHandler")
         self.epub_processor = LazyService(
-            "src.core.epub_processor", "EPUBProcessor", app_paths=app_paths
+            "src.core.epub_processor",
+            "EPUBProcessor",
+            app_paths=app_paths,
+            storage_paths=storage_paths,
         )
 
         # PERF §8：自动保存状态由 AutosaveCoordinator 管理（generation 状态机），
@@ -1471,13 +1476,52 @@ class MainWindow:
     # ── 窗口打开 ──────────────────────────────────────
 
     def open_settings(self):
+        from ..application.storage_settings import StorageSettingsService
         from .settings_window import SettingsWindow
 
+        # STORAGE-4：数据与存储设置页的后端用例。未接入 app_paths 的
+        # 旧调用路径（测试）下 service 为 None，设置页自动隐藏该区域。
+        storage_service = None
+        if self.app_paths is not None:
+            storage_service = StorageSettingsService(
+                self.config_manager,
+                self.app_paths,
+                is_task_active=self._has_unfinished_translation_tasks,
+            )
         SettingsWindow(
             self.root,
             self.config_manager,
             self._on_settings_updated,
+            app_paths=self.app_paths,
+            storage_service=storage_service,
         )
+
+    def _has_unfinished_translation_tasks(self) -> bool:
+        """STORAGE-5：是否存在未完结的翻译任务（主界面或后台队列）。
+
+        数据目录切换前必须确认没有任务正在向旧目录写入，否则会产生
+        半新半旧路径（§1 原则）。
+        """
+        controller = getattr(self, "translation_controller", None)
+        if controller is not None and getattr(controller, "is_translating", False):
+            return True
+        manager = getattr(self, "_queue_manager", None)
+        if manager is not None:
+            try:
+                from ..domain.project import TaskStatus
+
+                unfinished = {
+                    TaskStatus.PENDING,
+                    TaskStatus.RUNNING,
+                    TaskStatus.PAUSED,
+                    TaskStatus.PARTIAL,
+                }
+                for task in manager.get_all_tasks():
+                    if task.status in unfinished:
+                        return True
+            except Exception:  # noqa: BLE001 - 查询失败按无任务处理
+                pass
+        return False
 
     def open_onboarding(self):
         """帮助 > 新手指导：手动重新打开引导，忽略自动展示条件。"""
@@ -1512,6 +1556,8 @@ class MainWindow:
                 self.config_manager,
                 app_paths=self.app_paths,
                 limiter_registry=self._provider_limiter_registry,
+                # getattr 防御：兼容 __new__ 绕过 __init__ 的测试路径
+                storage_paths=getattr(self, "storage_paths", None),
             )
         self._concurrent_window = ConcurrentWindow(
             self.root,
