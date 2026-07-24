@@ -245,13 +245,29 @@ class TkUICallbackPump:
         return callbacks
 
     def _poll(self) -> None:
-        """排空邮箱并执行回调。只在 Tk 主线程执行。"""
+        """排空邮箱并执行回调。只在 Tk 主线程执行。
+
+        E-1（审计 §P1-PERF-4）：接通 8ms 单帧预算：
+        - 每执行一个 callback 后检查 time.perf_counter()。
+        - 达到 max_frame_ms 即把剩余回调推入 _deferred_callbacks，yield 给 Tk。
+        - 有积压：after_idle 调度下一帧；全空：idle_interval_ms（250ms）低频轮询。
+        - 更新帧指标：last_frame_duration_ms、max_frame_duration_ms、over_budget_frame_count。
+        """
         self._after_id = None
         if self._closed:
             return
+
         callbacks = self._take_callbacks_for_frame()
+        if not callbacks:
+            # 队列空闲，低频轮询节省 CPU
+            self._schedule_idle_poll()
+            return
+
+        frame_start = time.perf_counter()
         executed_this_frame = 0
-        for callback in callbacks:
+        over_budget = False
+
+        for i, callback in enumerate(callbacks):
             try:
                 callback()
                 self._executed_count += 1
@@ -266,8 +282,29 @@ class TkUICallbackPump:
                         self._on_error(exc)
                     except Exception:
                         pass
-        # 继续下一轮调度
-        self.start()
+
+            # E-1：单帧时间预算检查（每个回调执行后）
+            if time.perf_counter() - frame_start >= self._max_frame_seconds:
+                remaining = callbacks[i + 1 :]
+                if remaining:
+                    self._deferred_callbacks.extendleft(reversed(remaining))
+                over_budget = True
+                break
+
+        # 更新帧指标
+        frame_duration_ms = (time.perf_counter() - frame_start) * 1000.0
+        self._last_frame_callback_count = executed_this_frame
+        self._last_frame_duration_ms = frame_duration_ms
+        if frame_duration_ms > self._max_frame_duration_ms:
+            self._max_frame_duration_ms = frame_duration_ms
+        if over_budget:
+            self._over_budget_frame_count += 1
+
+        # E-1：自适应调度
+        if self._deferred_callbacks or self._mailbox.pending_count > 0:
+            self._schedule_backlog_poll()
+        else:
+            self._schedule_idle_poll()
 
     def close(self) -> None:
         """关闭事件泵，取消待执行的 after 回调。幂等。

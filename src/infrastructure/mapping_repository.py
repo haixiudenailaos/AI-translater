@@ -15,7 +15,9 @@ EPUB 映射仓库模块
 
 import datetime
 import json
+import shutil
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, List, Tuple
 from uuid import uuid4
 
@@ -34,9 +36,64 @@ _MAPPING_FILENAMES = (
     "format_info.json",
 )
 
+# B-1：兼容副本开关。新代码内部不依赖顶层 JSON，设为 False 可节省一次写盘。
+# 外部集成若仍直接读取顶层文件，保持 True 直到完成迁移。
+_LEGACY_COMPAT_COPIES_ENABLED: bool = True
+
 
 class MappingGenerationError(RuntimeError):
     """Published mapping manifest is missing or points outside its generation root."""
+
+
+# ── B-2: generation mark-and-sweep GC ──────────────────────────────────────
+
+
+def _reachable_generation_names(manifest: dict) -> set[str]:
+    """Extract generation directory names currently referenced by *manifest*.
+
+    Values in ``manifest["files"]`` are posix relative paths of the form
+    ``".mapping_generations/<hex>/filename.json"``.  The generation name is
+    the directory component immediately under MAPPING_GENERATIONS_DIRNAME.
+    """
+    names: set[str] = set()
+    gen_prefix = MAPPING_GENERATIONS_DIRNAME + "/"
+    for rel_path in manifest.get("files", {}).values():
+        if isinstance(rel_path, str) and rel_path.startswith(gen_prefix):
+            rest = rel_path[len(gen_prefix):]
+            name = rest.split("/")[0]
+            if name:
+                names.add(name)
+    return names
+
+
+def _gc_unreachable_generations(mapping_dir: Path, current_manifest: dict) -> int:
+    """Delete generation directories not referenced by *current_manifest*.
+
+    B-1 (审计 §P1-PERF-1)：每次成功发布后调用，确保不可达的旧 generation
+    目录不会无限增长。GC 失败不中断保存流程——记录 warning 后继续。
+
+    Returns:
+        Number of directories removed.
+    """
+    gen_root = mapping_dir / MAPPING_GENERATIONS_DIRNAME
+    if not gen_root.is_dir():
+        return 0
+
+    reachable = _reachable_generation_names(current_manifest)
+    removed = 0
+    for candidate in gen_root.iterdir():
+        if not candidate.is_dir() or candidate.name in reachable:
+            continue
+        try:
+            shutil.rmtree(candidate)
+            removed += 1
+        except OSError as exc:
+            logger.warning(
+                "generation GC: 删除目录失败，跳过 %s (%s)", candidate.name, exc
+            )
+    if removed:
+        logger.debug("generation GC: 已回收 %d 个不可达目录", removed)
+    return removed
 
 
 def _manifest_path(mapping_dir: Path) -> Path:
@@ -116,7 +173,12 @@ def _write_legacy_compatibility_copy(path: Path, payload: dict) -> None:
     The manifest is the commit point. A compatibility-copy failure must not
     invalidate a successfully published generation or make new readers fall
     back to potentially mixed files.
+
+    B-1：受 _LEGACY_COMPAT_COPIES_ENABLED 控制。设为 False 后不再写顶层
+    兼容副本，节省一次写盘和 fsync。迁移期间保持 True。
     """
+    if not _LEGACY_COMPAT_COPIES_ENABLED:
+        return
     try:
         write_json_atomic(path, payload)
     except OSError as exc:
@@ -134,7 +196,10 @@ def publish_mapping_bundle(
     All three members are durable before ``mapping_manifest.json`` is replaced.
     Readers that observe the manifest therefore see either the previous full
     generation or this full generation, never a partially written triple.
+
+    B-1：成功发布后执行 generation GC，回收不可达旧目录。写入指标记录到 debug 日志。
     """
+    t0 = perf_counter()
     root = Path(mapping_dir)
     root.mkdir(parents=True, exist_ok=True)
     generation, directory = _new_generation_directory(root)
@@ -152,8 +217,22 @@ def publish_mapping_bundle(
         files[filename] = _relative_generation_path(root, path)
 
     _publish_manifest(root, generation, files)
+
+    # B-2：manifest 发布成功后 GC，避免回收尚未替换的旧 generation
+    new_manifest = _load_manifest(root)
+    if new_manifest is not None:
+        _gc_unreachable_generations(root, new_manifest)
+
     for filename, payload in payloads.items():
         _write_legacy_compatibility_copy(root / filename, payload)
+
+    elapsed = perf_counter() - t0
+    logger.debug(
+        "publish_mapping_bundle: generation=%s, elapsed=%.3fs, files=%d",
+        generation[:8],
+        elapsed,
+        len(files),
+    )
     return paths
 
 
@@ -169,10 +248,13 @@ def publish_mapping_file_update(
     its own durable generation directory before a replacement manifest makes
     it visible. This prevents writers such as the image-asset migration from
     updating only a legacy compatibility copy.
+
+    B-1：成功发布后执行 generation GC，回收不可达旧目录。写入指标记录到 debug 日志。
     """
     if filename not in _MAPPING_FILENAMES:
         raise ValueError(f"Unsupported mapping filename: {filename}")
 
+    t0 = perf_counter()
     root = Path(mapping_dir)
     root.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest(root)
@@ -193,7 +275,21 @@ def publish_mapping_file_update(
     write_json_atomic(member_path, payload)
     files[filename] = _relative_generation_path(root, member_path)
     _publish_manifest(root, generation, files)
+
+    # B-2：manifest 发布成功后 GC
+    new_manifest = _load_manifest(root)
+    if new_manifest is not None:
+        _gc_unreachable_generations(root, new_manifest)
+
     _write_legacy_compatibility_copy(root / filename, payload)
+
+    elapsed = perf_counter() - t0
+    logger.debug(
+        "publish_mapping_file_update: %s, generation=%s, elapsed=%.3fs",
+        filename,
+        generation[:8],
+        elapsed,
+    )
     return member_path
 
 
@@ -249,22 +345,31 @@ def save_translations(mapping_dir: str, translated_lines: List[str]) -> None:
     """将译文列表按行号严格对齐保存到 content_mapping.json。
 
     - 不修改原有的 line_number（保持绝对稳定）
-    - 按 line_number 排序后，第 i 个条目对应 translated_lines[i]
+    - 第 i 个条目（line_number == i+1）直接对应 translated_lines[i]
     - 自动更新 translated_at 时间戳
     - 未翻译的行保持空字符串
+
+    B-1 (审计 §P1-PERF-1)：改用 O(N) 直接索引替代原先的 O(N log N) sorted()。
+    通过预先构建 {line_number: key} 字典，更新时按 line_number - 1 直接定位
+    translated_lines 中的译文，无需排序。
     """
     root = Path(mapping_dir)
     md = resolve_mapping_file(root, "content_mapping.json")
     obj = json.loads(md.read_text(encoding="utf-8"))
-    items = obj.get("content_mappings", {})
+    items: Dict[str, Dict] = obj.get("content_mappings", {})
     now = datetime.datetime.now().isoformat()
 
-    # 按 line_number 排序所有条目
-    sorted_items = sorted(items.items(), key=lambda x: x[1].get("line_number", 999999))
+    # B-1：O(N) 直接定位：构建 line_number → key 映射，避免 sorted()
+    line_to_key: Dict[int, str] = {}
+    for key, item_data in items.items():
+        ln = item_data.get("line_number")
+        if ln is not None:
+            line_to_key[int(ln)] = key
 
-    for idx, (key, item_data) in enumerate(sorted_items):
-        translation = translated_lines[idx] if idx < len(translated_lines) else ""
-        old_translation = item_data.get("translated_text", "")
+    for line_number, key in line_to_key.items():
+        idx = line_number - 1
+        translation = translated_lines[idx] if 0 <= idx < len(translated_lines) else ""
+        old_translation = items[key].get("translated_text", "")
         items[key]["translated_text"] = translation
         if translation != old_translation:
             items[key]["translated_at"] = now

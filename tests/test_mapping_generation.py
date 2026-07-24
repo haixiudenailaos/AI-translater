@@ -103,6 +103,131 @@ def test_translation_update_publishes_only_new_content_member(tmp_path):
     assert translations == ["translated"]
 
 
+# ── Batch B: generation GC tests ──────────────────────────────────────────
+
+
+def _count_generation_dirs(mapping_dir: Path) -> int:
+    """Return number of subdirectories inside .mapping_generations/."""
+    gen_root = mapping_dir / repository.MAPPING_GENERATIONS_DIRNAME
+    if not gen_root.is_dir():
+        return 0
+    return sum(1 for p in gen_root.iterdir() if p.is_dir())
+
+
+def _count_unreachable_generation_dirs(mapping_dir: Path) -> int:
+    """Return number of generation dirs NOT referenced by the current manifest."""
+    gen_root = mapping_dir / repository.MAPPING_GENERATIONS_DIRNAME
+    if not gen_root.is_dir():
+        return 0
+    manifest = repository._load_manifest(mapping_dir)
+    if manifest is None:
+        return 0
+    reachable = repository._reachable_generation_names(manifest)
+    return sum(
+        1 for p in gen_root.iterdir() if p.is_dir() and p.name not in reachable
+    )
+
+
+def test_gc_keeps_only_active_generation_after_repeated_bundle_publishes(tmp_path):
+    """连续整包发布后，每次都只保留当前 bundle 对应的一个 generation 目录。
+
+    publish_mapping_bundle 将全部三个成员写入同一 generation 目录，
+    因此 GC 后只有 1 个目录存活。
+    """
+    for i in range(6):
+        repository.publish_mapping_bundle(
+            tmp_path,
+            _content_payload(f"v{i}"),
+            _images_payload(f"img-{i}"),
+            _format_payload(f"title-{i}"),
+        )
+    # 整包发布：所有成员共享同一 generation，GC 后只剩 1 个目录
+    assert _count_generation_dirs(tmp_path) == 1
+    # 不可达数量必须为 0（GC 验收条件）
+    assert _count_unreachable_generation_dirs(tmp_path) == 0
+    originals, translations = repository.load_content_mapping(str(tmp_path))
+    assert translations == ["v5"]
+
+
+def test_gc_keeps_only_active_generation_after_repeated_file_updates(tmp_path):
+    """单文件更新时，GC 确保不可达 generation 数为 0。
+
+    每次 save_translations 只更新 content 成员，manifest 中的 images/format
+    仍指向原始 bundle generation。因此最多同时存在 2 个可达目录
+    （最新 content gen + 原始 bundle gen）。GC 应回收所有不可达的旧目录。
+    """
+    repository.publish_mapping_bundle(
+        tmp_path,
+        _content_payload(),
+        _images_payload(),
+        _format_payload(),
+    )
+    for i in range(8):
+        repository.save_translations(str(tmp_path), [f"trans-{i}"])
+
+    # 核心验收：不可达 generation 数必须为 0
+    assert _count_unreachable_generation_dirs(tmp_path) == 0
+    # 单文件更新：content-only gen + 原始 bundle gen（含 images/format）= 最多 2
+    assert _count_generation_dirs(tmp_path) <= 2
+    _, translations = repository.load_content_mapping(str(tmp_path))
+    assert translations == ["trans-7"]
+
+
+def test_gc_does_not_remove_currently_referenced_generation(tmp_path):
+    """GC 不会删除当前 manifest 正在引用的 generation 目录。"""
+    repository.publish_mapping_bundle(
+        tmp_path,
+        _content_payload("keep"),
+        _images_payload(),
+        _format_payload(),
+    )
+    # 整包发布：所有成员在同一 generation，只有 1 个目录
+    assert _count_generation_dirs(tmp_path) == 1
+    assert _count_unreachable_generation_dirs(tmp_path) == 0
+    path = repository.resolve_mapping_file(tmp_path, "content_mapping.json")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["content_mappings"]["line_000001"]["translated_text"] == "keep"
+
+
+def test_gc_count_stable_under_partial_member_updates(tmp_path):
+    """轮流更新各成员时，GC 确保不可达数为 0，总目录数 <= 成员数（3）。
+
+    当三个成员分别在各自 generation 目录中时，最多 3 个可达目录。
+    GC 应在每次发布后立即清除不可达的旧目录，使总数保持稳定上界。
+    """
+    repository.publish_mapping_bundle(
+        tmp_path,
+        _content_payload(),
+        _images_payload("img-0"),
+        _format_payload("t-0"),
+    )
+    for i in range(1, 5):
+        repository.save_images_mapping(tmp_path, {"cover.png": {"local_path": f"img-{i}"}})
+        repository.save_format_info(tmp_path, {"metadata": {"title": f"t-{i}"}, "spine_order": []})
+        # 每次更新后验证无不可达目录
+        assert _count_unreachable_generation_dirs(tmp_path) == 0
+
+    # 总目录数 <= 3（每个成员最多独占一个 generation 目录）
+    assert _count_generation_dirs(tmp_path) <= 3
+
+
+def test_legacy_compat_copies_disabled_skips_top_level_json(tmp_path, monkeypatch):
+    """_LEGACY_COMPAT_COPIES_ENABLED=False 时不再写顶层兼容副本。"""
+    monkeypatch.setattr(repository, "_LEGACY_COMPAT_COPIES_ENABLED", False)
+    repository.publish_mapping_bundle(
+        tmp_path,
+        _content_payload("x"),
+        _images_payload(),
+        _format_payload(),
+    )
+    # 顶层 JSON 不应存在
+    assert not (tmp_path / "content_mapping.json").exists()
+    assert not (tmp_path / "images.json").exists()
+    # generation 内文件应正常存在
+    path = repository.resolve_mapping_file(tmp_path, "content_mapping.json")
+    assert path.exists()
+
+
 def test_legacy_image_migration_publishes_a_new_images_generation(tmp_path):
     """Image migration must update the published member, not only its legacy copy."""
     image_data = b"legacy-image"

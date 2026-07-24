@@ -17,9 +17,10 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 from unittest.mock import MagicMock
@@ -111,9 +112,21 @@ class BenchmarkEngine:
 
 
 class _MockFileHandler:
+    """写入计数的 mock 文件处理器。
+
+    记录累计写入字节与写入次数，用于观测检查点写放大。
+    """
+
+    def __init__(self) -> None:
+        self.bytes_written = 0
+        self.write_count = 0
+
     def write_file(self, path, content):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(content, encoding="utf-8")
+        data = content.encode("utf-8")
+        Path(path).write_bytes(data)
+        self.bytes_written += len(data)
+        self.write_count += 1
 
     def read_file(self, path):
         return Path(path).read_text(encoding="utf-8")
@@ -165,17 +178,35 @@ class BenchmarkResult:
     total_429: int
     final_current_limit: int
     avg_batch_latency: float
+    # ── 批次 A 新增观测指标 ──
+    # 引擎调用总次数（含重试，反映真实请求放大）
+    total_attempts: int = 0
+    total_success: int = 0
+    total_timeouts: int = 0
+    # 检查点累计写入字节与写入次数（写放大观测）
+    checkpoint_bytes_written: int = 0
+    checkpoint_write_count: int = 0
+    # 协调器关闭耗时（终态保存排空）
+    close_seconds: float = 0.0
+    # 失败语义：任何任务保存失败 / 超时 / 未达终态即为 True
+    failed: bool = False
+    failure_reasons: List[str] = field(default_factory=list)
 
 
-def _patch_engine_factory(*, base_latency: float, fail_rate: float):
-    """返回一个工厂函数，用于替换 queue_scheduler.TranslatorEngine。"""
+def _patch_engine_factory(*, base_latency: float, fail_rate: float, engines: list):
+    """返回一个工厂函数，用于替换 queue_scheduler.TranslatorEngine。
+
+    每创建一个引擎就登记到 ``engines``，便于场景结束后聚合调用次数。
+    """
 
     def _factory(config_manager):
-        return BenchmarkEngine(
+        engine = BenchmarkEngine(
             config_manager,
             base_latency=base_latency,
             fail_rate=fail_rate,
         )
+        engines.append(engine)
+        return engine
 
     return _factory
 
@@ -188,26 +219,41 @@ def run_scenario(
     policy: QueuePolicy,
     base_latency: float,
     fail_rate: float,
+    workdir: Path,
     timeout: float = 60.0,
 ) -> BenchmarkResult:
-    """运行单个基准场景。"""
+    """运行单个基准场景。
+
+    ``workdir`` 必须是真实可写目录：任务 ``file_path`` 指向其中的文件，
+    检查点保存（``_译文.txt``）才能真实落盘。任何保存失败、任务进入
+    ERROR 终态或等待超时都会让结果 ``failed=True``——基准内部错误
+    不得返回成功。
+    """
     import src.core.queue_scheduler as qsch
 
     original_engine_cls = qsch.TranslatorEngine
-    qsch.TranslatorEngine = _patch_engine_factory(base_latency=base_latency, fail_rate=fail_rate)
+    engines: list = []
+    qsch.TranslatorEngine = _patch_engine_factory(
+        base_latency=base_latency,
+        fail_rate=fail_rate,
+        engines=engines,
+    )
 
     try:
+        file_handler = _MockFileHandler()
         coord = QueueTranslationCoordinator(
             _MockConfigManager(),
             policy,
-            file_handler=_MockFileHandler(),
+            file_handler=file_handler,
             epub_processor=_MockEpubProcessor(),
         )
         coord.start()
 
-        # 注册任务
+        # 注册任务：使用 workdir 下真实可写路径（Windows 上 /bench 会
+        # 解析到盘符根目录触发 PermissionError，导致结果不可比）。
+        failure_reasons: List[str] = []
         for i in range(task_count):
-            file_path = f"/bench/task_{i}.txt"
+            file_path = str(workdir / f"task_{i}.txt")
             source_lines = [f"line-{i}-{j}" for j in range(lines_per_task)]
             target_lines = [""] * lines_per_task
             ok = coord.add_task(
@@ -220,7 +266,7 @@ def run_scenario(
                 target_lines=target_lines,
             )
             if not ok:
-                print(f"  [警告] 任务 t{i} 注册失败（路径冲突）")
+                failure_reasons.append(f"任务 t{i} 注册失败（路径冲突）")
 
         # 启动全部任务
         coord.submit_command("start_all")
@@ -229,6 +275,7 @@ def run_scenario(
         start_time = time.monotonic()
         deadline = start_time + timeout
         last_snapshot: QueueSnapshot | None = None
+        reached_terminal = False
         while time.monotonic() < deadline:
             snapshot = coord.get_snapshot()
             if snapshot is not None:
@@ -244,6 +291,7 @@ def run_scenario(
                     for t in snapshot.tasks
                 )
                 if all_terminal and snapshot.tasks:
+                    reached_terminal = True
                     break
             time.sleep(0.1)
 
@@ -251,15 +299,39 @@ def run_scenario(
 
         # 收集指标
         total_429 = 0
+        total_timeouts = 0
+        total_success = 0
         final_limit = policy.max_in_flight_requests
         if last_snapshot is not None:
             total_429 = last_snapshot.metrics.total_429
+            total_timeouts = last_snapshot.metrics.total_timeouts
+            total_success = last_snapshot.metrics.total_success
             final_limit = last_snapshot.metrics.current_limit
+
+            # 失败语义：检查点保存失败或任务 ERROR 终态都使场景失败
+            for task in last_snapshot.tasks:
+                if task.checkpoint_error:
+                    failure_reasons.append(
+                        f"任务 {task.task_id} 检查点保存失败: {task.checkpoint_error}"
+                    )
+                if task.state == QueueTaskState.ERROR:
+                    failure_reasons.append(
+                        f"任务 {task.task_id} 进入 ERROR 终态: {task.error_message}"
+                    )
+        else:
+            failure_reasons.append("场景运行期间未获得任何队列快照")
+
+        if not reached_terminal:
+            failure_reasons.append(f"等待 {timeout:.0f}s 后仍有任务未达终态")
 
         total_lines = task_count * lines_per_task
         throughput = total_lines / elapsed if elapsed > 0 else 0.0
 
+        close_start = time.monotonic()
         coord.close()
+        close_seconds = time.monotonic() - close_start
+
+        total_attempts = sum(engine.call_count for engine in engines)
 
         return BenchmarkResult(
             scenario=scenario,
@@ -270,6 +342,14 @@ def run_scenario(
             total_429=total_429,
             final_current_limit=final_limit,
             avg_batch_latency=base_latency,
+            total_attempts=total_attempts,
+            total_success=total_success,
+            total_timeouts=total_timeouts,
+            checkpoint_bytes_written=file_handler.bytes_written,
+            checkpoint_write_count=file_handler.write_count,
+            close_seconds=close_seconds,
+            failed=bool(failure_reasons),
+            failure_reasons=failure_reasons,
         )
     finally:
         qsch.TranslatorEngine = original_engine_cls
@@ -301,12 +381,29 @@ def main():
         default=None,
         help="CSV 输出路径（可选）",
     )
+    parser.add_argument(
+        "--workdir",
+        type=str,
+        default=None,
+        help="检查点写入目录（默认使用临时目录，运行结束自动清理）",
+    )
     args = parser.parse_args()
 
     print("=" * 72)
     print("队列翻译并发优化基准工具")
     print(f"任务数: {args.tasks}  每任务行数: {args.lines}")
     print("=" * 72)
+
+    # 工作目录：默认 TemporaryDirectory，避免 Windows 下 /bench 解析到
+    # 盘符根目录导致 PermissionError（审计 §2.2）。
+    if args.workdir is not None:
+        workdir = Path(args.workdir).resolve()
+        workdir.mkdir(parents=True, exist_ok=True)
+        _workdir_cm = None
+    else:
+        _workdir_cm = tempfile.TemporaryDirectory(prefix="queue_bench_")
+        workdir = Path(_workdir_cm.name)
+    print(f"工作目录: {workdir}")
 
     results: List[BenchmarkResult] = []
 
@@ -333,6 +430,7 @@ def main():
             policy=policy,
             base_latency=0.02,
             fail_rate=0.0,
+            workdir=workdir / "serial",
         )
         results.append(r)
         _print_result(r)
@@ -360,6 +458,7 @@ def main():
             policy=policy,
             base_latency=0.02,
             fail_rate=0.0,
+            workdir=workdir / "concurrent",
         )
         results.append(r)
         _print_result(r)
@@ -387,6 +486,7 @@ def main():
             policy=policy,
             base_latency=0.02,
             fail_rate=0.3,
+            workdir=workdir / "rate_limited",
             timeout=120.0,
         )
         results.append(r)
@@ -408,17 +508,45 @@ def main():
                 f"耗时 {r.elapsed_seconds:6.2f}s | "
                 f"吞吐 {r.throughput_lines_per_sec:6.1f} 行/秒 | "
                 f"429: {r.total_429} | "
+                f"attempts: {r.total_attempts} | "
+                f"checkpoint: {r.checkpoint_bytes_written / 1024:.1f} KiB/"
+                f"{r.checkpoint_write_count} 次 | "
+                f"close: {r.close_seconds:.2f}s | "
                 f"final_limit: {r.final_current_limit}"
             )
+
+    # 失败语义：任何场景失败 -> 进程非零退出（审计 §6 统一规则）。
+    failed_results = [r for r in results if r.failed]
+    if _workdir_cm is not None:
+        _workdir_cm.cleanup()
+    if failed_results:
+        print("\n[失败] 以下场景未通过：")
+        for r in failed_results:
+            print(f"  - {r.scenario}:")
+            for reason in r.failure_reasons:
+                print(f"      {reason}")
+        sys.exit(1)
+    print("\n全部场景通过。")
 
 
 def _print_result(r: BenchmarkResult):
     print(f"  场景: {r.scenario}")
     print(f"  任务数: {r.task_count}  总行数: {r.total_lines}")
-    print(f"  耗时: {r.elapsed_seconds:.2f}s")
+    print(f"  耗时: {r.elapsed_seconds:.2f}s  关闭耗时: {r.close_seconds:.2f}s")
     print(f"  吞吐: {r.throughput_lines_per_sec:.1f} 行/秒")
-    print(f"  429 次数: {r.total_429}")
+    print(f"  引擎调用总次数（含重试）: {r.total_attempts}")
+    print(f"  429 次数: {r.total_429}  超时次数: {r.total_timeouts}  成功批次: {r.total_success}")
+    print(
+        f"  检查点写入: {r.checkpoint_bytes_written} 字节 "
+        f"({r.checkpoint_bytes_written / 1024:.1f} KiB), {r.checkpoint_write_count} 次"
+    )
     print(f"  最终并发上限: {r.final_current_limit}")
+    if r.failed:
+        print("  状态: 失败")
+        for reason in r.failure_reasons:
+            print(f"    - {reason}")
+    else:
+        print("  状态: 通过")
 
 
 def _write_csv(path: str, results: List[BenchmarkResult]):
@@ -434,6 +562,14 @@ def _write_csv(path: str, results: List[BenchmarkResult]):
                 "total_429",
                 "final_current_limit",
                 "avg_batch_latency",
+                "total_attempts",
+                "total_success",
+                "total_timeouts",
+                "checkpoint_bytes_written",
+                "checkpoint_write_count",
+                "close_seconds",
+                "failed",
+                "failure_reasons",
             ]
         )
         for r in results:
@@ -447,6 +583,14 @@ def _write_csv(path: str, results: List[BenchmarkResult]):
                     r.total_429,
                     r.final_current_limit,
                     f"{r.avg_batch_latency:.3f}",
+                    r.total_attempts,
+                    r.total_success,
+                    r.total_timeouts,
+                    r.checkpoint_bytes_written,
+                    r.checkpoint_write_count,
+                    f"{r.close_seconds:.3f}",
+                    int(r.failed),
+                    "; ".join(r.failure_reasons),
                 ]
             )
 

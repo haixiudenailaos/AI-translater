@@ -328,14 +328,17 @@ class ConcurrentWindow:
         P1-1：manager 的 ``_notify_progress`` 可能从工作线程调用此回调，
         通过 UI 回调邮箱提交刷新任务，避免跨线程 Tk 调用。
         回调参数可能为 None（``start_all`` 等批量命令）或 task_id。
+
+        E-1（审计 §P1-PERF-4）：使用 submit_keyed 而非 submit，同一 key
+        只保留最新一次刷新，避免高频 kick 时队列积压超过帧预算。
         """
         if self._closed:
             return
         mailbox = getattr(self, "_ui_mailbox", None)
         if mailbox is None:
             return
-        mailbox.submit(self._refresh_tree)
-        mailbox.submit(self._refresh_metrics)
+        mailbox.submit_keyed("queue:tree", self._refresh_tree)
+        mailbox.submit_keyed("queue:metrics", self._refresh_metrics)
 
     def _refresh_tree(self):
         """刷新任务列表。

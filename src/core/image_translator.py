@@ -18,7 +18,6 @@ from typing import Any, Callable, Dict
 from urllib.parse import urlparse
 
 import httpx
-import requests
 from volcenginesdkarkruntime import Ark
 from volcenginesdkarkruntime._exceptions import (
     ArkAPIConnectionError,
@@ -256,6 +255,9 @@ def _safe_download_image(url: str, *, timeout: int = 60) -> bytes:
     - 验证 Content-Type 是允许的图片 MIME
     - 用魔数（_detect_image_format）二次验证真实格式
 
+    F-1（审计 §P1-PERF-5）：用 httpx（项目已依赖）替代 requests，
+    消除 requests/urllib3 约 1.28 MiB 对 onefile 产物的依赖。
+
     Args:
         url: 待下载的图片 URL。
         timeout: 下载超时秒数。
@@ -268,56 +270,57 @@ def _safe_download_image(url: str, *, timeout: int = 60) -> bytes:
     """
     _validate_download_url(url)
 
-    # P1-3：所有 HTTP 状态/MIME/重定向/超限分支都必须关闭 response，
-    # 避免连接泄漏。旧实现只在流式读取完成后 close，HTTP 错误和 MIME
-    # 拒绝路径直接 raise，response 句柄丢失到 GC。
-    response = None
-    try:
-        # 禁止自动重定向，手动验证 Location
-        response = requests.get(
-            url,
-            timeout=timeout,
-            stream=True,
-            allow_redirects=False,
-        )
-        if response.status_code in (301, 302, 303, 307, 308):
-            location = response.headers.get("Location", "")
-            # 递归校验重定向目标（限制深度由 requests 重试机制兜底）
+    _dl_timeout = httpx.Timeout(
+        connect=20.0,
+        read=float(timeout),
+        write=30.0,
+        pool=10.0,
+    )
+
+    # P1-3：httpx.Client 作为 context manager 确保连接在所有分支都关闭，
+    # 不再需要 finally + response.close() 手动管理。
+    with httpx.Client(follow_redirects=False, timeout=_dl_timeout) as client:
+        # 第一次请求：禁止跟随重定向，手动校验 Location
+        resp = client.get(url)
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location", "")
             _validate_download_url(location)
-            # 校验通过后跟随重定向（不再允许二次重定向）
-            # P1-3：先关闭旧 response，再发起新请求
-            response.close()
-            response = requests.get(
-                location,
-                timeout=timeout,
-                stream=True,
-                allow_redirects=False,
-            )
+            # 校验通过后请求重定向目标（不再允许二次重定向）
+            with client.stream("GET", location) as resp2:
+                return _read_validated_stream(resp2)
 
-        if response.status_code != 200:
-            raise ImageDownloadError(f"下载失败: HTTP {response.status_code}")
+        if resp.status_code != 200:
+            raise ImageDownloadError(f"下载失败: HTTP {resp.status_code}")
 
-        # Content-Type 校验
-        content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if content_type and content_type not in _ALLOWED_DOWNLOAD_CONTENT_TYPES:
-            raise ImageDownloadError(f"下载 Content-Type 不允许: {content_type}")
+        # 无重定向：直接流式读取
+        with client.stream("GET", url) as stream:
+            return _read_validated_stream(stream)
 
-        # 流式读取，限制最大字节数
-        chunks: list[bytes] = []
-        total = 0
-        for chunk in response.iter_content(chunk_size=8192):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > _DOWNLOAD_MAX_BYTES:
-                raise ImageDownloadError(f"下载超出最大字节数限制 ({_DOWNLOAD_MAX_BYTES} bytes)")
-            chunks.append(chunk)
 
-        data = b"".join(chunks)
-    finally:
-        # P1-3：所有分支统一在 finally 中关闭 response
-        if response is not None:
-            response.close()
+def _read_validated_stream(response: httpx.Response) -> bytes:
+    """流式读取并校验 Content-Type 与字节数上限。
+
+    返回原始 bytes；由调用方执行格式魔数和可解码性检验。
+    """
+    if response.status_code != 200:
+        raise ImageDownloadError(f"下载失败: HTTP {response.status_code}")
+
+    content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type and content_type not in _ALLOWED_DOWNLOAD_CONTENT_TYPES:
+        raise ImageDownloadError(f"下载 Content-Type 不允许: {content_type}")
+
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_bytes(chunk_size=8192):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > _DOWNLOAD_MAX_BYTES:
+            raise ImageDownloadError(f"下载超出最大字节数限制 ({_DOWNLOAD_MAX_BYTES} bytes)")
+        chunks.append(chunk)
+
+    data = b"".join(chunks)
 
     # P1-9：严格魔数验证（不盲信 Content-Type，不依赖默认返回值）
     image_format = _validate_image_magic_bytes(data)
