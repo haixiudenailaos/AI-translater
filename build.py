@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-轻小说翻译器 V1.6.1 automated build script
+轻小说翻译器 V1.6.2 automated build script
 使用 PyInstaller 构建可执行文件，支持清理、构建、信息更新等功能
 """
 
@@ -263,7 +263,7 @@ class BuildManager:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
-        description="LightNovelTranslator V1.6.1 automated build script",
+        description="LightNovelTranslator V1.6.2 automated build script",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:

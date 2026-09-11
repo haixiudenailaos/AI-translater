@@ -61,6 +61,11 @@ class TranslationDocument:
         """自上次保存以来被修改的行索引（只读视图）。"""
         return frozenset(self._dirty_indices)
 
+    @property
+    def has_dirty_rows(self) -> bool:
+        """是否存在未保存的行。热路径判空，不拷贝 dirty 集合。"""
+        return bool(self._dirty_indices)
+
     def row(self, index: int) -> TranslationRow:
         """获取指定行（只读访问）。"""
         return self._rows[index]

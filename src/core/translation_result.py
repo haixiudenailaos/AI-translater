@@ -41,12 +41,18 @@ class BatchTranslationResult:
         lines: 译文列表（与原文行数对齐；失败行可为空字符串）
         failed_indices: 失败行索引（0-based）
         error_message: 最后一次错误消息（失败时提供）
+        output_truncated: provider 明确返回了截断信号（如
+            ``finish_reason == "length"``）。超长请求更容易被输出容量截断，
+            此时不能仅凭 HTTP 成功断言整批成功。
+        finish_reason: provider 返回的原始结束原因，便于诊断与展示。
     """
 
     status: OperationStatus
     lines: List[str]
     failed_indices: List[int] = field(default_factory=list)
     error_message: str | None = None
+    output_truncated: bool = False
+    finish_reason: str | None = None
 
     @property
     def is_success(self) -> bool:

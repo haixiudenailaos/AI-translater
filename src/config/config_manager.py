@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from ..domain.secret import ConfigSaveResult, SecretSaveResult, StorageStatus
+from ..domain.translation_policy import coerce_context_window_tokens
 from ..utils.file_handler import write_json_atomic
 from ..utils.logger import get_logger
 
@@ -23,6 +24,13 @@ from ..utils.logger import get_logger
 from .image_ocr import (
     SILICONFLOW_OCR_DEFAULT_BASE_URL,
     SILICONFLOW_OCR_DEFAULT_MODEL,
+)
+from .long_context_config import (
+    LONG_CONTEXT_CONFIG_KEY,
+    LONG_CONTEXT_SCHEMA_VERSION,
+    default_long_context_config,
+    normalize_long_context_config,
+    read_context_window_tokens,
 )
 from .storage_config import DEFAULT_STORAGE_CONFIG, normalize_storage_config
 from .translation_profile import (
@@ -145,6 +153,10 @@ class ConfigManager:
             # 字段语义见 config/storage_config.py；路径解析由
             # infrastructure/storage_paths.py 统一完成，业务模块不得直接读取。
             "storage": copy.deepcopy(DEFAULT_STORAGE_CONFIG),
+            # 超长上下文翻译的用户预算。语义见 config/long_context_config.py；
+            # 与 API 配置中的模型容量字段（api_config.context_window_tokens）
+            # 是两件事，不可混用。
+            LONG_CONTEXT_CONFIG_KEY: default_long_context_config(),
         }
 
         self.default_glossary = {"terms": [], "categories": ["通用", "技术", "专业"]}
@@ -533,6 +545,11 @@ class ConfigManager:
                     merged_config["storage"] = normalize_storage_config(
                         merged_config.get("storage")
                     )
+                    # 超长上下文配置段归一化：共享默认值来自同一入口，保证
+                    # 加载/保存/预览使用同一套校验（LC-02）。
+                    merged_config[LONG_CONTEXT_CONFIG_KEY] = normalize_long_context_config(
+                        merged_config.get(LONG_CONTEXT_CONFIG_KEY)
+                    )
                     self._migrate_translation_prompt(config, merged_config)
                     return merged_config
         except (OSError, json.JSONDecodeError) as e:
@@ -542,6 +559,7 @@ class ConfigManager:
         result["image_translation"] = self._migrate_image_translation_config(None)
         result["onboarding"] = self._normalize_onboarding_config(None)
         result["storage"] = normalize_storage_config(None)
+        result[LONG_CONTEXT_CONFIG_KEY] = default_long_context_config()
         result["prompt_schema_version"] = DEFAULT_PROMPT_SCHEMA_VERSION
         return result
 
@@ -734,11 +752,55 @@ class ConfigManager:
         """获取默认图片翻译 Provider id。"""
         return "ai_volcengine"
 
+    def get_long_context_config(self) -> Dict[str, Any]:
+        """读取超长上下文配置段（规范化后的副本）。"""
+        with self._app_config_lock:
+            return normalize_long_context_config(self.app_config.get(LONG_CONTEXT_CONFIG_KEY))
+
+    def get_long_context_window_tokens(self) -> int:
+        """读取用户设置的单次上下文大小（token）；损坏时回退默认值。"""
+        return read_context_window_tokens(self.get_app_config())
+
+    def set_long_context_window_tokens(
+        self, context_window_tokens: object, *, persist: bool = True
+    ) -> bool:
+        """设置超长上下文预算。
+
+        单个字段的更新必须作为一个整体与 ``save_app_config`` 共用同一把锁，
+        否则设置窗口的批量保存会用它读到的旧快照覆盖该字段。返回 ``False``
+        表示未通过校验或保存失败（此时不发布新值）。
+        """
+        tokens = coerce_context_window_tokens(context_window_tokens)
+        if tokens is None:
+            logger.error("超长上下文预算无效: %r", context_window_tokens)
+            return False
+        normalized = {
+            "schema_version": LONG_CONTEXT_SCHEMA_VERSION,
+            "context_window_tokens": tokens,
+        }
+        with self._app_config_lock:
+            if not persist:
+                self.app_config[LONG_CONTEXT_CONFIG_KEY] = normalized
+                return True
+            candidate = copy.deepcopy(self.app_config)
+            candidate[LONG_CONTEXT_CONFIG_KEY] = normalized
+            try:
+                write_json_atomic(self.app_config_file, candidate)
+            except OSError as e:
+                logger.error("保存超长上下文配置失败: %s", e)
+                return False
+            self.app_config = candidate
+            return True
+
     def save_app_config(self, config: Dict[str, Any]) -> bool:
         """保存应用配置"""
         candidate = copy.deepcopy(config)
         candidate.pop("batch_max_input_tokens", None)
         candidate.pop("queue_batch_max_input_tokens", None)
+        # 保存与加载共用同一规范化入口，保证深层默认合并与幂等性（LC-02）。
+        candidate[LONG_CONTEXT_CONFIG_KEY] = normalize_long_context_config(
+            candidate.get(LONG_CONTEXT_CONFIG_KEY)
+        )
         try:
             with self._app_config_lock:
                 # BUG-006：使用原子写入，失败时旧文件保持不变
@@ -1000,15 +1062,24 @@ class ConfigManager:
         return result
 
     def save_api_and_model_preset(
-        self, preset_name: str, api_key: str, model_name: str
+        self,
+        preset_name: str,
+        api_key: str,
+        model_name: str,
+        *,
+        context_window_tokens: int | None = None,
+        base_url: str | None = None,
     ) -> SecretSaveResult:
         """保存API和模型预设（ENG-2：返回 SecretSaveResult 区分三态）
 
-        BUG-009：密钥存入密钥环，JSON 只保存模型名。
+        BUG-009：密钥存入密钥环，JSON 只保存非敏感字段。
         ENG-2：与 ``save_api_config`` 复用 ``SecretSaveResult`` 结果类型，
         - FAILED：密钥存储失败，不写入 JSON
         - SESSION_ONLY：允许会话使用，但 UI 必须提示"重启后需重新输入"
         - PERSISTED：正常成功
+
+        ``context_window_tokens`` 是用户声明的模型容量，随预设保存/加载/切换；
+        非正整数时忽略该项，不影响已有预设的兼容读取。
 
         向后兼容：``SecretSaveResult.__bool__`` 使旧调用方
         ``if save_api_and_model_preset(...)`` 继续工作
@@ -1052,9 +1123,13 @@ class ConfigManager:
             )
 
         # JSON 中只保存非敏感信息
-        presets[preset_name] = {
-            "model_name": model_name,
-        }
+        preset_payload: Dict[str, Any] = {"model_name": model_name}
+        capacity = coerce_context_window_tokens(context_window_tokens)
+        if capacity is not None:
+            preset_payload["context_window_tokens"] = capacity
+        if base_url:
+            preset_payload["base_url"] = base_url
+        presets[preset_name] = preset_payload
 
         # BUG-006：使用原子写入
         try:
@@ -1081,8 +1156,12 @@ class ConfigManager:
             provider=provider_tag,
         )
 
-    def load_api_presets(self) -> Dict[str, Dict[str, str]]:
+    def load_api_presets(self) -> Dict[str, Dict[str, Any]]:
         """加载API预设（BUG-009：从密钥环注入密钥；R2-BUG-003：不写回明文）
+
+        返回值包含非敏感字段与运行时注入的 ``api_key``。``context_window_tokens``
+        是用户声明的模型容量，随预设往返；旧预设缺该字段时按默认容量处理，
+        不因缺少字段而丢弃整个预设。
 
         R2-BUG-003 修复要点：
         - 持久化对象（写回磁盘）和返回给 UI 的运行时对象必须分离
@@ -1098,9 +1177,9 @@ class ConfigManager:
                 disk_presets = json.load(f)
 
             # 运行时预设（注入密钥，仅用于 UI 显示）
-            runtime_presets: Dict[str, Dict[str, str]] = {}
+            runtime_presets: Dict[str, Dict[str, Any]] = {}
             # 需要写回磁盘的干净预设（不含 api_key）
-            clean_presets: Dict[str, Dict[str, str]] = {}
+            clean_presets: Dict[str, Dict[str, Any]] = {}
             needs_rewrite = False
 
             for name, data in disk_presets.items():
@@ -1131,6 +1210,11 @@ class ConfigManager:
 
                 # 构造运行时对象（包含 api_key 供 UI 临时使用）
                 runtime_data = {k: v for k, v in data_copy.items()}
+                # 模型容量规范化：旧预设缺字段或值损坏时回退默认值，
+                # 而不是丢弃整个预设或让 UI 拿到不可解释的类型。
+                capacity = coerce_context_window_tokens(data_copy.get("context_window_tokens"))
+                if capacity is not None:
+                    runtime_data["context_window_tokens"] = capacity
                 if legacy_key and legacy_key.strip():
                     # 迁移失败时仍使用 legacy_key，迁移成功时从密钥环读取
                     # P1-4：通过注入的 SecretStore 读取

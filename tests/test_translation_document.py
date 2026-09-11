@@ -279,3 +279,41 @@ def test_translation_row_slots():
 
     with pytest.raises(AttributeError):
         row.new_field = "value"  # type: ignore[attr-defined]
+
+
+# ── has_dirty_rows（自动保存热路径）─────────────────────
+
+
+def test_has_dirty_rows_tracks_the_dirty_set():
+    """``has_dirty_rows`` 与 ``dirty_indices`` 的判空语义一致。"""
+    doc = TranslationDocument([TranslationRow(source="A"), TranslationRow(source="B")])
+
+    assert doc.has_dirty_rows is False
+
+    doc.update_target(0, "甲")
+    assert doc.has_dirty_rows is True
+    assert bool(doc.dirty_indices) is True
+
+    doc.clear_dirty()
+    assert doc.has_dirty_rows is False
+    assert bool(doc.dirty_indices) is False
+
+
+def test_has_dirty_rows_does_not_copy_the_dirty_set():
+    """判空不得拷贝 dirty 集合。
+
+    自动保存调度在每个批次完成时检查一次，而 dirty 集合在保存成功前只增
+    不减。若这里走 ``dirty_indices`` 的 frozenset 全量拷贝，长文档翻译会
+    退化为 O(n²)，在 Tk 主线程上表现为界面逐渐卡顿。
+    """
+    doc = TranslationDocument([TranslationRow(source=f"L{i}") for i in range(1000)])
+    for index in range(1000):
+        doc.update_target(index, f"译{index}")
+
+    class ExplodingSet(set):
+        def __iter__(self):
+            raise AssertionError("has_dirty_rows 不应遍历/拷贝 dirty 集合")
+
+    doc._dirty_indices = ExplodingSet(range(1000))
+
+    assert doc.has_dirty_rows is True

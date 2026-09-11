@@ -83,12 +83,37 @@ class ConcurrentApi:
         pass
 
 
+class HyphenMarkerConcurrentApi(ConcurrentApi):
+    """并发返回被模型改写为连字符形式的行号标记。"""
+
+    def translate_stream_enhanced(
+        self, text, callback, context, stream_id=None, system_prompt=None
+    ):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.system_prompts.append(system_prompt)
+        try:
+            time.sleep(0.02)
+            translated = []
+            for line in text.splitlines():
+                marker, source = line[:10], line[10:]
+                translated.append(f"{marker.replace('_', '-')}Translation:{source}")
+            result = "\n".join(translated)
+            callback(result)
+            return result
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
 def test_token_budget_builds_smaller_batches():
     """PERF §9.6：_build_batch_ranges 返回 TranslationBatchPlan 列表。
 
     token 预算受限时每批只放 1 行，且每个 plan 携带正确的 start/end/batch_id。
     """
     from src.core.translator import TranslationBatchPlan
+    from src.domain.translation_policy import ContextMode, ResolvedContextBudget
 
     config = PerformanceConfig(batch_lines=20)
     engine = TranslatorEngine(config)
@@ -99,7 +124,18 @@ def test_token_budget_builds_smaller_batches():
     )
     lines = ["中" * 50] * 4
 
-    plans = engine._build_batch_ranges(lines, 20, fixed + 65)
+    # 直接构造预算，绕过 resolve_standard_budget 的 512 下限——
+    # 本用例验证的是分批算法本身，而不是配置层的最小预算语义。
+    input_token_budget = fixed + 65
+    budget = ResolvedContextBudget(
+        mode=ContextMode.STANDARD,
+        requested_context_tokens=input_token_budget,
+        effective_context_tokens=input_token_budget,
+        safety_margin_tokens=0,
+        batch_budget_tokens=input_token_budget,
+        max_batch_lines=20,
+    )
+    plans = engine._build_batch_ranges(lines, 20, input_token_budget, resolved_budget=budget)
 
     # §9.6：返回 TranslationBatchPlan 而非裸 tuple
     assert all(isinstance(p, TranslationBatchPlan) for p in plans)
@@ -279,6 +315,34 @@ def test_concurrent_batches_write_back_in_source_order():
     assert all(data["display_batch_start"] == 0 for data in later_batch_streams)
 
 
+def test_hyphen_markers_are_cleaned_under_high_concurrency():
+    config = PerformanceConfig(concurrency=8, batch_lines=1)
+    config.app["target_language"] = "English"
+    api = HyphenMarkerConcurrentApi()
+    engine = TranslatorEngine(config)
+    engine.api = api
+    completed = []
+    progress_events = []
+
+    engine._translate(
+        "\n".join(f"line-{index}" for index in range(32)),
+        lambda _, data: progress_events.append(data),
+        completed.append,
+    )
+
+    assert api.max_active == 8
+    assert completed[0].status == OperationStatus.SUCCEEDED
+    assert completed[0].lines == [f"Translation:line-{index}" for index in range(32)]
+    visible_lines = [
+        line
+        for data in progress_events
+        for key in ("preview_lines", "translated_lines")
+        for line in data.get(key, [])
+    ]
+    assert visible_lines
+    assert all("[LINE" not in line.upper() for line in visible_lines)
+
+
 def test_main_translation_uses_only_capacity_left_by_background_queue():
     """主编辑器和一个后台队列公平平分全局 4 个请求槽。"""
     from src.core.queue_provider import ProviderLimiterRegistry
@@ -446,6 +510,17 @@ def sse(content):
     return f"data: {payload}"
 
 
+def test_deepseek_v4_translation_disables_default_thinking():
+    api, client = make_api(
+        [FakeResponse(chunks=[sse("译文"), "data: [DONE]"])], model_name="deepseek-v4-flash"
+    )
+    try:
+        api.translate_stream("原文")
+        assert client.requests[0]["thinking"] == {"type": "disabled"}
+    finally:
+        api.close()
+
+
 def test_api_retries_429_once_and_sends_system_message():
     api, client = make_api(
         [
@@ -494,6 +569,37 @@ def test_api_retries_empty_stream_exception_before_receiving_content(monkeypatch
         assert len(client.requests) == 2
         assert metrics["retries"] == 1
         assert metrics["successful_requests"] == 1
+    finally:
+        api.close()
+
+
+def test_retry_after_winerror_cleans_hyphen_line_marker(monkeypatch):
+    class FailedStreamResponse(FakeResponse):
+        def iter_lines(self):
+            raise OSError(10038, "在一个非套接字上尝试了一个操作。")
+
+    api, client = make_api(
+        [
+            FailedStreamResponse(),
+            FakeResponse(
+                chunks=[
+                    sse("[LINE-001]I gave up on indulging in sentimentality."),
+                    "data: [DONE]",
+                ]
+            ),
+        ]
+    )
+    monkeypatch.setattr(api, "_recreate_client_if_safe", lambda: None)
+    config = PerformanceConfig(concurrency=1, batch_lines=1)
+    config.app["target_language"] = "English"
+    engine = TranslatorEngine(config)
+    engine.api = api
+    try:
+        result = engine._translate_batch(["原文"], lambda *_: None, 0, 1)
+
+        assert len(client.requests) == 2
+        assert result.status == OperationStatus.SUCCEEDED
+        assert result.lines == ["I gave up on indulging in sentimentality."]
     finally:
         api.close()
 

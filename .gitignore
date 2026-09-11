@@ -167,4 +167,5 @@ workspace/
 .claude/
 .workbuddy/
 .pytest-*/
+.dbg/
 tools/_patch_*.py

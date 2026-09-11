@@ -111,11 +111,47 @@ class TranslatorApp:
             if self._loading_frame is not None:
                 self._loading_frame.destroy()
                 self._loading_frame = None
+            self._bind_stall_diagnostic()
             self._notify_interrupted_migration()
         except Exception as exc:
             logger.exception("应用初始化失败")
             messagebox.showerror("启动错误", f"应用启动失败: {exc}")
             self.root.destroy()
+
+    def _bind_stall_diagnostic(self):
+        """Ctrl+Shift+D 把所有线程的调用栈写入日志。
+
+        翻译停住时（进度不再前进、也没有新请求发出）按一次，日志里就会出现
+        每个线程当前阻塞的确切位置。诊断卡死必须知道线程停在哪一行，而这
+        无法从事后的日志时间线推断出来。
+        """
+
+        def dump_stacks(_event=None):
+            import sys as _sys
+            import threading as _threading
+            import traceback as _traceback
+
+            names = {t.ident: t.name for t in _threading.enumerate()}
+            lines = ["===== 线程栈转储（诊断翻译卡死）====="]
+            for ident, frame in _sys._current_frames().items():
+                lines.append(f"\n--- 线程 {names.get(ident, '?')} (id={ident}) ---")
+                lines.extend(entry.rstrip() for entry in _traceback.format_stack(frame))
+            logger.warning("\n".join(lines))
+            try:
+                self.main_window.update_status("已将线程栈写入日志（诊断卡死用）")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Caps Lock + Shift produces lowercase ``d`` on Windows. Both keysyms
+        # must be bound; returning break prevents later binding handlers from
+        # processing the same diagnostic keypress again.
+        def _dump_shortcut(event=None):
+            dump_stacks(event)
+            return "break"
+
+        for sequence in ("<Control-Shift-KeyPress-d>", "<Control-Shift-KeyPress-D>"):
+            self.root.bind_all(sequence, _dump_shortcut, add="+")
+        logger.info("卡死诊断已启用：翻译停住时按 Ctrl+Shift+D 转储线程栈")
 
     def _notify_interrupted_migration(self):
         """STORAGE-5：提示上次未完成的数据目录迁移（§5：启动时发现

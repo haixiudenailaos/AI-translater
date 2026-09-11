@@ -19,6 +19,7 @@ from enum import Enum
 from typing import TypeGuard
 
 from .translation import OperationStatus
+from .translation_policy import coerce_context_window_tokens
 
 
 class TaskStatus(str, Enum):
@@ -104,6 +105,10 @@ class ModelSnapshot:
 
     记录发起翻译时的模型、目标语言、提示词版本和术语库版本，
     用于项目恢复时判断配置是否变化。
+
+    超长上下文翻译（§6.3）：额外记录上下文模式与用户预算，使暂停/重启后的
+    恢复继承原模式与预算，而不是静默回退普通模式。旧项目缺这些字段时按普通
+    模式读取，不触发全量重译。
     """
 
     provider: str = ""
@@ -112,6 +117,12 @@ class ModelSnapshot:
     prompt_version: str = ""
     glossary_version: str = ""
     batch_size: int = 20
+    #: ``"standard"`` / ``"long"``；旧项目缺失时为 ``"standard"``。
+    context_mode: str = "standard"
+    #: 用户设置的总预算（token）；普通模式下为 ``None``。
+    context_window_tokens: int | None = None
+    #: 解析预算时使用的估算策略版本，供恢复时诊断（不参与判定）。
+    context_policy_version: int = 1
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -121,12 +132,24 @@ class ModelSnapshot:
             "prompt_version": self.prompt_version,
             "glossary_version": self.glossary_version,
             "batch_size": self.batch_size,
+            "context_mode": self.context_mode,
+            "context_window_tokens": self.context_window_tokens,
+            "context_policy_version": self.context_policy_version,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object] | None = None) -> "ModelSnapshot":
         if not data:
             return cls()
+        raw_mode = data.get("context_mode")
+        context_mode = "long" if raw_mode == "long" else "standard"
+        # 预算必须经受同一套严格校验：``int(1.5)`` 会静默截断成 1，
+        # ``True`` 会变成 1，都不应被当作合法 token 预算。
+        requested = coerce_context_window_tokens(data.get("context_window_tokens"))
+        if context_mode == "long" and requested is None:
+            # 标记为超长但预算缺失/损坏：按普通模式读取，不猜一个预算也不
+            # 让项目无法打开（旧项目缺字段的兼容路径）。
+            context_mode = "standard"
         return cls(
             provider=str(data.get("provider", "")),
             model_name=str(data.get("model_name", "")),
@@ -134,7 +157,14 @@ class ModelSnapshot:
             prompt_version=str(data.get("prompt_version", "")),
             glossary_version=str(data.get("glossary_version", "")),
             batch_size=_coerce_int(data.get("batch_size"), default=20),
+            context_mode=context_mode,
+            context_window_tokens=requested if context_mode == "long" else None,
+            context_policy_version=_coerce_int(data.get("context_policy_version"), default=1),
         )
+
+    @property
+    def is_long_context(self) -> bool:
+        return self.context_mode == "long" and self.context_window_tokens is not None
 
 
 @dataclass

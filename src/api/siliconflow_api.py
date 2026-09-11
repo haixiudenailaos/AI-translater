@@ -22,6 +22,7 @@ class SiliconFlowAPI(BaseAPI):
     DEFAULT_MAX_KEEPALIVE = 20
     DEFAULT_MAX_CONNECTIONS = 50
     DEFAULT_TIMEOUT = 90.0
+    SUPPORTS_HTTP2 = True
 
     def __init__(self, config: Dict[str, Any]):
         # SiliconFlow 特有：keepalive_expiry
@@ -41,7 +42,13 @@ class SiliconFlowAPI(BaseAPI):
             self._start_heartbeat()
 
     def _build_client(self) -> httpx.Client:
-        """Build an HTTP/2 client without publishing it to other threads."""
+        """Build the HTTP client without publishing it to other threads.
+
+        HTTP/2 is used for batched concurrent translation, but the serial
+        line-by-line mode switches to HTTP/1.1 via
+        ``configure_serial_transport``; see that method for why.
+        """
+        http2 = getattr(self, "_http2_enabled", True)
         try:
             expiry = getattr(self, "_keepalive_expiry", 300.0)
             limits = httpx.Limits(
@@ -50,8 +57,8 @@ class SiliconFlowAPI(BaseAPI):
                 keepalive_expiry=expiry,
             )
             # 重试由 BaseAPI 统一处理，transport 不再隐式重复请求。
-            transport = httpx.HTTPTransport(retries=0, limits=limits, http2=True)
-            return httpx.Client(timeout=self._http_timeout, transport=transport, http2=True)
+            transport = httpx.HTTPTransport(retries=0, limits=limits, http2=http2)
+            return httpx.Client(timeout=self._http_timeout, transport=transport, http2=http2)
         except Exception as e:
             logger.error("重建HTTP客户端失败: %s", e)
             limits = httpx.Limits(
@@ -94,6 +101,11 @@ class SiliconFlowAPI(BaseAPI):
         """BUG-005：关闭心跳线程和父类资源，幂等可安全多次调用。"""
         self._stop_heartbeat()
         super().close()
+
+    def retire(self) -> None:
+        """退役实例同样必须停掉心跳线程，否则它会一直尝试重建连接。"""
+        self._stop_heartbeat()
+        super().retire()
 
     # ── 增强 vision_query（带 debug 日志）──────────────
 

@@ -19,6 +19,12 @@ from ..application.autosave import (
     AutosaveCoordinator,
     SaveResult,
 )
+from ..application.context_budget import (
+    describe_budget,
+    resolve_long_budget,
+    resolve_model_context_tokens,
+    resolve_model_max_output_tokens,
+)
 from ..application.preflight import PreflightSeverity, build_preflight_report
 from ..application.quality_review import inspect_quality
 from ..application.translation_document import TranslationDocument
@@ -196,6 +202,7 @@ class MainWindow:
             on_run_terminal=self._record_translation_usage,
             on_retranslated=self._on_rows_retranslated,
             mode_toggle=self.small_model_mode_btn,
+            long_context_btn=self.long_context_btn,
             backup_dir=(
                 storage_paths.translation_backups_dir if storage_paths is not None else None
             ),
@@ -565,6 +572,18 @@ class MainWindow:
             command=lambda: self.translation_controller.stop_translation(),
         )
         self.stop_btn.pack(side=tk.LEFT)
+
+        # P1-10：超长上下文翻译与主按钮同排；空间不足时由下面的第二行承载
+        # （见 create_control_panel 结尾的自适应换行）。
+        self.long_context_btn = ttk.Button(
+            left_control,
+            text="超长上下文翻译",
+            width=14,
+            state=tk.DISABLED,
+            command=self._start_long_context_translation,
+        )
+        self.long_context_btn.pack(side=tk.LEFT, padx=(8, 0))
+
         self.small_model_mode_btn = ttk.Checkbutton(
             left_control,
             text="小模型（逐行）",
@@ -1157,10 +1176,17 @@ class MainWindow:
         if errors:
             messagebox.showerror("翻译预检", "\n".join(errors), parent=self.root)
             return False
+        # LC-13：超长模式必须把同一策略解析出的有效预算展示给用户，且不得
+        # 无条件增加额外确认弹窗——只有普通模式的警告确认保持原样。
+        budget_note = ""
+        if action == "long_context":
+            budget_note = self._long_context_preflight_note(api_config)
+            if budget_note is None:
+                return False
         warnings = [
             issue.message for issue in report.issues if issue.severity is PreflightSeverity.WARNING
         ]
-        if warnings and app_config.get("preflight_confirm_warnings", True):
+        if warnings and app_config.get("preflight_confirm_warnings", True) and not budget_note:
             approved = messagebox.askyesno(
                 "翻译预检",
                 "\n".join(warnings)
@@ -1169,10 +1195,37 @@ class MainWindow:
             )
             if not approved:
                 return False
-        self.update_status(
-            f"预检通过：待翻译 {report.pending_lines} 行，预计输入 {report.estimated_input_tokens} token"
+        summary = (
+            f"预检通过：待翻译 {report.pending_lines} 行，"
+            f"预计输入 {report.estimated_input_tokens} token"
         )
+        if budget_note:
+            summary += f"；{budget_note}"
+        self.update_status(summary)
         return True
+
+    def _long_context_preflight_note(self, api_config) -> str | None:
+        """解析超长模式的预算并返回展示文案；不可解析时提示并返回 ``None``。
+
+        与运行时共用 ``resolve_long_budget``：预检显示的模式与有效预算必须与
+        实际运行一致（LC-13）。
+        """
+        try:
+            requested = self.config_manager.get_long_context_window_tokens()
+            budget = resolve_long_budget(
+                requested_context_tokens=requested,
+                model_context_tokens=resolve_model_context_tokens(api_config),
+                model_max_output_tokens=resolve_model_max_output_tokens(api_config),
+            )
+        except Exception as exc:  # noqa: BLE001 - 预算不可解析必须可见
+            logger.error("超长上下文预算解析失败: %s", exc)
+            messagebox.showerror("翻译预检", str(exc), parent=self.root)
+            return None
+        narrative = describe_budget(
+            budget, model_context_tokens=resolve_model_context_tokens(api_config)
+        )
+        self.update_status(f"超长上下文翻译：{narrative.text}")
+        return narrative.text
 
     def _record_translation_usage(self, _result, _mode: str) -> None:
         get_snapshot = getattr(self.translator, "call_if_initialized", None)
@@ -1254,11 +1307,13 @@ class MainWindow:
         policy = self._refresh_shared_translation_policy()
         if enabled:
             self.update_status(
-                "已开启小模型模式：逐行翻译，"
-                f"主界面与后台队列并发 {policy.max_in_flight_requests}"
+                f"已开启小模型模式：逐行翻译，主界面与后台队列并发 {policy.max_in_flight_requests}"
             )
         else:
             self.update_status("已关闭小模型模式：恢复按设置分批翻译")
+        # 小模型模式与超长上下文互斥：切换后立即刷新超长入口状态，不调用
+        # 完整的 refresh_action_state（那会要求文档模型等全部控件就绪）。
+        self._refresh_long_context_button_state()
 
     def _refresh_shared_translation_policy(self):
         policy = build_queue_policy_from_app_config(self.config_manager.get_app_config())
@@ -1276,6 +1331,28 @@ class MainWindow:
         self._show_all_rows()
         self.translation_controller.retranslate_all()
 
+    def _start_long_context_translation(self) -> None:
+        """主界面“超长上下文翻译”：翻译当前文档全部未完成行。
+
+        沿用导入/API 校验、预检、运行锁和自动保存；过滤后的表格不是真相源。
+        """
+        if self._table_loading:
+            self.update_status("内容仍在加载，请稍候")
+            return
+        self._show_all_rows()
+        if not self.translation_table.get_children():
+            self.file_importer.import_file()
+            return
+        if self._api_configured is None:
+            self._apply_api_status(self.config_manager.is_api_configured())
+        if not self.config_manager.is_api_configured():
+            self.open_settings()
+            return
+        onboarding = getattr(self, "onboarding", None)
+        if onboarding is not None:
+            onboarding.notify("translation_started")
+        self.translation_controller.start_long_context_translation()
+
     def _on_rows_retranslated(self, row_indices: set[int]) -> None:
         """Keep the manual-edit filter aligned with successful retranslations."""
         for row_index in row_indices:
@@ -1289,7 +1366,9 @@ class MainWindow:
             self.apply_review_filter()
 
     def refresh_action_state(self):
-        if self._table_loading:
+        # 通过 __new__ 构造的最小测试替身可能没有部分属性；与 _has_* 的
+        # hasattr 风格保持一致，缺属性时按"无文档"处理。
+        if getattr(self, "_table_loading", False):
             if hasattr(self, "start_translation_btn"):
                 self.start_translation_btn.config(state=tk.DISABLED)
             if hasattr(self, "retranslate_btn"):
@@ -1347,6 +1426,9 @@ class MainWindow:
                 tk.NORMAL if has_content and completed and api_configured else tk.DISABLED
             )
             self.retranslate_btn.config(state=retranslate_state)
+        self._refresh_long_context_button_state(
+            has_content=has_content, pending=pending, api_configured=api_configured
+        )
         if hasattr(self, "more_actions_menu"):
             menu_state = tk.NORMAL if is_epub else tk.DISABLED
             if hasattr(self, "export_epub_btn"):
@@ -1371,6 +1453,37 @@ class MainWindow:
                 )
         if hasattr(self, "task_summary_label"):
             self.task_summary_label.config(text=f"待翻译 {pending} · 已完成 {completed}")
+
+    def _refresh_long_context_button_state(
+        self, *, has_content=None, pending=None, api_configured=None
+    ):
+        """刷新“超长上下文翻译”按钮的可用状态。
+
+        与“翻译未完成行”同一可用条件：有内容、有待翻译行、API 已配置，且小模型
+        模式未开启（两者互斥）。不传状态参数时自行读取——用于小模型开关切换后
+        的局部刷新，避免依赖完整控制器/文档模型。
+        """
+        button = getattr(self, "long_context_btn", None)
+        if button is None:
+            return
+        if has_content is None or pending is None or api_configured is None:
+            try:
+                source_lines = self._document.source_lines()
+                target_lines = self._document.target_lines()
+                has_content = bool(source_lines)
+                pending = sum(
+                    1
+                    for source, target in zip(source_lines, target_lines, strict=True)
+                    if source.strip() and not target.strip()
+                )
+                api_configured = bool(self._api_configured)
+            except AttributeError:
+                # 最小测试替身没有文档模型：保持按钮原状，不猜测状态。
+                return
+        enabled = bool(
+            has_content and pending and api_configured and not self._small_model_mode_var.get()
+        )
+        button.config(state=tk.NORMAL if enabled else tk.DISABLED)
 
     def _set_save_status(self, status):
         if hasattr(self, "save_status_label"):
@@ -1398,7 +1511,7 @@ class MainWindow:
         """
         if self._table_loading:
             return
-        if not self._document.dirty_indices:
+        if not self._document.has_dirty_rows:
             return
         app_config = self.config_manager.get_app_config()
         auto_save_enabled = app_config.get("auto_save", True)

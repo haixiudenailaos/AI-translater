@@ -55,6 +55,8 @@ class BaseAPI:
     DEFAULT_MAX_CONNECTIONS: int = 20
     DEFAULT_TIMEOUT: float = 60.0
     DEFAULT_CONNECTION_TEST_TIMEOUT: float = 30.0
+    # 只有明确验证过 HTTP/2 的 provider 才开启（见 SiliconFlowAPI）。
+    SUPPORTS_HTTP2: bool = False
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -68,12 +70,23 @@ class BaseAPI:
         self.temperature = config.get("temperature", 0.3)
         self._cancel_event = threading.Event()
         self._current_client: httpx.Client | None = None
+        # 退役实例（``retire()``）不再重建，而是拒绝后续请求。
+        self._retired = False
+        # 逐行/单并发模式下切到 HTTP/1.1：小模型逐行翻译会在一条连接上连续
+        # 开关大量短流，打包后的 Windows exe 里 h2 在这种模式下会以
+        # ConnectionTerminated / WinError 10038 中断整个连接。
+        self._http2_enabled = self.SUPPORTS_HTTP2
 
         # R2-BUG-023：活动请求计数器和客户端锁
         # 心跳线程通过检查 _active_requests 判断是否有翻译请求正在进行，
         # 避免在流式翻译过程中关闭客户端导致连接中断。
         self._client_lock = threading.Lock()
         self._active_requests = 0
+
+        # 每次请求的局部结果（当前只有流式 ``finish_reason``）。
+        # 必须按线程隔离：同一实例被多个批次线程并发使用，放在实例上会让
+        # 并发请求读到彼此的状态。
+        self._request_local = threading.local()
 
         self._max_attempts = max(1, min(5, int(config.get("api_max_attempts", 3))))
         self._retry_base_delay = max(0.0, float(config.get("retry_base_delay", 1.0)))
@@ -180,6 +193,8 @@ class BaseAPI:
     def _recreate_client(self) -> None:
         """Replace the shared client atomically, then close the detached client."""
         with self._client_lock:
+            if self._retired:
+                return
             old_client = self._replace_client_locked()
         self._close_client(old_client)
 
@@ -189,9 +204,14 @@ class BaseAPI:
         R2-BUG-008：不仅判断是否为 None，还要判断 is_closed。
         取消操作会关闭并置空客户端，下次请求必须重建，否则复用已关闭客户端
         会导致连续失败。
+
+        退役实例（``retire()``）不再重建，而是抛出 ``TranslationRequestError``：
+        它的运行已被 UI 丢弃，继续发请求只会消耗额度。
         """
         old_client: httpx.Client | None = None
         with self._client_lock:
+            if self._retired:
+                raise TranslationRequestError("API 客户端已因配置变更退役，本次请求不再发送")
             client = self._current_client
             if client is None or getattr(client, "is_closed", False):
                 old_client = self._replace_client_locked()
@@ -210,6 +230,8 @@ class BaseAPI:
         """
         old_client: httpx.Client | None = None
         with self._client_lock:
+            if self._retired:
+                raise TranslationRequestError("API 客户端已因配置变更退役，本次请求不再发送")
             client = self._current_client
             if client is None or getattr(client, "is_closed", False):
                 old_client = self._replace_client_locked()
@@ -232,6 +254,8 @@ class BaseAPI:
         有活动请求时跳过并记录日志，等下一个心跳周期再尝试。
         """
         with self._client_lock:
+            if self._retired:
+                return
             if self._active_requests > 0:
                 logger.debug("心跳检测到 %d 个活动请求，跳过客户端重建", self._active_requests)
                 return
@@ -264,6 +288,46 @@ class BaseAPI:
             client = self._current_client
             self._current_client = None
         self._close_client(client)
+
+    def retire(self) -> None:
+        """永久停用此实例：关闭客户端并拒绝后续请求。幂等。
+
+        配置变更会让引擎构造一个新的 API 实例，但此前启动的批次线程仍持有
+        旧实例。旧实例若能继续重建连接，它会跑完整个运行——而 UI 早已按新
+        ``run_id`` 丢弃它的进度事件，于是进度条永久静止、额度被白白消耗。
+        与 ``close()`` 的区别：``close()`` 之后允许惰性重建，``retire()`` 之后
+        不允许。
+        """
+        with self._client_lock:
+            self._retired = True
+            client = self._current_client
+            self._current_client = None
+        self._cancel_event.set()
+        self._close_client(client)
+
+    def configure_serial_transport(self, serial: bool) -> None:
+        """逐行单并发运行时改用 HTTP/1.1；恢复批量并发时切回默认协议。
+
+        小模型逐行模式会在同一条连接上连续开关成百上千条很短的流。打包后的
+        Windows exe 中，h2 在这种模式下会以 ``ConnectionTerminated`` /
+        ``WinError 10038`` 掉整条连接，表现为翻译中途长时间停顿后失败。
+        HTTP/1.1 每个请求独立成流，不受此影响。
+
+        不支持 HTTP/2 的 provider 上是纯 no-op。切换必然重建客户端，
+        因此值未变化时不做任何事（保持幂等，避免拔掉在途连接）。
+        """
+        if not self.SUPPORTS_HTTP2:
+            return
+        target = self.SUPPORTS_HTTP2 and not serial
+        with self._client_lock:
+            if self._retired or self._http2_enabled == target:
+                return
+            self._http2_enabled = target
+            old_client = self._replace_client_locked()
+        self._close_client(old_client)
+        logger.info(
+            "HTTP 传输已切换为 %s（逐行单并发=%s）", "HTTP/2" if target else "HTTP/1.1", serial
+        )
 
     # ── 连接测试 ────────────────────────────────────────
 
@@ -477,6 +541,17 @@ class BaseAPI:
         """
         self._on_retryable_response = hook
 
+    def last_finish_reason(self) -> str | None:
+        """返回**本线程上次**流式请求的 ``finish_reason``。
+
+        实现指南 §5.1/§6.1：超长请求的截断（``finish_reason == "length"``）必须
+        作为结构化信息传给结果判断，不能仅凭 HTTP 成功宣告整批成功。
+
+        该值按线程保存：同一 API 实例会被多个批次线程并发使用，把
+        ``last_finish_reason`` 放在实例上会让并发请求互相读取对方的状态。
+        """
+        return getattr(self._request_local, "last_finish_reason", None)
+
     def translate_stream(
         self,
         text: str,
@@ -486,6 +561,8 @@ class BaseAPI:
         if self._cancel_event.is_set():
             return None
 
+        # 每次请求开始清空本线程的截断标记，避免上一次请求的状态泄漏到本次。
+        self._request_local.last_finish_reason = None
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -513,6 +590,16 @@ class BaseAPI:
                             "messages": messages,
                             "temperature": self.temperature,
                             "stream": True,
+                            # DeepSeek V4 enables high-effort reasoning by default.
+                            # Translation only needs the final text; allowing the
+                            # hidden reasoning stream can make a large batch appear
+                            # stuck for a minute before its first translated token.
+                            **(
+                                {"thinking": {"type": "disabled"}}
+                                if "deepseek-v4" in self.model_name.lower()
+                                and self.config.get("disable_thinking", True)
+                                else {}
+                            ),
                         },
                     ) as response:
                         if response.status_code != 200:
@@ -580,7 +667,13 @@ class BaseAPI:
                                     data = json.loads(data_str)
                                     choices = data.get("choices", [])
                                     if choices:
-                                        delta = choices[0].get("delta", {})
+                                        choice = choices[0]
+                                        # 只在本次请求内记录，供上层（translator）
+                                        # 判断是否被输出容量截断。
+                                        finish_reason = choice.get("finish_reason")
+                                        if isinstance(finish_reason, str) and finish_reason:
+                                            self._request_local.last_finish_reason = finish_reason
+                                        delta = choice.get("delta", {})
                                         content = delta.get("content", "")
                                         if content:
                                             if first_token_at is None:

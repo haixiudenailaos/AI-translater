@@ -16,16 +16,34 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import cast
 
+from ..application.context_budget import (
+    describe_budget,
+    resolve_long_budget,
+    resolve_model_context_tokens,
+)
 from ..application.error_handling import format_diagnostic_info
+from ..config.translation_profile import SMALL_MODEL_MODE_CONFIG_KEY
 from ..core.concurrent_manager import (
     ConcurrentTranslationManager,
     TranslationTask,
     TranslationTaskSummary,
 )
 from ..core.epub_processor import EpubImportCancelled
+from ..domain.translation_policy import ContextMode, TranslationContextPolicy
+from ..utils.logger import get_logger
 from .task_detail_window import TaskDetailWindow
 from .theme import COLORS, FONT_APP_SMALL
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
+
+logger = get_logger(__name__)
+
+# 小模型模式与超长上下文翻译互斥（实现指南 §3.2）。与 controller / 引擎
+# 使用同一条消息，避免三处入口给出不同解释。
+SMALL_MODEL_LONG_CONTEXT_CONFLICT_MESSAGE = (
+    "小模型模式与超长上下文翻译不能同时使用：小模型模式强制逐行翻译，"
+    "与超长批次语义冲突。请先关闭小模型模式（设置 → 翻译设置），"
+    "或改用普通翻译。"
+)
 
 
 class ConcurrentWindow:
@@ -142,6 +160,14 @@ class ConcurrentWindow:
         ttk.Button(toolbar, text="全部开始", command=self._start_all).pack(
             side=tk.LEFT, padx=(0, 4)
         )
+        # 超长上下文翻译：只对点击时符合 start_all 启动条件的未完成任务生效；
+        # 运行中/取消处理中/保存中的任务不切换模式（由 Coordinator 再校验）。
+        self.long_context_btn = ttk.Button(
+            toolbar,
+            text="超长上下文翻译",
+            command=self._start_all_long_context,
+        )
+        self.long_context_btn.pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(toolbar, text="全部暂停", command=self._pause_all).pack(
             side=tk.LEFT, padx=(0, 4)
         )
@@ -594,6 +620,71 @@ class ConcurrentWindow:
             return
         self.manager.start_all()
 
+    def _start_all_long_context(self):
+        """批量超长上下文翻译。
+
+        与 ``_start_all`` 相同的启动条件与目标集合（点击时现有、符合原启动条件
+        的未完成任务），额外携带超长模式与预算快照。运行中/取消处理中/保存中
+        的任务由 Coordinator 在应用命令时重新校验并跳过，不在这里切换模式。
+        """
+        if not self.config_manager.is_api_configured():
+            messagebox.showwarning("配置警告", "请先配置API设置", parent=self.win)
+            return
+        app_config = self.config_manager.get_app_config()
+        if bool(app_config.get(SMALL_MODEL_MODE_CONFIG_KEY, False)):
+            # 小模型模式强制逐行，与超长批次语义冲突：入口即拒绝，
+            # 不静默覆盖小模型设置，也不显示超长却逐行发送。
+            messagebox.showwarning(
+                "超长上下文翻译不可用",
+                SMALL_MODEL_LONG_CONTEXT_CONFLICT_MESSAGE,
+                parent=self.win,
+            )
+            return
+        try:
+            requested = self.config_manager.get_long_context_window_tokens()
+        except Exception as exc:  # noqa: BLE001 - 配置异常需可见
+            logger.exception("读取超长上下文预算失败")
+            messagebox.showerror("配置错误", f"无法读取超长上下文设置：{exc}", parent=self.win)
+            return
+
+        # 冻结点击时的目标集合：之后新加入的文件不被纳入本次操作。
+        eligible = {
+            "pending",
+            "paused",
+            "cancelled",
+            "error",
+            "partial",
+        }
+        task_ids = tuple(
+            task.task_id for task in self._get_task_summaries() if task.status in eligible
+        )
+        if not task_ids:
+            messagebox.showinfo("提示", "没有可启动的超长上下文翻译任务", parent=self.win)
+            return
+
+        try:
+            budget = resolve_long_budget(
+                requested_context_tokens=requested,
+                model_context_tokens=resolve_model_context_tokens(
+                    self.config_manager.get_api_config(load_secret=False)
+                ),
+            )
+        except ValueError as exc:
+            messagebox.showerror("超长上下文翻译", str(exc), parent=self.win)
+            return
+
+        policy = TranslationContextPolicy(ContextMode.LONG, requested)
+        self.manager.start_all_long_context(task_ids, policy)
+        self.metrics_var.set(
+            f"超长上下文翻译已启动：{len(task_ids)} 个任务 | {describe_budget(budget, model_context_tokens=resolve_model_context_tokens(self.config_manager.get_api_config(load_secret=False))).text}"
+        )
+        logger.info(
+            "超长上下文翻译启动：tasks=%d requested=%d effective=%d",
+            len(task_ids),
+            budget.requested_context_tokens,
+            budget.effective_context_tokens,
+        )
+
     def _pause_all(self):
         self.manager.pause_all()
 
@@ -913,7 +1004,7 @@ class ConcurrentWindow:
                             self._submit_ui(
                                 run_id,
                                 lambda c=current, t=total, text=label, _idx=_i: self.win.title(
-                                    f"队列翻译管理 - [{_idx}/{total_tasks}] " f"{text} {c}/{t}"
+                                    f"队列翻译管理 - [{_idx}/{total_tasks}] {text} {c}/{t}"
                                 ),
                             )
 

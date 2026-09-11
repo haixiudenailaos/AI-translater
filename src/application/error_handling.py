@@ -140,6 +140,24 @@ def classify_error(
             correlation_id,
         )
 
+    # 已经按单并发逐行运行时，不要再建议"降低并发"——用户无法再降。
+    if "单并发逐行运行" in raw_message:
+        if status_code == 429 or "限流" in raw_message or "429" in raw_message:
+            return ActionableError(
+                ErrorCategory.RATE_LIMIT,
+                safe_message,
+                "当前已按单并发逐行运行；请稍后重试或检查服务商限制。",
+                True,
+                correlation_id,
+            )
+        return ActionableError(
+            ErrorCategory.NETWORK,
+            safe_message,
+            "当前已按单并发逐行运行；请稍后重试或更换模型。",
+            True,
+            correlation_id,
+        )
+
     # 401/403：认证 / 授权
     if status_code in (401, 403) or any(
         token in lowered

@@ -1,4 +1,4 @@
-name: Build V1.6.1 Desktop Artifacts
+name: Build V1.6.2 Desktop Artifacts
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
 
 env:
   APP_NAME: LightNovelTranslator
-  APP_VERSION: "1.6.1"
+  APP_VERSION: "1.6.2"
   # Windows release builds consume the checked-in Python 3.10 hash lock.
   PYTHON_VERSION: "3.10"
   PYINSTALLER_VERSION: "6.11.1"
@@ -124,7 +124,7 @@ jobs:
       - name: Rename and validate executable
         shell: pwsh
         run: |
-          $source = "dist/LightNovelTranslatorV1.6.1.exe"
+          $source = "dist/LightNovelTranslatorV1.6.2.exe"
           if (-not (Test-Path $source)) {
             throw "PyInstaller did not produce the expected executable: $source"
           }
@@ -184,7 +184,7 @@ jobs:
       - name: Assemble macOS application
         shell: bash
         run: |
-          BINARY="dist/LightNovelTranslatorV1.6.1"
+          BINARY="dist/LightNovelTranslatorV1.6.2"
           if [ ! -f "$BINARY" ]; then
             echo "PyInstaller did not produce the expected binary: $BINARY"
             exit 1
@@ -212,9 +212,9 @@ jobs:
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
-            <string>1.6.1</string>
+            <string>1.6.2</string>
             <key>CFBundleVersion</key>
-            <string>1.6.1</string>
+            <string>1.6.2</string>
             <key>LSMinimumSystemVersion</key>
             <string>11.0</string>
             <key>NSHighResolutionCapable</key>
@@ -236,7 +236,7 @@ jobs:
           retention-days: 30
 
   release:
-    name: Publish V1.6.1 release
+    name: Publish V1.6.2 release
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/V1.6'
@@ -256,9 +256,9 @@ jobs:
       - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.6.1
+          tag_name: v1.6.2
           target_commitish: V1.6
-          name: LightNovelTranslator v1.6.1
-          body_path: docs/RELEASE_NOTES_1.6.1.md
+          name: LightNovelTranslator v1.6.2
+          body_path: docs/RELEASE_NOTES_1.6.2.md
           generate_release_notes: false
           files: release-assets/*

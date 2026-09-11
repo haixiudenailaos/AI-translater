@@ -244,7 +244,12 @@ class _GlobalRequestGate:
         base, remainder = divmod(self._configured_max, len(active))
         for position, (_priority, _order, registered_id) in enumerate(active):
             if registered_id == consumer_id:
-                return base + (1 if position < remainder else 0)
+                # A share of 0 is not a fair share, it is a deadlock: a consumer
+                # that can never acquire spins in ``ProviderLimiter.acquire``
+                # forever. The floor keeps every registered consumer able to
+                # make progress once a slot frees; ``_in_flight`` below still
+                # enforces the real global upper bound.
+                return max(1, base + (1 if position < remainder else 0))
         return 0
 
 
@@ -508,7 +513,14 @@ class ProviderLimiter:
         base, remainder = divmod(self._state.current_limit, len(active))
         for position, (_priority, _order, registered_id) in enumerate(active):
             if registered_id == consumer_id:
-                return base + (1 if position < remainder else 0)
+                # Never hand out a 0 share.  ``acquire()`` polls until it wins a
+                # slot and only gives up on cancellation, so a 0 share turns
+                # into a permanent spin and the dispatch loop waits on that
+                # batch forever — the run stalls with no error.  This is the
+                # normal case once a 429 halves ``current_limit`` below the
+                # number of in-flight batches.  ``self._in_flight`` below still
+                # caps the real concurrency at ``current_limit``.
+                return max(1, base + (1 if position < remainder else 0))
         return 0
 
     # ── 槽位获取（Worker 调用） ──────────────────────────

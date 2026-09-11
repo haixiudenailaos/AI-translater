@@ -11,7 +11,17 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from ..application.context_budget import (
+    describe_budget,
+    resolve_long_budget,
+    resolve_model_context_tokens,
+    resolve_model_max_output_tokens,
+)
 from ..config.image_ocr import SILICONFLOW_OCR_DEFAULT_MODEL
+from ..config.long_context_config import (
+    LONG_CONTEXT_CONFIG_KEY,
+    LONG_CONTEXT_SCHEMA_VERSION,
+)
 from ..config.translation_profile import (
     DEEPSEEK_V4_FLASH_MODEL,
     DEFAULT_QUEUE_ADAPTIVE_CONCURRENCY,
@@ -36,7 +46,12 @@ from ..config.volcengine_image import (
     VOLCENGINE_IMAGE_DEFAULT_MODEL,
     VOLCENGINE_IMAGE_MODEL_SUGGESTIONS,
 )
-from .form_validation import FormValidator
+from ..domain.translation_policy import LONG_CONTEXT_DEFAULT_CONTEXT_WINDOW_TOKENS
+from .form_validation import (
+    FormValidator,
+    parse_positive_int_text,
+    validate_positive_int_text,
+)
 from .theme import COLORS
 from .ui_callback_mailbox import TkUICallbackPump, UICallbackMailbox
 from .window_geometry import WindowGeometryTracker
@@ -193,9 +208,23 @@ class SettingsWindow:
         self._form_validator.attach_focus_out_clamp(spec)
 
     def _validate_form(self) -> tuple[bool, str, object | None]:
-        """P2-5：整表校验。返回 ``(ok, first_message, first_failed_widget)``。"""
+        """P2-5：整表校验。返回 ``(ok, first_message, first_failed_widget)``。
+
+        超长上下文大小使用"无上限正整数"校验，**不**走 ``clamp_int``：失败时
+        返回字段级消息并把焦点设到该字段，保留用户待编辑内容，绝不静默裁剪成
+        普通模式的 6,000/20,000。
+        """
         result = self._form_validator.validate_all()
-        return result.ok, result.first_message or "", result.first_failed_widget
+        if not result.ok:
+            return False, result.first_message or "", result.first_failed_widget
+        entry = getattr(self, "long_context_entry", None)
+        if entry is not None:
+            message = validate_positive_int_text(
+                self.long_context_tokens_var.get(), "单次上下文大小"
+            )
+            if message is not None:
+                return False, message, entry
+        return True, "", None
 
     def _on_queue_concurrency_preset_changed(self) -> None:
         """Keep the custom field and selected global concurrency in sync."""
@@ -561,6 +590,28 @@ class SettingsWindow:
         self.temp_label.grid(row=4, column=2, padx=5, pady=10)
         temperature_scale.configure(command=self.update_temperature_label)
 
+        # 模型容量（超长上下文翻译的预算上限）。这是用户声明的值，不是向
+        # 服务端查询验证过的能力；可随 API 预设保存、加载和切换。
+        ttk.Label(api_frame, text="模型容量（token）:").grid(
+            row=5, column=0, sticky=tk.W, padx=10, pady=(4, 10)
+        )
+        capacity = resolve_model_context_tokens(self.api_config)
+        self.model_context_window_var = tk.StringVar(value=str(capacity))
+        self.model_context_window_entry = ttk.Entry(
+            api_frame, textvariable=self.model_context_window_var, width=30
+        )
+        self.model_context_window_entry.grid(row=5, column=1, padx=10, pady=(4, 10), sticky=tk.EW)
+        capacity_tip = ttk.Label(
+            api_frame,
+            text="本次模型可用的总上下文大小，用于超长上下文翻译的有效预算预览。",
+            foreground=COLORS["muted"],
+            justify=tk.LEFT,
+        )
+        capacity_tip.grid(row=6, column=0, columnspan=3, sticky=tk.EW, padx=10, pady=(0, 6))
+        capacity_tip.bind(
+            "<Configure>", lambda event: capacity_tip.configure(wraplength=event.width - 4)
+        )
+
     def create_translation_tab(self, notebook):
         """创建翻译设置页面"""
         trans_frame = self._create_scrollable_tab(notebook, "翻译设置")
@@ -755,6 +806,117 @@ class SettingsWindow:
             "自定义并发请求数",
         )
         self._on_queue_concurrency_preset_changed()
+
+        self._create_long_context_section(trans_frame, start_row=11)
+
+    # ── 超长上下文翻译设置（实现指南 §3.1） ────────────────
+
+    def _create_long_context_section(self, parent, *, start_row: int) -> None:
+        """在“翻译设置”页追加超长上下文翻译区域。
+
+        单位是 **token**（输入与输出合计的预算），不是字符数或行数。字段使用
+        字符串变量接收输入，由 ``validate_positive_int_text`` 完整校验后再转成
+        整数——不接受空值/0/负数/小数/布尔值，也不通过 ``int(1.5)`` 静默截断。
+        """
+        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
+            row=start_row, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(10, 4)
+        )
+        ttk.Label(
+            parent,
+            text="超长上下文翻译",
+            font=("TkDefaultFont", 9, "bold"),
+        ).grid(row=start_row + 1, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(0, 2))
+
+        ttk.Label(parent, text="单次上下文大小（token）:").grid(
+            row=start_row + 2, column=0, sticky=tk.W, padx=10, pady=(6, 2)
+        )
+        current_tokens = self.app_config.get(LONG_CONTEXT_CONFIG_KEY, {})
+        if isinstance(current_tokens, dict):
+            current_value = current_tokens.get("context_window_tokens")
+        else:
+            current_value = None
+        if not isinstance(current_value, int) or isinstance(current_value, bool):
+            current_value = int(current_value) if str(current_value).strip().isdigit() else None
+        self.long_context_tokens_var = tk.StringVar(
+            value=str(current_value or LONG_CONTEXT_DEFAULT_CONTEXT_WINDOW_TOKENS)
+        )
+        self.long_context_entry = ttk.Entry(
+            parent, textvariable=self.long_context_tokens_var, width=33
+        )
+        self.long_context_entry.grid(
+            row=start_row + 2, column=1, padx=10, pady=(6, 2), sticky=tk.EW
+        )
+
+        presets_frame = ttk.Frame(parent)
+        presets_frame.grid(row=start_row + 3, column=1, padx=10, pady=(0, 4), sticky=tk.W)
+        ttk.Label(presets_frame, text="快捷值:").pack(side=tk.LEFT, padx=(0, 6))
+        # 快捷值只提供便捷输入，不是合法值白名单——用户可填写任意正整数。
+        for value in (32_768, 65_536, 131_072, 262_144, 1_048_576):
+            ttk.Button(
+                presets_frame,
+                text=f"{value:,}",
+                width=9,
+                command=lambda v=value: self.long_context_tokens_var.set(str(v)),
+            ).pack(side=tk.LEFT, padx=(0, 4))
+
+        explanation = ttk.Label(
+            parent,
+            text=("包含提示词、原文和输出预留。仅用于超长上下文翻译；实际大小受当前模型容量影响。"),
+            foreground=COLORS["muted"],
+            justify=tk.LEFT,
+        )
+        explanation.grid(
+            row=start_row + 4, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(0, 4)
+        )
+        explanation.bind(
+            "<Configure>", lambda event: explanation.configure(wraplength=event.width - 4)
+        )
+
+        self.long_context_preview_var = tk.StringVar(value="")
+        preview = ttk.Label(
+            parent,
+            textvariable=self.long_context_preview_var,
+            foreground=COLORS["muted"],
+            justify=tk.LEFT,
+        )
+        preview.grid(row=start_row + 5, column=0, columnspan=2, sticky=tk.EW, padx=10, pady=(0, 8))
+        preview.bind("<Configure>", lambda event: preview.configure(wraplength=event.width - 4))
+        # 输入变化时实时刷新预览（“设置预算 X，按当前模型配置有效预算 Y”）。
+        self.long_context_tokens_var.trace_add(
+            "write", lambda *_a: self._refresh_long_context_preview()
+        )
+        self._refresh_long_context_preview()
+
+    def _refresh_long_context_preview(self) -> None:
+        """刷新有效预算预览；损坏输入显示提示而不是悄悄裁剪。"""
+        variable = getattr(self, "long_context_preview_var", None)
+        if variable is None:
+            return
+        raw = self.long_context_tokens_var.get()
+        error = validate_positive_int_text(raw, "单次上下文大小")
+        if error is not None:
+            variable.set(f"⚠ {error}")
+            return
+        requested = parse_positive_int_text(raw)
+        if requested is None:  # pragma: no cover - 与上面的校验同源
+            variable.set("⚠ 单次上下文大小无效")
+            return
+        try:
+            api_config = self.config_manager.get_api_config(load_secret=False)
+        except Exception:  # noqa: BLE001 - 预览失败不应阻塞设置窗口
+            variable.set(f"设置预算 {requested:,} token")
+            return
+        model_context = resolve_model_context_tokens(api_config)
+        try:
+            budget = resolve_long_budget(
+                requested_context_tokens=requested,
+                model_context_tokens=model_context,
+                model_max_output_tokens=resolve_model_max_output_tokens(api_config),
+            )
+        except ValueError as exc:
+            variable.set(f"⚠ {exc}")
+            return
+        variable.set(describe_budget(budget, model_context_tokens=model_context).text)
 
     def create_volc_tab(self, notebook):
         """创建 V1.5 AI 图片翻译设置页面。"""
@@ -1491,7 +1653,12 @@ class SettingsWindow:
         self.prompt_text.insert(1.0, default_prompt)
 
     def _current_api_form_config(self):
-        """Build and validate the API settings currently shown in the form."""
+        """Build and validate the API settings currently shown in the form.
+
+        包含模型容量 ``context_window_tokens``：它是用户**声明**的值（用于
+        超长上下文预算的上限），不是假装已向服务端查询验证过的能力，也绝不
+        根据模型名称推断百万 token。
+        """
         display_model = self.model_var.get().strip()
         actual_model = self.display_to_model_map.get(display_model, display_model)
         provider = self.provider_var.get()
@@ -1502,13 +1669,20 @@ class SettingsWindow:
                 raise ValueError("请输入接口支持的模型名称")
             self.base_url_var.set(base_url)
 
-        return {
+        config = {
             "provider": provider,
             "api_key": self.api_key_var.get().strip(),
             "base_url": base_url,
             "model_name": actual_model,
             "temperature": self.temperature_var.get(),
         }
+        capacity_var = getattr(self, "model_context_window_var", None)
+        if capacity_var is not None:
+            capacity = parse_positive_int_text(capacity_var.get())
+            if capacity is None:
+                raise ValueError("模型容量必须是不含空值/0/负数/小数的正整数 token 数")
+            config["context_window_tokens"] = capacity
+        return config
 
     def test_connection(self):
         """测试API连接。
@@ -1621,6 +1795,9 @@ class SettingsWindow:
             if queue_preset not in QUEUE_CONCURRENCY_PRESETS:
                 queue_preset = QUEUE_CONCURRENCY_CUSTOM
             queue_concurrency = self._selected_queue_concurrency()
+            long_context_tokens = parse_positive_int_text(self.long_context_tokens_var.get())
+            if long_context_tokens is None:
+                raise ValueError("单次上下文大小必须是不含空值/0/负数/小数的正整数")
             new_app_config.update(
                 {
                     "target_language": self.target_lang_var.get(),
@@ -1629,6 +1806,11 @@ class SettingsWindow:
                     "auto_save": self.auto_save_var.get(),
                     "ui_font_size": self.ui_font_size_var.get(),
                     "translation_prompt": self.prompt_text.get(1.0, tk.END).strip(),
+                    # 超长上下文预算：保存用户原值，不在保存时按容量裁剪。
+                    LONG_CONTEXT_CONFIG_KEY: {
+                        "schema_version": LONG_CONTEXT_SCHEMA_VERSION,
+                        "context_window_tokens": long_context_tokens,
+                    },
                     "queue_concurrency_preset": queue_preset,
                     "queue_max_in_flight_requests": queue_concurrency,
                     "queue_hard_request_cap": queue_concurrency,
@@ -1739,8 +1921,21 @@ class SettingsWindow:
         if not preset_name:
             return
 
+        # 模型容量与 endpoint 随预设保存，使“随 API 预设保存、加载和切换”成立。
+        # 注意不要用 getattr(..., tk.StringVar()) 作默认值：那会在缺少 Tk root
+        # 的测试替身上构造 Tk 变量并抛错，即使属性本来存在。
+        capacity_var = getattr(self, "model_context_window_var", None)
+        capacity = parse_positive_int_text(capacity_var.get()) if capacity_var is not None else None
+        base_url_var = getattr(self, "base_url_var", None)
+        base_url = (base_url_var.get().strip() or None) if base_url_var is not None else None
         # ENG-2：返回 SecretSaveResult，按三态分支提示
-        result = self.config_manager.save_api_and_model_preset(preset_name, api_key, model_name)
+        result = self.config_manager.save_api_and_model_preset(
+            preset_name,
+            api_key,
+            model_name,
+            context_window_tokens=capacity,
+            base_url=base_url,
+        )
         if result.failed:
             messagebox.showerror(
                 "保存失败",
@@ -1819,6 +2014,20 @@ class SettingsWindow:
             raw_model_name = preset_data.get("model_name")
             model_name = raw_model_name if isinstance(raw_model_name, str) else ""
             self.model_var.set(self.model_display_map.get(model_name, model_name))
+            raw_base_url = preset_data.get("base_url")
+            if isinstance(raw_base_url, str) and raw_base_url:
+                self.base_url_var.set(raw_base_url)
+            # 模型容量随预设切换；旧预设缺字段时保留当前值并提示容量预览会变化。
+            capacity = preset_data.get("context_window_tokens")
+            entry = getattr(self, "model_context_window_entry", None)
+            if (
+                entry is not None
+                and isinstance(capacity, int)
+                and not isinstance(capacity, bool)
+                and capacity > 0
+            ):
+                self.model_context_window_var.set(str(capacity))
+                self._refresh_long_context_preview()
 
             preset_window.destroy()
             messagebox.showinfo("加载成功", f"已加载预设 '{preset_name}'")

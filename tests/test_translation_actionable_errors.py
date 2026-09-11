@@ -58,6 +58,18 @@ def test_small_model_provider_rejection_recommends_lower_global_concurrency():
     assert "并发 1" in actionable.recommended_action
 
 
+def test_small_model_http_429_does_not_suggest_lowering_single_line_concurrency():
+    actionable = classify_error(
+        RuntimeError(
+            "小模型逐行翻译请求被服务商限流（HTTP 429）。翻译已停止；当前已按单并发逐行运行。"
+        )
+    )
+
+    assert actionable.category is ErrorCategory.RATE_LIMIT
+    assert "单并发逐行运行" in actionable.recommended_action
+    assert "降低并发" not in actionable.recommended_action
+
+
 def test_non_retryable_missing_error_stops_automatic_retry(monkeypatch):
     controller = _controller_for_errors()
     controller._show_actionable_error = MagicMock()

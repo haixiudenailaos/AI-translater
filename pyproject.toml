@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-translater"
-version = "1.6.1"
+version = "1.6.2"
 description = "轻小说翻译器：EPUB/TXT 文学翻译与图片翻译工具"
 # 应用支持 Python 3.10 及以上；质量门禁覆盖多个主流 Python 版本。
 requires-python = ">=3.10,!=3.11.*"

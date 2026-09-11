@@ -68,7 +68,7 @@ def test_quality_review_detects_deterministic_line_level_issues():
                 "Magic Sword appears.",
             ],
             [
-                "Alice 有 10 个苹果。[LINE_1]",
+                "Alice 有 10 个苹果。[LINE-1]",
                 "相同的译文内容。",
                 "相同的译文内容。",
                 "魔法武器出现。",

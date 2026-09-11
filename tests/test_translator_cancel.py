@@ -36,6 +36,10 @@ class FakeApi:
         self.call_count = 0
         self.cancelled = False
         self.prompts = []
+        self.serial_transport_calls = []
+
+    def configure_serial_transport(self, serial):
+        self.serial_transport_calls.append(serial)
 
     def translate_stream(self, prompt, callback):
         self.call_count += 1
@@ -119,11 +123,13 @@ def _make_engine(
     batch_lines: int = 20,
     api=None,
     *,
+    model_name: str = "gpt-4",
     small_model_mode: bool = False,
     global_concurrency: int = 4,
 ) -> TranslatorEngine:
     cm = FakeConfigManager(
         batch_lines=batch_lines,
+        model_name=model_name,
         small_model_mode=small_model_mode,
         global_concurrency=global_concurrency,
     )
@@ -318,6 +324,49 @@ class TestTranslateBatchSuccess:
         assert result.lines == ["你好", "世界", "再见"]
         assert result.failed_indices == []
 
+    def test_hyphen_line_markers_are_parsed_and_removed_from_stream(self):
+        """模型把下划线改成连字符时，最终译文和流式预览都不得泄露标记。"""
+        api = FakeApi(
+            response_text=(
+                "[LINE-001]I gave up on indulging in sentimentality.\n"
+                "[line-002]There were just over ten days left."
+            )
+        )
+        engine = _make_engine(api=api)
+        progress_events = []
+
+        result = engine._translate_batch(
+            ["原文一", "原文二"],
+            lambda _, data: progress_events.append(data),
+            0,
+            2,
+        )
+
+        assert result.status == TranslationStatus.SUCCEEDED
+        assert result.lines == [
+            "I gave up on indulging in sentimentality.",
+            "There were just over ten days left.",
+        ]
+        previews = [line for event in progress_events for line in event.get("preview_lines", [])]
+        assert previews
+        assert all("[LINE" not in line.upper() for line in previews)
+
+    def test_marker_is_removed_from_unmarked_fallback_content(self):
+        """行首协议标记被剥离；无法对齐的标记行不会把标记本身写入译文。
+
+        正文中间碰巧出现的 ``[LINE-013]`` 仍保留（见
+        ``test_line_marker_inside_translation_is_not_removed``）。这里覆盖的是
+        模型把协议行写在回退路径上的情况：整行都是标记，对齐用不上。
+        """
+        api = FakeApi(response_text="[LINE-999]")
+        engine = _make_engine(api=api)
+
+        result = engine._translate_batch(["原文"], _no_op_progress, 0, 1)
+
+        assert result.status == TranslationStatus.PARTIAL
+        assert result.lines == [""]
+        assert result.failed_indices == [0]
+
     def test_empty_source_line_not_counted_as_failed(self):
         """原文为空的行不计为失败，即使译文也为空"""
         api = FakeApi(response_text="[LINE_001]你好\n[LINE_002]\n[LINE_003]再见")
@@ -462,7 +511,12 @@ class TestTranslateFlow:
 
     def test_small_model_mode_sends_exactly_one_source_line_per_request(self):
         api = FakeApi(response_text="逐行译文")
-        engine = _make_engine(batch_lines=20, api=api, small_model_mode=True)
+        engine = _make_engine(
+            batch_lines=20,
+            api=api,
+            model_name="Qwen/Qwen3-8B",
+            small_model_mode=True,
+        )
 
         completed = []
         engine._translate(
@@ -475,8 +529,9 @@ class TestTranslateFlow:
         assert completed[0].status == TranslationStatus.SUCCEEDED
         assert completed[0].lines == ["逐行译文", "逐行译文", "逐行译文"]
         assert all("[LINE_002]" not in prompt for prompt in api.prompts)
+        assert api.serial_transport_calls == [True]
 
-    def test_small_model_stream_rejection_stops_after_first_failed_request(self):
+    def test_small_model_stream_connection_error_stops_without_false_concurrency_claim(self):
         api = SequenceApi(
             [
                 (
@@ -503,8 +558,8 @@ class TestTranslateFlow:
         assert api.cancelled is True
         assert completed[0].status == TranslationStatus.FAILED
         assert set(completed[0].failed_indices) == {0, 1, 2}
-        assert "并发批次过大" in (completed[0].error_message or "")
-        assert "服务商拒绝" in (completed[0].error_message or "")
+        assert "流式连接被服务商提前关闭" in (completed[0].error_message or "")
+        assert "并发批次过大" not in (completed[0].error_message or "")
 
     def test_small_model_generic_stream_error_is_not_reported_as_provider_rejection(self):
         api = SequenceApi([("", False, TranslationRequestError("流式翻译异常: EmptyStreamError"))])
@@ -702,3 +757,99 @@ class TestCancelRecreatesClient:
             assert not client2.is_closed
         finally:
             api.close()
+
+    def test_retire_blocks_further_requests_instead_of_rebuilding(self):
+        """退役后的实例不得重建客户端继续消耗额度。
+
+        配置变更会把引擎的 api 换成新实例，但此前启动的批次线程仍持有旧
+        实例。旧实例若能在重试时重建连接，翻译会继续跑而 UI 已丢弃其进度
+        （run_id 已变），表现为进度条永久静止。
+        """
+        from src.api.base_api import BaseAPI
+
+        api = BaseAPI(
+            {
+                "base_url": "http://localhost",
+                "api_key": "test-key",
+                "model_name": "gpt-4",
+                "enable_cache": False,
+                "enable_batch": False,
+            }
+        )
+
+        try:
+            client1 = api._get_client()
+            api.retire()
+            assert api._current_client is None
+            assert client1.is_closed
+
+            with pytest.raises(TranslationRequestError):
+                api._get_client()
+
+            # 幂等，且心跳/显式重建都不得让退役实例复活。
+            api.retire()
+            api._recreate_client()
+            assert api._current_client is None
+        finally:
+            api.close()
+
+
+class TestApiRefreshDuringRun:
+    """翻译进行中的配置变更不得拔掉在途请求的 HTTP 客户端。
+
+    现场表现：翻译中保存 API 设置 → refresh_api() 关闭批次线程正在读取的
+    客户端 → 所有在途流以 WinError 10038 中断 → 进度条永久静止但窗口仍可
+    操作。修复后配置变更延迟到本次翻译结束才应用。
+    """
+
+    def test_refresh_during_run_is_deferred_until_the_run_finishes(self):
+        api = FakeApi(response_text="[LINE_001]译文")
+        engine = _make_engine(api=api)
+        refresh_calls = []
+        engine._init_api = lambda: refresh_calls.append(engine._run_active)
+
+        observed_api = []
+
+        def progress(_, data):
+            if data.get("streaming"):
+                # 模拟用户在翻译途中保存设置。
+                engine.refresh_api()
+                observed_api.append(engine.api)
+
+        engine._translate("原文", progress, lambda _: None)
+
+        # 运行期间不得调用 _init_api，且在途请求始终看到同一个 api 实例。
+        assert observed_api, "预期至少产生一次流式进度"
+        assert all(instance is api for instance in observed_api)
+        # 结束后恰好应用一次，且此时已不在运行中。
+        assert refresh_calls == [False]
+
+    def test_refresh_while_idle_applies_immediately(self):
+        engine = _make_engine(api=FakeApi(response_text="[LINE_001]译文"))
+        calls = []
+        engine._init_api = lambda: calls.append(True)
+
+        engine.refresh_api()
+
+        assert calls == [True]
+        assert engine._api_refresh_pending is False
+
+    def test_pending_refresh_is_applied_even_when_the_run_fails(self):
+        engine = _make_engine(api=FakeApi(raise_exc=RuntimeError("boom")))
+        calls = []
+        engine._init_api = lambda: calls.append(True)
+        pending_during_completion = []
+
+        def on_complete(_result):
+            # 终结回调仍在 _translate 的 try 块内，此时 run 尚未解除。
+            engine.refresh_api()
+            pending_during_completion.append(engine._api_refresh_pending)
+
+        engine._translate("原文", _no_op_progress, on_complete)
+
+        # 失败路径也必须解除 _run_active 并应用挂起的配置变更，
+        # 否则后续所有 refresh_api 都会被永久推迟。
+        assert pending_during_completion == [True]
+        assert engine._run_active is False
+        assert engine._api_refresh_pending is False
+        assert calls == [True]

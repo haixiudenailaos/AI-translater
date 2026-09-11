@@ -92,6 +92,40 @@ def validate_required_string(value: object, label: str) -> str | None:
     return None
 
 
+def validate_positive_int_text(value: object, label: str) -> str | None:
+    """校验"无上限正整数"文本字段（如超长上下文预算）。
+
+    与 :func:`validate_int_range` 的差别：
+
+    1. **不设人为最大值**——用户可输入 1,048,576 甚至更大，不用
+       ``sys.maxsize`` 之类的哨兵值表达"不限"。
+    2. **不做静默截断**——``int(1.5)`` 会接受 1.5 并截断为 1，
+       ``int("１２")`` 会接受全角数字，这里都拒绝。
+    3. 返回字段级错误消息，调用方聚焦字段并保留待编辑内容。
+    """
+    if value is None:
+        return f"{label}不能为空"
+    text = str(value).strip()
+    if not text:
+        return f"{label}不能为空"
+    if not all(char in "0123456789" for char in text):
+        return f"{label}必须是正整数（不能为空、0、负数、小数或非数字内容）"
+    if int(text) <= 0:  # pragma: no cover - 全 0 字符串由上一分支覆盖
+        return f"{label}必须大于 0"
+    return None
+
+
+def parse_positive_int_text(value: object) -> int | None:
+    """把已通过 :func:`validate_positive_int_text` 的文本转成整数。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or not all(char in "0123456789" for char in text):
+        return None
+    parsed = int(text)
+    return parsed if parsed > 0 else None
+
+
 class FormValidator:
     """聚合多个 ``FieldSpec``，提供整表校验。
 
@@ -219,6 +253,8 @@ __all__ = [
     "ValidationResult",
     "FormValidator",
     "clamp_int",
+    "parse_positive_int_text",
     "validate_int_range",
+    "validate_positive_int_text",
     "validate_required_string",
 ]

@@ -454,3 +454,76 @@ def test_credential_reference_empty_for_no_key():
     assert credential_reference_for({}) == ""
     assert credential_reference_for({"api_key": ""}) == ""
     assert credential_reference_for({"api_key": "   "}) == ""
+
+
+class TestStarvationFloor:
+    """争抢者多于可用槽位时，任何 consumer 都不得分到 0 份额。
+
+    现场症状：翻译到一半停住，不再发出新请求，也不报错。原因是
+    ``divmod(current_limit, len(active))`` 在 current_limit 小于争抢者数量时
+    给排在后面的 consumer 分到 0，而 ``acquire()`` 只在取消/致命错误时才退出
+    轮询，于是该批次永久自旋、派发循环永久等待它完成。
+    """
+
+    def test_no_consumer_is_starved_when_limit_is_below_consumer_count(self):
+        limiter = _make_limiter(configured_max=1, hard_cap=1)
+        limiter.register_consumer("A", priority=0)
+        limiter.register_consumer("B", priority=0)
+
+        assert limiter._consumer_limit_locked("A") >= 1
+        assert limiter._consumer_limit_locked("B") >= 1
+
+    def test_starved_consumer_proceeds_after_the_holder_releases(self):
+        limiter = _make_limiter(configured_max=1, hard_cap=1)
+        limiter.register_consumer("A", priority=0)
+        limiter.register_consumer("B", priority=0)
+
+        assert limiter.try_acquire(consumer_id="A")
+        # 全局上界仍然生效：A 持有唯一槽位时 B 必须等待。
+        assert not limiter.try_acquire(consumer_id="B")
+
+        limiter.release(consumer_id="A")
+        # 修复前这里恒为 False，B 会在 acquire() 中永久自旋。
+        assert limiter.try_acquire(consumer_id="B")
+        assert limiter.in_flight <= limiter._state.current_limit
+
+    def test_a_429_does_not_permanently_starve_a_second_batch(self):
+        limiter = _make_limiter(configured_max=2, hard_cap=2)
+        limiter.register_consumer("batch:1", priority=0)
+        limiter.register_consumer("batch:2", priority=0)
+
+        limiter.record_rate_limited()
+        assert limiter._state.current_limit == 1
+        limiter._state.blocked_until = 0.0
+
+        assert limiter.try_acquire(consumer_id="batch:1")
+        limiter.release(consumer_id="batch:1")
+        assert limiter.try_acquire(consumer_id="batch:2")
+
+    def test_shares_never_oversubscribe_the_global_budget(self):
+        limiter = _make_limiter(configured_max=2, hard_cap=2)
+        consumers = [f"c{index}" for index in range(5)]
+        for consumer in consumers:
+            limiter.register_consumer(consumer, priority=0)
+
+        granted = [c for c in consumers if limiter.try_acquire(consumer_id=c)]
+
+        assert len(granted) == 2
+        assert limiter.in_flight == 2
+        assert all(not limiter.try_acquire(consumer_id=c) for c in consumers)
+
+    def test_global_gate_also_applies_a_floor(self):
+        from src.core.queue_provider import _GlobalRequestGate
+
+        gate = _GlobalRequestGate(configured_max=1, hard_cap=1)
+        gate.register_consumer("A", priority=0)
+        gate.register_consumer("B", priority=0)
+
+        assert gate._consumer_limit_locked("A") >= 1
+        assert gate._consumer_limit_locked("B") >= 1
+
+        assert gate.try_acquire("A", priority=0, persistent=True)
+        assert not gate.try_acquire("B", priority=0, persistent=True)
+        gate.release("A")
+        assert gate.try_acquire("B", priority=0, persistent=True)
+        assert gate.available_capacity == 0

@@ -315,7 +315,17 @@ class ConcurrentTranslationManager:
         self._notify_progress(task_id)
 
     def start_all(self) -> None:
+        """普通模式批量启动；不受另一个任务选择超长模式影响。"""
         self._coordinator.submit_command("start_all")
+        self._notify_progress(None)
+
+    def start_all_long_context(self, task_ids, context_policy) -> None:
+        """超长上下文模式批量启动（LC-04）。
+
+        任务集合在点击时由调用方冻结，``context_policy`` 是该次运行的不可变
+        预算快照。运行中/取消处理中/保存中的任务由 Coordinator 重新校验后跳过。
+        """
+        self._coordinator.submit_long_context_start(task_ids, context_policy)
         self._notify_progress(None)
 
     def pause_all(self) -> None:

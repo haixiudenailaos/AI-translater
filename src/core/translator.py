@@ -17,6 +17,12 @@ from typing import Callable, List
 from ..api.deepseek_api import DeepseekAPI
 from ..api.openai_compatible_api import OpenAICompatibleAPI
 from ..api.siliconflow_api import SiliconFlowAPI
+from ..application.batch_planner import (
+    BatchPlanningError,
+    compute_protocol_overhead,
+    plan_batches,
+)
+from ..application.context_budget import is_unsatisfiable_for_provider
 from ..config.translation_profile import (
     DEFAULT_OUTPUT_TOKEN_RESERVE,
     DEFAULT_QUEUE_TRANSLATION_BATCH_LINES,
@@ -33,8 +39,12 @@ from ..config.translation_profile import (
     SMALL_MODEL_MODE_CONFIG_KEY,
     apply_text_translation_profile,
 )
+from ..domain.translation_policy import (
+    ContextMode,
+    ResolvedContextBudget,
+    TranslationContextPolicy,
+)
 from ..utils.logger import get_logger
-from ..utils.token_estimator import estimate_tokens
 from .queue_provider import (
     ProviderLimiter,
     ProviderLimiterRegistry,
@@ -66,6 +76,32 @@ _SMALL_MODEL_PROVIDER_REJECTION_MESSAGE = (
     "小模型逐行翻译的并发批次过大，已被服务商拒绝。"
     "翻译已停止；当前并发已限制为 1，请稍后重试或检查服务商限制。"
 )
+_SMALL_MODEL_STREAM_CLOSED_MESSAGE = (
+    "小模型逐行翻译时流式连接被服务商提前关闭。翻译已停止；当前已按单并发逐行运行。"
+)
+_SMALL_MODEL_LONG_CONTEXT_CONFLICT_MESSAGE = (
+    "小模型模式与超长上下文翻译不能同时使用：小模型模式强制逐行翻译，"
+    "与超长批次语义冲突。请先关闭小模型模式（设置 → 翻译设置），"
+    "或改用普通翻译。"
+)
+
+
+def _unsatisfiable_tpm_message(plan: "TranslationBatchPlan", tpm_limit: int) -> str:
+    """单个请求的输入估算超过 TPM 上限时的可操作错误。"""
+    return (
+        f"本次请求估算输入约 {plan.estimated_input_tokens:,} token，"
+        f"超过当前每分钟 token 限额（TPM）{tpm_limit:,}。"
+        "该请求永远无法取得发送许可。请调小“单次上下文大小”，"
+        "或在队列设置中提高 TPM 限额。"
+    )
+
+
+def _truncated_result_message(finish_reason: str | None) -> str:
+    """输出被 provider 截断时的可操作错误。"""
+    detail = f"（finish_reason={finish_reason}）" if finish_reason else ""
+    return (
+        f"模型输出被截断{detail}，本批译文不完整。请调小“单次上下文大小”或更换支持更大输出的模型。"
+    )
 
 
 def _as_int(value: object, *, default: int, minimum: int | None = None) -> int:
@@ -92,16 +128,27 @@ def _numeric_metrics(value: object) -> dict[str, int | float]:
 
 
 def _small_model_terminal_error_message(error: TranslationRequestError) -> str:
-    """Translate stream/protocol rejection details into an actionable UI message."""
+    """Translate stream/protocol rejection details into an actionable UI message.
+
+    HTTP/2 ``ConnectionTerminated`` (and similar stream-reset errors) happen
+    even at concurrency 1, typically because the provider closed a short
+    sequential stream.  Mapping that to "并发批次过大" tells the user to
+    lower a concurrency that is already 1, which is both wrong and
+    unactionable.
+    """
     message = str(error)
     lowered = message.lower()
-    stream_rejection_markers = (
+    stream_closed_markers = (
         "connectionterminated",
         "end_stream",
         "pseudo-header in trailer",
+        "winerror 10038",
+        "在一个非套接字上尝试了一个操作",
     )
-    if error.status_code == 429 or any(marker in lowered for marker in stream_rejection_markers):
-        return _SMALL_MODEL_PROVIDER_REJECTION_MESSAGE
+    if any(marker in lowered or marker in message for marker in stream_closed_markers):
+        return _SMALL_MODEL_STREAM_CLOSED_MESSAGE
+    if error.status_code == 429:
+        return "小模型逐行翻译请求被服务商限流（HTTP 429）。翻译已停止；当前已按单并发逐行运行。"
     return message or "小模型逐行翻译失败，翻译已停止。"
 
 
@@ -132,6 +179,14 @@ class TranslationRunContext:
     prompt_version: str = ""
     prompt_schema_version: int = 1
     glossary_version: str = ""
+    # 超长上下文翻译：任务级不可变预算快照。运行中的批次只读这里，
+    # 不读取可变的 UI 或共享配置，因此设置改动只影响新开始的运行。
+    # 普通模式为 ``None``（按原策略解析）。
+    budget: ResolvedContextBudget | None = None
+
+    @property
+    def context_mode(self) -> ContextMode:
+        return self.budget.mode if self.budget is not None else ContextMode.STANDARD
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,12 +195,18 @@ class TranslationBatchPlan:
 
     取代散落的 ``(start, end)`` tuple，便于在性能日志中记录批次大小和
     token 估算。
+
+    超长上下文翻译（LONG）下 ``max_batch_lines`` 不生效，批次只受预算约束；
+    此时 ``output_budget_tokens`` 是公共规划器算出的输出预留，用于在发送前
+    判定"输出能否容纳本批"。普通模式沿用旧的固定预留语义。
     """
 
     batch_id: int
     start: int
     end: int
     estimated_input_tokens: int
+    #: 该批允许的输出 token 额度；``None`` 表示按旧的固定预留处理。
+    output_budget_tokens: int | None = None
 
 
 def _clean_stream_line(line: str) -> str:
@@ -192,6 +253,12 @@ class TranslatorEngine:
         self.pause_event = threading.Event()
         self.pause_event.set()  # 默认不暂停
 
+        # 配置变更不得拔掉在途请求的 HTTP 客户端。运行期间收到的
+        # refresh_api() 只置位，等本次运行结束再真正换实例。
+        self._run_lock = threading.Lock()
+        self._run_active = False
+        self._api_refresh_pending = False
+
         # 延迟初始化API与正则（按需构建）
         self._re_many_newlines = None
         # 不在构造时初始化 API，首次使用时再构建
@@ -200,11 +267,17 @@ class TranslatorEngine:
         """初始化API客户端。
 
         BUG-005：覆盖旧实例前先关闭，避免连接和心跳线程累积。
+        旧实例走 ``retire()`` 而非 ``close()``：仍在运行的批次线程持有它，
+        必须让它们立刻失败，而不是重建连接跑完一个 UI 已丢弃的运行。
         """
-        # 先关闭旧实例（如果有）
+        # 先退役旧实例（如果有）
         if self.api is not None:
             try:
-                self.api.close()
+                retire = getattr(self.api, "retire", None)
+                if callable(retire):
+                    retire()
+                else:
+                    self.api.close()
             except Exception as e:
                 logger.warning("关闭旧API实例失败: %s", e)
             self.api = None
@@ -232,12 +305,16 @@ class TranslatorEngine:
         if self.api is None:
             self._init_api()
 
-    def build_run_context(self) -> TranslationRunContext:
+    def build_run_context(
+        self, *, budget: ResolvedContextBudget | None = None
+    ) -> TranslationRunContext:
         """PERF §9.5 + 队列并发优化阶段 2：构造不可变运行上下文。
 
         供 ``QueueTranslationCoordinator`` 在每次任务尝试开始时调用一次，
         复用给该任务的所有 ``BatchJob``，避免逐批重复读取配置和构造提示词。
         必须在 ``_ensure_api`` 之后调用。
+
+        ``budget`` 是本次运行解析好的上下文预算快照；普通模式传 ``None``。
         """
         app_config = self.config_manager.get_app_config()
         api_config = self.config_manager.get_api_config()
@@ -268,22 +345,103 @@ class TranslatorEngine:
             prompt_version=run_prompt_version,
             prompt_schema_version=prompt_schema_version,
             glossary_version=run_glossary_version,
+            budget=budget,
+        )
+
+    def _provider_input_budget_hint(self, configured: int) -> int | None:
+        """读取 provider 的输入预算建议（限流压力下的动态建议）。
+
+        返回 ``None`` 表示 provider 没有给出建议。该值只作为**本次规划**的
+        额外输入上限，绝不覆盖用户保存的预算。
+        """
+        budget_recommendation = getattr(self.api, "recommended_input_budget", None)
+        if not callable(budget_recommendation):
+            return None
+        hinted = _as_int(budget_recommendation(configured), default=configured, minimum=0)
+        if hinted <= 0 or hinted >= configured:
+            return None
+        return hinted
+
+    def resolve_run_budget(
+        self,
+        context_policy: TranslationContextPolicy,
+        *,
+        configured_input_budget: int | None = None,
+        max_batch_lines: int | None = None,
+        provider_input_budget_hint: bool = True,
+    ) -> ResolvedContextBudget:
+        """解析本次运行的有效预算。
+
+        普通模式与超长模式共用同一个入口，调用方（主界面、队列、预检）不得
+        自行实现第二套公式。必须在 ``_ensure_api`` 之后调用。
+
+        Args:
+            context_policy: 本次运行的上下文策略。
+            configured_input_budget: 普通模式的配置输入预算；``None`` 时按默认值。
+            max_batch_lines: 普通模式仍然生效的行数上限（超长模式忽略本参数）。
+            provider_input_budget_hint: 是否把 provider 的动态预算建议作为本次
+                规划的额外输入上限。预检/预览可传 ``False`` 以展示稳定的配置值。
+
+        Raises:
+            ValueError: 超长模式下预算无法解析（如设置预算小于安全余量）。
+        """
+        from ..application.context_budget import (
+            resolve_context_budget,
+            resolve_model_context_tokens,
+            resolve_model_max_output_tokens,
+        )
+
+        api_config = self.config_manager.get_api_config()
+        model_context = resolve_model_context_tokens(api_config)
+        if context_policy.mode is ContextMode.STANDARD:
+            configured = (
+                configured_input_budget
+                if configured_input_budget is not None
+                else self.compute_input_token_budget(DEFAULT_TRANSLATION_INPUT_TOKENS)
+            )
+            recommendation = (
+                self._provider_input_budget_hint(configured) if provider_input_budget_hint else None
+            )
+            return resolve_context_budget(
+                context_policy,
+                model_context_tokens=model_context,
+                configured_input_budget=configured,
+                max_batch_lines=max_batch_lines,
+                provider_recommended_input_budget=recommendation,
+            )
+        return resolve_context_budget(
+            context_policy,
+            model_context_tokens=model_context,
+            model_max_output_tokens=resolve_model_max_output_tokens(api_config),
         )
 
     def compute_input_token_budget(self, configured_budget: int) -> int:
-        """计算上下文安全的输入 token 预算（队列并发优化阶段 2）。
+        """计算普通模式的输入 token 预算（队列并发优化阶段 2）。
 
         供 ``BatchPlanner`` 使用：受模型 context window、output reserve 和
         API 实例的 ``recommended_input_budget`` 共同约束。
+
+        超长上下文翻译**不**使用本方法（它的输入额度由
+        :meth:`resolve_run_budget` 按用户总预算解析），以免旧的
+        ``max(512, ...)`` 下限暗中恢复小批次限制。
         """
         api_config = self.config_manager.get_api_config()
         configured = max(512, int(configured_budget))
-        budget_recommendation = getattr(self.api, "recommended_input_budget", None)
-        if callable(budget_recommendation):
-            configured = _as_int(budget_recommendation(configured), default=configured, minimum=512)
+        recommendation = self._provider_input_budget_hint(configured)
+        if recommendation is not None:
+            configured = recommendation
         context_window = max(4096, int(api_config.get("context_window_tokens", 32768)))
         context_safe_budget = max(512, context_window - DEFAULT_OUTPUT_TOKEN_RESERVE - 1024)
         return min(configured, context_safe_budget)
+
+    def _provider_tpm_limit(self) -> int:
+        """读取当前 provider 的 TPM 限额（0 表示不限流）。"""
+        if self._limiter_registry is None:
+            return 0
+        from ..config.translation_profile import build_queue_policy_from_app_config
+
+        policy = build_queue_policy_from_app_config(self.config_manager.get_app_config())
+        return max(0, int(policy.tpm_limit))
 
     def _get_shared_limiter(self, api_config: dict) -> ProviderLimiter | None:
         """获取应用级 ProviderLimiter；未注入注册表时保持原有独立行为。"""
@@ -310,8 +468,36 @@ class TranslatorEngine:
         """刷新API配置。
 
         BUG-005：先关闭旧实例，再创建新实例（_init_api 已内置关闭逻辑）。
+
+        翻译进行中不立即应用：``_init_api`` 会退役批次线程正在读取的 HTTP
+        客户端，在途的流会全部以 ``WinError 10038`` 断掉，而 UI 只看到进度条
+        永久静止。此时只置位，等 ``_translate`` 结束再应用。
         """
+        with self._run_lock:
+            if self._run_active:
+                self._api_refresh_pending = True
+                logger.info("翻译进行中，API 配置变更将在本次运行结束后生效")
+                return
+            self._api_refresh_pending = False
         self._init_api()
+
+    def _begin_run(self) -> None:
+        """标记运行开始，让期间的 ``refresh_api`` 推迟到运行结束。"""
+        with self._run_lock:
+            self._run_active = True
+
+    def _end_run(self) -> None:
+        """解除运行标记并应用运行期间挂起的配置变更。
+
+        必须在 ``_translate`` 的 ``finally`` 中调用：失败路径若不解除，
+        后续所有 ``refresh_api`` 都会被永久推迟。
+        """
+        with self._run_lock:
+            self._run_active = False
+            pending = self._api_refresh_pending
+            self._api_refresh_pending = False
+        if pending:
+            self._init_api()
 
     def get_usage_snapshot(self) -> dict[str, int | float]:
         """Return cumulative provider counters without request text or credentials."""
@@ -343,6 +529,31 @@ class TranslatorEngine:
         服务端限流退避仍由 HTTP 层 429 重试统一负责。
         """
         self._translate(content, progress_callback, complete_callback)
+
+    def translate_long_context_mode(
+        self,
+        content: str,
+        progress_callback: Callable,
+        complete_callback: Callable,
+        *,
+        wallet: TranslationContextPolicy | None = None,
+    ):
+        """超长上下文翻译入口（普通模式之外的**显式**运行选项）。
+
+        只做两件事：把任务级策略快照传给统一的 ``_translate``，其余分批、执行、
+        流式解析、行映射、保存和导出全部复用现有管道。不得在此复制
+        ``_translate_run`` / ``_translate_batch``。
+
+        小模型模式的互斥校验在 ``_translate_run`` 里统一执行，因此本入口和
+        队列路径得到同一条明确错误。
+        """
+        policy = wallet or TranslationContextPolicy(ContextMode.LONG)
+        self._translate(
+            content,
+            progress_callback,
+            complete_callback,
+            context_policy=policy,
+        )
 
     def translate_bulk_mode(
         self,
@@ -402,6 +613,7 @@ class TranslatorEngine:
         input_token_budget_override: int | None = None,
         concurrency_override: int | None = None,
         emit_stream_progress: bool = True,
+        context_policy: TranslationContextPolicy | None = None,
     ):
         """统一翻译流程：分批翻译 + 流式输出
 
@@ -418,12 +630,48 @@ class TranslatorEngine:
         """
         self.reset()
         self._ensure_api()
+        self._begin_run()
+        try:
+            self._translate_run(
+                content,
+                progress_callback,
+                complete_callback,
+                batch_lines_override=batch_lines_override,
+                input_token_budget_override=input_token_budget_override,
+                concurrency_override=concurrency_override,
+                emit_stream_progress=emit_stream_progress,
+                context_policy=context_policy,
+            )
+        finally:
+            self._end_run()
 
+    def _translate_run(
+        self,
+        content: str,
+        progress_callback: Callable,
+        complete_callback: Callable,
+        *,
+        batch_lines_override: int | None = None,
+        input_token_budget_override: int | None = None,
+        concurrency_override: int | None = None,
+        emit_stream_progress: bool = True,
+        context_policy: TranslationContextPolicy | None = None,
+    ):
+        """``_translate`` 的实现主体。运行标记由 ``_translate`` 负责。"""
         lines = content.split("\n")
         total_lines = len(lines)
         app_config = self.config_manager.get_app_config()
         api_config = self.config_manager.get_api_config()
         small_model_mode = bool(app_config.get(SMALL_MODEL_MODE_CONFIG_KEY, False))
+        context_policy = context_policy or TranslationContextPolicy()
+        if context_policy.mode is ContextMode.LONG and small_model_mode:
+            # 小模型模式强制逐行，与超长批次语义互斥。程序调用入口返回明确
+            # 配置错误，不静默覆盖任一方设置（实现指南 §3.2）。
+            raise TranslationRequestError(
+                _SMALL_MODEL_LONG_CONTEXT_CONFLICT_MESSAGE,
+                failed_indices=list(range(total_lines)),
+                status_code=None,
+            )
         if batch_lines_override is None:
             batch_lines = min(
                 MAX_STABLE_TRANSLATION_BATCH_LINES,
@@ -443,16 +691,33 @@ class TranslatorEngine:
             )
         else:
             configured_input_budget = max(512, int(input_token_budget_override))
-        budget_recommendation = getattr(self.api, "recommended_input_budget", None)
-        if callable(budget_recommendation):
-            configured_input_budget = _as_int(
-                budget_recommendation(configured_input_budget),
-                default=configured_input_budget,
-                minimum=512,
+
+        # 预算解析集中在 resolve_run_budget（普通与超长共用），批次规划集中在
+        # application.batch_planner。两者都只读本次运行的不可变快照。
+        # 预算无法解析（如超长模式预算低于安全余量）必须变成可操作错误，
+        # 而不是让 ValueError 逃逸到工作线程。
+        try:
+            resolved_budget = self.resolve_run_budget(
+                context_policy,
+                configured_input_budget=configured_input_budget,
+                max_batch_lines=batch_lines,
             )
-        context_window = max(4096, int(api_config.get("context_window_tokens", 32768)))
-        context_safe_budget = max(512, context_window - DEFAULT_OUTPUT_TOKEN_RESERVE - 1024)
-        input_token_budget = min(configured_input_budget, context_safe_budget)
+        except ValueError as exc:
+            logger.error("上下文预算无法解析: %s", exc)
+            complete_callback(
+                BatchTranslationResult(
+                    status=TranslationStatus.FAILED,
+                    lines=[""] * total_lines,
+                    failed_indices=list(range(total_lines)),
+                    error_message=str(exc),
+                )
+            )
+            return
+        # 超长模式不受旧的行数/token 上限约束：预算只来自用户设置、模型容量与
+        # 输出预留。``max_batch_lines`` 为 ``None`` 表示"应用不设上限"。
+        if resolved_budget.mode is ContextMode.LONG:
+            batch_lines = resolved_budget.max_batch_lines
+        input_token_budget = resolved_budget.batch_budget_tokens
         if small_model_mode:
             from ..config.translation_profile import build_queue_policy_from_app_config
 
@@ -473,10 +738,21 @@ class TranslatorEngine:
         else:
             concurrency = max(1, min(8, int(concurrency_override)))
 
+        # 逐行模式在打包后的 Windows exe 上不能走 HTTP/2：连续开关大量极短
+        # 的流会让 h2 以 ConnectionTerminated / WinError 10038 掉掉整条连接，
+        # 表现为翻译中途长时间停顿。让 provider 自己决定如何降级。
+        serial_transport = small_model_mode
+        configure_serial = getattr(self.api, "configure_serial_transport", None)
+        if callable(configure_serial):
+            try:
+                configure_serial(serial_transport)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("切换 HTTP 传输协议失败: %s", exc)
+
         # PERF §9.5：一次构造不可变运行上下文。
         # 后续所有批次复用同一份配置/提示词，避免逐批重复读取和构造。
         target_language = app_config.get("target_language", "中文")
-        run_context = self.build_run_context()
+        run_context = self.build_run_context(budget=resolved_budget)
         if target_language != run_context.target_language:
             logger.debug(
                 "translation settings changed while starting a run; using the latest snapshot"
@@ -487,7 +763,49 @@ class TranslatorEngine:
         # 还必须通过应用级 Limiter，因此两条路径的在途总数不会相加失控。
         shared_limiter = self._get_shared_limiter(api_config)
 
-        batch_ranges = self._build_batch_ranges(lines, batch_lines, input_token_budget)
+        try:
+            batch_ranges = self._build_batch_ranges(
+                lines,
+                batch_lines,
+                input_token_budget,
+                resolved_budget=resolved_budget,
+                run_context=run_context,
+            )
+        except BatchPlanningError as exc:
+            # 预算不足必须是可操作错误，而不是空批次或无限循环。
+            logger.error("批次规划失败: %s", exc)
+            complete_callback(
+                BatchTranslationResult(
+                    status=TranslationStatus.FAILED,
+                    lines=[""] * total_lines,
+                    failed_indices=list(range(total_lines)),
+                    error_message=str(exc),
+                )
+            )
+            return
+
+        # 发送前检查不可满足的 TPM 请求：单个请求的输入估算若超过非零 TPM
+        # 上限，它永远等不到许可。此处直接报错并提示调整，不永久挂起。
+        tpm_limit = self._provider_tpm_limit()
+        if tpm_limit > 0:
+            oversized = [
+                plan
+                for plan in batch_ranges
+                if is_unsatisfiable_for_provider(
+                    estimated_input_tokens=plan.estimated_input_tokens, tpm_limit=tpm_limit
+                )
+            ]
+            if oversized:
+                plan = oversized[0]
+                complete_callback(
+                    BatchTranslationResult(
+                        status=TranslationStatus.FAILED,
+                        lines=[""] * total_lines,
+                        failed_indices=list(range(plan.start, plan.end)),
+                        error_message=_unsatisfiable_tpm_message(plan, tpm_limit),
+                    )
+                )
+                return
         limiter_consumer_id: str | None = None
         if shared_limiter is not None:
             limiter_consumer_id = f"main:{uuid.uuid4().hex}"
@@ -530,6 +848,9 @@ class TranslatorEngine:
         failed_indices: List[int] = []
         last_error: str | None = None
         any_success = False
+        # 截断是运行级的结构性信息：任一批被截断即意味着整批输出不可信。
+        output_truncated = False
+        truncation_reason: str | None = None
 
         progress_lock = threading.Lock()
         # PERF §9.6：以 TranslationBatchPlan.start 作为批次键（保持与原 tuple
@@ -715,6 +1036,11 @@ class TranslatorEngine:
                         any_success = True
                     if batch_result.error_message:
                         last_error = batch_result.error_message
+                    # 任一批次被 provider 明确截断时，本次运行必须把该结构性
+                    # 信息带到顶层结果，调用方才能区分"HTTP 成功"与"输出完整"。
+                    if batch_result.output_truncated:
+                        output_truncated = True
+                        truncation_reason = batch_result.finish_reason or truncation_reason
 
                     with progress_lock:
                         previous_completed = completed_by_batch.get(batch_start, 0)
@@ -778,55 +1104,74 @@ class TranslatorEngine:
         else:
             status = TranslationStatus.FAILED
 
+        if output_truncated and last_error is None:
+            last_error = _truncated_result_message(truncation_reason)
+
         result = BatchTranslationResult(
             status=status,
             lines=all_translated_lines,
             failed_indices=failed_indices,
             error_message=last_error,
+            output_truncated=output_truncated,
+            finish_reason=truncation_reason,
         )
         complete_callback(result)
 
+    def _resolve_protocol_text(self, run_context: TranslationRunContext | None) -> str:
+        """返回该运行每批都要发送的固定协议文本。
+
+        Hunyuan-MT 分支不使用 system 提示词，协议只有 ``将以下文本翻译为X：``
+        这一行；其余模型使用 system prompt。
+        """
+        if run_context is not None:
+            if run_context.is_hunyuan:
+                return ""
+            return run_context.system_prompt or ""
+        app_config = self.config_manager.get_app_config()
+        target_language = app_config.get("target_language", "中文")
+        if self._is_hunyuan_mt():
+            return ""
+        base_prompt = app_config.get("translation_prompt", "")
+        glossary_prompt = self.config_manager.get_glossary_prompt()
+        return self._translation_system_prompt(target_language, base_prompt, glossary_prompt)
+
     def _build_batch_ranges(
-        self, lines: List[str], max_lines: int, input_token_budget: int
+        self,
+        lines: List[str],
+        max_lines: int | None,
+        input_token_budget: int,
+        *,
+        resolved_budget: ResolvedContextBudget,
+        run_context: TranslationRunContext | None = None,
     ) -> List[TranslationBatchPlan]:
         """PERF §9.6：构造批次计划只读对象列表，取代散落的 ``(start, end)`` tuple。
 
-        便于在性能日志中记录批次大小和 token 估算，并避免调用方解包 tuple
-        时出错。每个 ``TranslationBatchPlan`` 携带 ``batch_id``（按序递增）、
-        ``start`` / ``end``（行区间，左闭右开）和 ``estimated_input_tokens``
-        （该批 token 估算，含协议开销）。
+        计划算法来自 ``application.batch_planner``——主界面、队列和引擎共用
+        同一份 token 分批逻辑，避免复制第二套提示词开销算法。
+
+        ``max_lines`` 为 ``None`` 表示应用不设行数上限（超长模式的
+        ``ResolvedContextBudget.max_batch_lines``）。
+
+        Raises:
+            BatchPlanningError: 超长模式下单行（或协议开销本身）无法满足预算。
         """
-        app_config = self.config_manager.get_app_config()
-        target_language = app_config.get("target_language", "中文")
-        base_prompt = app_config.get("translation_prompt", "")
-        glossary_prompt = self.config_manager.get_glossary_prompt()
-        protocol = self._translation_system_prompt(target_language, base_prompt, glossary_prompt)
-        fixed_tokens = estimate_tokens(protocol)
-        plans: List[TranslationBatchPlan] = []
-        start = 0
-        batch_id = 0
-        while start < len(lines):
-            end = start
-            used_tokens = fixed_tokens
-            while end < len(lines) and end - start < max_lines:
-                marker = f"[LINE_{end - start + 1:03d}]"
-                line_tokens = estimate_tokens(marker + lines[end] + "\n")
-                if end > start and used_tokens + line_tokens > input_token_budget:
-                    break
-                used_tokens += line_tokens
-                end += 1
-            batch_end = max(start + 1, end)
-            plans.append(
-                TranslationBatchPlan(
-                    batch_id=batch_id,
-                    start=start,
-                    end=batch_end,
-                    estimated_input_tokens=used_tokens,
-                )
+        protocol = compute_protocol_overhead(self._resolve_protocol_text(run_context))
+        planned = plan_batches(
+            lines,
+            range(len(lines)),
+            budget=resolved_budget,
+            protocol=protocol,
+        )
+        return [
+            TranslationBatchPlan(
+                batch_id=batch.batch_id,
+                start=batch.source_indices[0],
+                end=batch.source_indices[-1] + 1,
+                estimated_input_tokens=batch.estimated_input_tokens,
+                output_budget_tokens=batch.output_budget_tokens,
             )
-            batch_id += 1
-            start = batch_end
-        return plans
+            for batch in planned
+        ]
 
     @staticmethod
     def _translation_system_prompt(
@@ -838,6 +1183,26 @@ class TranslatorEngine:
             "逐行对应输出，除译文外不要添加说明。"
         )
         return "\n\n".join(parts)
+
+    def _last_finish_reason(self) -> str | None:
+        """读取**本线程**上次流式请求的结束原因。
+
+        按线程保存（见 ``BaseAPI.last_finish_reason``）：同一 API 实例被多个
+        批次线程并发使用，共享一个 ``last_finish_reason`` 会让并发请求互相
+        读取对方的状态。不支持该接口的 provider 返回 ``None``（能力未知时
+        明确是估算，不编造截断信号）。
+        """
+        if self.api is None:
+            return None
+        getter = getattr(self.api, "last_finish_reason", None)
+        if not callable(getter):
+            return None
+        try:
+            reason = getter()
+        except Exception as exc:  # noqa: BLE001 - 诊断信息不应中断翻译
+            logger.debug("读取 finish_reason 失败: %s", exc)
+            return None
+        return reason if isinstance(reason, str) and reason else None
 
     def _is_hunyuan_mt(self) -> bool:
         """判断当前模型是否为混元翻译模型"""
@@ -1169,19 +1534,37 @@ class TranslatorEngine:
                     if src.strip() and not tgt.strip():
                         batch_failed.append(i)
 
+                # 截断是**结构化**信息，不能仅凭 HTTP 成功宣告整批成功。
+                # provider 返回 ``finish_reason=length`` 时输出必然不完整，
+                # 缺失的行保持失败并进入现有补漏流程，而不是被补齐成假成功。
+                finish_reason = self._last_finish_reason()
+                truncated = finish_reason == "length"
+
+                if truncated and not batch_failed:
+                    # 解析结果看似完整但被明确截断：整批不可信，全部重试/补漏。
+                    batch_failed = list(range(expected_lines))
+
                 if batch_failed:
-                    # 存在缺失译文：返回 PARTIAL
+                    error_message = (
+                        _truncated_result_message(finish_reason)
+                        if truncated
+                        else f"批次内 {len(batch_failed)} 行译文缺失"
+                    )
+                    # 存在缺失译文：返回 PARTIAL，不写入成功缓存。
                     return BatchTranslationResult(
                         status=TranslationStatus.PARTIAL,
                         lines=translated_lines,
                         failed_indices=batch_failed,
-                        error_message=f"批次内 {len(batch_failed)} 行译文缺失",
+                        error_message=error_message,
+                        output_truncated=truncated,
+                        finish_reason=finish_reason,
                     )
 
                 # 全部必需行都有译文：返回 SUCCEEDED
                 return BatchTranslationResult(
                     status=TranslationStatus.SUCCEEDED,
                     lines=translated_lines,
+                    finish_reason=finish_reason,
                 )
 
             except TranslationRequestError as exc:

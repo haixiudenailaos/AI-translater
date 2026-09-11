@@ -5,6 +5,7 @@
 """
 
 import threading
+import time
 import tkinter as tk
 import uuid
 from collections import deque
@@ -24,7 +25,9 @@ from ..application.translation_events import (
     TranslationEventKind,
     TranslationProgressEvent,
 )
+from ..config.translation_profile import SMALL_MODEL_MODE_CONFIG_KEY
 from ..core.translation_result import BatchTranslationResult, TranslationStatus
+from ..domain.translation_policy import ContextMode, TranslationContextPolicy
 from ..utils.logger import get_logger
 from .export_helpers import (
     build_default_epub_filename,
@@ -42,6 +45,20 @@ MAX_MISSING_CHECK_ROUNDS = 2
 
 # PERF：事件泵默认刷新间隔（20 次/秒，满足"不超过 25 次/秒"的验收标准）
 DEFAULT_EVENT_PUMP_INTERVAL_MS = 50
+
+# 长请求存活提示：DeepSeek 等模型常在首 token 前静默十余秒。状态栏在这段
+# 时间不变，用户无法区分"正在等模型"和"程序卡死"。超过此阈值后显示已等待
+# 秒数；收到流式数据后计时归零。
+_LIVENESS_TICK_MS = 1000
+_LIVENESS_SILENCE_SECONDS = 8
+
+# 小模型模式强制逐行，与超长批次语义互斥（实现指南 §3.2）。UI 与服务边界
+# 使用同一条消息，避免两处给出不同解释。
+_SMALL_MODEL_LONG_CONTEXT_CONFLICT_MESSAGE = (
+    "小模型模式与超长上下文翻译不能同时使用：小模型模式强制逐行翻译，"
+    "与超长批次语义冲突。请先关闭小模型模式（设置 → 翻译设置），"
+    "或改用普通翻译。"
+)
 
 
 class TranslationController:
@@ -84,6 +101,7 @@ class TranslationController:
         on_retranslated: Callable[[set[int]], None] | None = None,
         mode_toggle=None,
         backup_dir: Path | str | None = None,
+        long_context_btn=None,
     ):
         self.root = root
         self.config_manager = config_manager
@@ -99,6 +117,7 @@ class TranslationController:
         self.start_btn = start_btn
         self.translate_btn = translate_btn
         self.retranslate_btn = retranslate_btn
+        self.long_context_btn = long_context_btn
         self.mode_toggle = mode_toggle
         self.continue_btn = continue_btn
         self.stop_btn = stop_btn
@@ -174,10 +193,22 @@ class TranslationController:
         self._export_job: ExportJob | TextExportJob | None = None
         self._export_poll_after_id: str | None = None
         self._export_kind: str | None = None
+        # 每个 run_id 冻结的上下文策略（None = 普通模式）。工作线程按 run_id
+        # 取用后立即移除；三个 worker 因此可以共用同一 (content, run_id) 签名。
+        self._run_context_policies: dict[str, TranslationContextPolicy | None] = {}
         self._export_success_callback: Callable[[], None] | None = None
+        # 长请求存活提示：记录最近一次流式活动时间和 after 回调。
+        self._last_stream_activity_at: float | None = None
+        self._liveness_after_id: str | None = None
+        self._liveness_base_message: str = ""
 
     def _set_control_states(self, translate_state, continue_state, stop_state) -> None:
-        """Keep all text-translation actions synchronized."""
+        """Keep all text-translation actions synchronized.
+
+        超长上下文按钮与翻译按钮同步禁用/启用：运行期间两者都不能启动重叠运行。
+        小模型模式下超长按钮保持禁用（互斥），由 ``refresh_action_state`` 在
+        启用路径上再次校验。
+        """
         seen: set[int] = set()
         for button in (
             getattr(self, "start_btn", None),
@@ -187,6 +218,12 @@ class TranslationController:
             if button is not None and id(button) not in seen:
                 button.config(state=translate_state)
                 seen.add(id(button))
+        long_btn = getattr(self, "long_context_btn", None)
+        if long_btn is not None:
+            long_state = translate_state
+            if translate_state != tk.DISABLED and self._small_model_mode_enabled():
+                long_state = tk.DISABLED
+            long_btn.config(state=long_state)
         self.continue_btn.config(state=continue_state)
         self.stop_btn.config(state=stop_state)
         mode_toggle = getattr(self, "mode_toggle", None)
@@ -211,6 +248,7 @@ class TranslationController:
             except (tk.TclError, ValueError):
                 pass
             self._export_poll_after_id = None
+        self._stop_liveness_ticker()
         self._event_pump.close()
 
     def invalidate_session(self):
@@ -227,6 +265,7 @@ class TranslationController:
             self._current_run_id = None
             self._current_mode = None
         self._streaming_preview_rows.clear()
+        self._stop_liveness_ticker()
 
     def cancel_for_session_replacement(self) -> bool:
         """Cancel the active run and make the controller immediately reusable.
@@ -255,6 +294,7 @@ class TranslationController:
         self._missing_translation_indices = []
         self._selected_translation_data = []
         self._revert_streaming_preview()
+        self._stop_liveness_ticker()
         self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         self.status_updater("已停止当前翻译，正在切换文档")
         self.schedule_save(delay_ms=0)
@@ -273,8 +313,13 @@ class TranslationController:
         self._current_mode = mode
         return run_id
 
-    def start_translation(self):
-        """开始翻译（完全重构：分批翻译机制）"""
+    def start_translation(self, *, context_policy: TranslationContextPolicy | None = None):
+        """开始翻译（完全重构：分批翻译机制）
+
+        ``context_policy`` 是本次运行的显式上下文模式。``None`` 表示普通模式，
+        保持既有默认策略；传入 LONG 策略即超长上下文翻译。策略作为不可变快照
+        传到工作线程，不通过临时修改全局配置再恢复来实现。
+        """
         if not self._can_start_translation():
             return
         # UXF-001：默认只处理缺失译文，绝不静默清空已有译文。
@@ -288,7 +333,8 @@ class TranslationController:
             messagebox.showwarning("配置警告", "请先配置API设置")
             self.open_settings()
             return
-        if not self._confirm_preflight("full"):
+        action = "long_context" if (context_policy and context_policy.is_long) else "full"
+        if not self._confirm_preflight(action):
             return
 
         # 更新界面状态
@@ -314,15 +360,68 @@ class TranslationController:
         # P0-4：在主线程生成 run_id 并通过参数传入工作线程，
         # 避免工作线程在回调时读取可变的 self._current_run_id。
         run_id = self._new_run_id("full")
-        self.status_updater("正在翻译...")
+        mode_label = "超长上下文翻译" if action == "long_context" else "翻译"
+        self._start_liveness_ticker(f"正在{mode_label}...")
 
         # 在新线程中执行翻译
         source_content = "\n".join(source_lines[index] for index in pending_indices)
+        self._run_context_policies[run_id] = context_policy
         translation_thread = threading.Thread(
-            target=self._translate_worker, args=(source_content, run_id)
+            target=self._translate_worker,
+            args=(source_content, run_id),
         )
         translation_thread.daemon = True
         translation_thread.start()
+
+    def start_long_context_translation(self) -> None:
+        """主界面“超长上下文翻译”入口：翻译当前文档全部未完成行。
+
+        复用同一 controller 与同一运行锁，因此重复点击不会启动重叠运行；
+        过滤后的表格不是真相源（``get_table_data`` 读文档模型）。
+        小模型模式在此处预检拦截，程序调用入口也有明确配置错误。
+        """
+        if not self._can_start_translation():
+            return
+        policy = self._resolve_long_context_policy()
+        if policy is None:
+            return
+        self.start_translation(context_policy=policy)
+
+    def _resolve_long_context_policy(self) -> TranslationContextPolicy | None:
+        """读取用户预算并构造超长模式策略；失败时提示并返回 ``None``。"""
+        if self._small_model_mode_enabled():
+            messagebox.showwarning(
+                "超长上下文翻译不可用",
+                _SMALL_MODEL_LONG_CONTEXT_CONFLICT_MESSAGE,
+                parent=self.root,
+            )
+            self.status_updater("超长上下文翻译需要先关闭小模型模式")
+            return None
+        try:
+            tokens = self.config_manager.get_long_context_window_tokens()
+        except Exception as exc:  # noqa: BLE001 - 配置异常需可见而非静默
+            logger.exception("读取超长上下文预算失败")
+            messagebox.showerror("配置错误", f"无法读取超长上下文设置：{exc}", parent=self.root)
+            return None
+        return TranslationContextPolicy(ContextMode.LONG, tokens)
+
+    def _small_model_mode_enabled(self) -> bool:
+        try:
+            app_config = self.config_manager.get_app_config()
+        except Exception:  # noqa: BLE001 - 读不到配置时不阻断普通翻译
+            return False
+        return bool(app_config.get(SMALL_MODEL_MODE_CONFIG_KEY, False))
+
+    def _take_run_context_policy(self, run_id: str) -> TranslationContextPolicy | None:
+        """取出并移除该 run 冻结的上下文策略（工作线程第一个动作）。
+
+        ``getattr`` 回退让 ``__new__`` 构造的最小测试替身也能调用本方法。
+        """
+        with self._results_lock:
+            policies = getattr(self, "_run_context_policies", None)
+            if policies is None:
+                return None
+            return policies.pop(run_id, None)
 
     def retranslate_all(self):
         """Retranslate every non-empty source row after explicit confirmation.
@@ -366,7 +465,7 @@ class TranslationController:
         self._continue_missing_indices = source_indices
 
         run_id = self._new_run_id("retranslate")
-        self.status_updater(f"正在重新翻译全部 {len(source_indices)} 行...")
+        self._start_liveness_ticker(f"正在重新翻译全部 {len(source_indices)} 行...")
         source_content = "\n".join(source_lines[index] for index in source_indices)
         translation_thread = threading.Thread(
             target=self._translate_worker, args=(source_content, run_id)
@@ -427,7 +526,7 @@ class TranslationController:
 
         # P0-4：在主线程生成 run_id 并通过参数传入工作线程
         run_id = self._new_run_id("full")
-        self.status_updater("正在继续翻译...")
+        self._start_liveness_ticker("正在继续翻译...")
 
         # 在新线程中执行翻译，只翻译缺失行
         translation_thread = threading.Thread(
@@ -458,6 +557,7 @@ class TranslationController:
 
             # 更新UI状态
             self._set_control_states(tk.DISABLED, tk.DISABLED, tk.DISABLED)
+            self._stop_liveness_ticker()
             self.status_updater("正在停止翻译，已完成内容会保留")
 
             # 重置进度条为当前实际进度
@@ -549,7 +649,7 @@ class TranslationController:
 
         # P0-4：在主线程生成 run_id 并通过参数传入工作线程
         run_id = self._new_run_id("selected")
-        self.status_updater("正在翻译选中行...")
+        self._start_liveness_ticker("正在翻译选中行...")
 
         # 在新线程中执行翻译
         translation_thread = threading.Thread(
@@ -564,13 +664,27 @@ class TranslationController:
         P0-4：``run_id`` 在主线程生成并通过参数传入，工作线程不再读取
         可变的 ``self._current_run_id``。旧任务停止后新任务启动时，
         旧线程的迟到事件仍携带旧 run_id，会被事件泵丢弃。
+
+        上下文策略通过 **run_id → 策略** 的映射按运行读取，而不是加一个
+        仅本 worker 才有的参数：三个 worker 必须共用 ``(content, run_id)``
+        同一回调模式（P0-3）。策略在主线程入队时冻结，之后设置改动不影响
+        在途运行。
         """
         try:
-            self.translator.translate_fast_mode(
-                content,
-                lambda progress, data: self._publish_progress_event(progress, data, run_id),
-                lambda result: self._publish_terminal_event(result, run_id),
-            )
+            context_policy = self._take_run_context_policy(run_id)
+            if context_policy is not None and context_policy.is_long:
+                self.translator.translate_long_context_mode(
+                    content,
+                    lambda progress, data: self._publish_progress_event(progress, data, run_id),
+                    lambda result: self._publish_terminal_event(result, run_id),
+                    wallet=context_policy,
+                )
+            else:
+                self.translator.translate_fast_mode(
+                    content,
+                    lambda progress, data: self._publish_progress_event(progress, data, run_id),
+                    lambda result: self._publish_terminal_event(result, run_id),
+                )
         except Exception as exc:
             # BUG-002：在离开 except 块前绑定消息，避免 NameError
             error_message = str(exc)
@@ -815,14 +929,19 @@ class TranslationController:
             return
 
         if event.kind is TranslationEventKind.STREAM:
+            self._note_stream_activity()
             self._dispatch_stream_event(event)
         elif event.kind is TranslationEventKind.BATCH_COMPLETED:
+            self._note_stream_activity()
             self._dispatch_batch_completed_event(event)
         elif event.kind is TranslationEventKind.RUN_COMPLETED:
+            self._stop_liveness_ticker()
             self._dispatch_terminal_event(event, is_terminal_run=True)
         elif event.kind is TranslationEventKind.RUN_FAILED:
+            self._stop_liveness_ticker()
             self._dispatch_terminal_event(event, is_terminal_run=False, is_failed=True)
         elif event.kind is TranslationEventKind.RUN_CANCELLED:
+            self._stop_liveness_ticker()
             self._dispatch_terminal_event(event, is_terminal_run=True, is_cancelled=True)
 
     def _apply_to_document(self, updates: dict[int, str]) -> dict[int, str]:
@@ -979,6 +1098,9 @@ class TranslationController:
             self._pending_errors = getattr(self, "_pending_errors", {})
             self._pending_results.pop(run_id, None)
             self._pending_errors.pop(run_id, None)
+            policies = getattr(self, "_run_context_policies", None)
+            if policies is not None:
+                policies.pop(run_id, None)
             retired_run_ids = getattr(self, "_retired_run_ids", None)
             if retired_run_ids is None:
                 retired_run_ids = deque(maxlen=64)
@@ -988,6 +1110,9 @@ class TranslationController:
         with lock:
             self._pending_results.pop(run_id, None)
             self._pending_errors.pop(run_id, None)
+            policies = getattr(self, "_run_context_policies", None)
+            if policies is not None:
+                policies.pop(run_id, None)
             retired_run_ids = getattr(self, "_retired_run_ids", None)
             if retired_run_ids is None:
                 retired_run_ids = deque(maxlen=64)
@@ -998,10 +1123,60 @@ class TranslationController:
         with self._results_lock:
             return run_id in getattr(self, "_retired_run_ids", ())
 
+    def _start_liveness_ticker(self, base_message: str) -> None:
+        """Start (or restart) the status-bar wait ticker for a new run."""
+        self._stop_liveness_ticker()
+        self._liveness_base_message = base_message
+        self._last_stream_activity_at = time.monotonic()
+        self.status_updater(base_message)
+        try:
+            self._liveness_after_id = self.root.after(_LIVENESS_TICK_MS, self._tick_liveness)
+        except (tk.TclError, AttributeError):
+            self._liveness_after_id = None
+
+    def _note_stream_activity(self) -> None:
+        """Reset the elapsed wait when a stream/batch event arrives."""
+        self._last_stream_activity_at = time.monotonic()
+
+    def _tick_liveness(self) -> None:
+        """Refresh the status bar with elapsed wait, or stop after the run ends."""
+        self._liveness_after_id = None
+        if not self.is_translating:
+            return
+        started = self._last_stream_activity_at
+        elapsed = int(time.monotonic() - started) if started is not None else 0
+        base = self._liveness_base_message or "正在翻译..."
+        if elapsed >= _LIVENESS_SILENCE_SECONDS:
+            self.status_updater(f"{base}（等待模型响应 {elapsed}s）")
+        else:
+            self.status_updater(base)
+        try:
+            self._liveness_after_id = self.root.after(_LIVENESS_TICK_MS, self._tick_liveness)
+        except (tk.TclError, AttributeError):
+            self._liveness_after_id = None
+
+    def _stop_liveness_ticker(self) -> None:
+        """Cancel the pending after callback. Idempotent.
+
+        Controllers constructed with ``__new__`` in tests may not have the
+        ticker attributes at all; treat that as already stopped.
+        """
+        token = getattr(self, "_liveness_after_id", None)
+        self._liveness_after_id = None
+        if token is None:
+            return
+        try:
+            self.root.after_cancel(token)
+        except (tk.TclError, ValueError, AttributeError):
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+
     def _handle_full_translation_complete(self, result: BatchTranslationResult):
         """全文翻译完成：在主线程更新 UI（原 ``_on_translation_complete.update_ui``）。"""
         is_retranslation = getattr(self, "_current_mode", None) == "retranslate"
         self.is_translating = False
+        self._stop_liveness_ticker()
         self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         # 复位续写标记
         self._continuing_mode = False
@@ -1069,6 +1244,7 @@ class TranslationController:
     def _handle_translation_failed(self, error_msg: str):
         """Restore the UI and present a safe, actionable error summary."""
         self.is_translating = False
+        self._stop_liveness_ticker()
         self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         # P0-2：worker 异常时回退未提交的流式预览
         self._revert_streaming_preview()
@@ -1193,6 +1369,7 @@ class TranslationController:
         """选中行翻译完成：在主线程更新 UI（原 ``_on_selected_translation_complete``）。"""
         # 恢复界面状态
         self.is_translating = False
+        self._stop_liveness_ticker()
         self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         # P0-2：回退未提交的流式预览到文档值
         self._revert_streaming_preview()
@@ -1303,6 +1480,9 @@ class TranslationController:
         # PERF：在主线程生成 run_id 并丢弃旧任务事件。
         # P0-3：捕获 run_id 并传入工作线程，避免回调签名不匹配而崩溃。
         run_id = self._new_run_id("missing")
+        self._start_liveness_ticker(
+            f"正在进行翻译查漏（第 {self._missing_check_rounds}/{MAX_MISSING_CHECK_ROUNDS} 次）"
+        )
 
         # 在新线程中执行翻译
         combined_source = "\n".join(empty_source_lines)
@@ -1435,6 +1615,7 @@ class TranslationController:
         ``root.after(0, ...)`` 包装（事件泵已在主线程调用）。
         """
         self.is_translating = False
+        self._stop_liveness_ticker()
         self._set_control_states(tk.NORMAL, tk.NORMAL, tk.DISABLED)
         # P0-2：回退未提交的流式预览到文档值
         self._revert_streaming_preview()

@@ -8,7 +8,12 @@ from typing import Iterable
 
 from ..domain.project import TranslationProject
 
-_LINE_MARKER_RE = re.compile(r"\[LINE_\d+\]")
+# 与 TranslatorEngine 的行号协议对齐：模型常把 ``[LINE_001]`` 改写成
+# ``[LINE-001]`` / ``[LINE 1]``，这些同样不得出现在终稿译文中。
+_LINE_MARKER_RE = re.compile(
+    r"[\[［【]\s*LINE\s*[_\-‐‑‒–—－:：.．\s]*\d+\s*[\]］】]",
+    re.IGNORECASE,
+)
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
 
 

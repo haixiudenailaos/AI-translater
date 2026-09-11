@@ -158,6 +158,42 @@ def test_cancel_does_not_close_client_created_by_the_next_run():
     api.close()
 
 
+def test_serial_translation_switches_transport_to_http1_and_restores_http2():
+    """逐行单并发不使用会在 Windows EXE 中异常终止的 HTTP/2 流。"""
+    api = _make_siliconflow()
+
+    class FakeClient:
+        is_closed = False
+
+        def close(self):
+            self.is_closed = True
+
+    original_client = api._current_client
+    built_protocols = []
+
+    def build_client():
+        built_protocols.append(api._http2_enabled)
+        return FakeClient()
+
+    api._build_client = build_client
+    try:
+        api.configure_serial_transport(True)
+
+        assert api._http2_enabled is False
+        assert built_protocols == [False]
+        assert original_client is not None and original_client.is_closed
+
+        # 幂等调用不应反复重建客户端。
+        api.configure_serial_transport(True)
+        assert built_protocols == [False]
+
+        api.configure_serial_transport(False)
+        assert api._http2_enabled is True
+        assert built_protocols == [False, True]
+    finally:
+        api.close()
+
+
 # ── 心跳与翻译并发 ────────────────────────────────────
 
 

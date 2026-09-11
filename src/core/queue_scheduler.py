@@ -30,16 +30,32 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from ..application.batch_planner import (
+    BatchPlanningError,
+    compute_protocol_overhead,
+)
+
 # P1-UX-3：所有异常先转换为 ActionableError，UI 展示安全文案与建议动作
+from ..application.batch_planner import (  # noqa: I001 - plan_batches 别名需与上方同源
+    plan_batches as plan_shared_batches,
+)
 from ..application.error_handling import (
     ActionableError,
     ErrorCategory,
     classify_error,
     log_classified_error,
 )
-from ..config.translation_profile import MAX_QUEUE_CUSTOM_CONCURRENCY
+from ..config.translation_profile import (
+    MAX_QUEUE_CUSTOM_CONCURRENCY,
+    SMALL_MODEL_MODE_CONFIG_KEY,
+)
 from ..domain.errors import TranslationCancelled, TranslationRequestError
 from ..domain.project import TranslationProject
+from ..domain.translation_policy import (
+    ContextMode,
+    ResolvedContextBudget,
+    TranslationContextPolicy,
+)
 
 # P1-UX-2：TXT 队列跨重启续传所需的指纹 / 项目仓库支持
 from ..infrastructure.project_repository import (
@@ -65,6 +81,44 @@ from .translator import TranslationRunContext, TranslatorEngine
 logger = get_logger(__name__)
 
 _QUEUE_CLOSE_TIMEOUT_SECONDS = 10.0
+
+# 小模型模式与超长上下文翻译互斥（实现指南 §3.2）。与
+# ``src/core/translator.py`` 的同名消息保持一致，避免两条入口给出不同解释。
+_SMALL_MODEL_LONG_CONTEXT_CONFLICT_MESSAGE = (
+    "小模型模式与超长上下文翻译不能同时使用：小模型模式强制逐行翻译，"
+    "与超长批次语义冲突。请先关闭小模型模式（设置 → 翻译设置），"
+    "或改用普通翻译。"
+)
+
+
+def _unsatisfiable_tpm_error(estimated_input_tokens: int, tpm_limit: int) -> str:
+    """单个请求的输入估算超过 TPM 上限时的可操作错误（§5.3）。"""
+    return (
+        f"本次请求估算输入约 {estimated_input_tokens:,} token，"
+        f"超过当前每分钟 token 限额（TPM）{tpm_limit:,}。"
+        "该请求永远无法取得发送许可。请调小“单次上下文大小”，"
+        "或在队列设置中提高 TPM 限额。"
+    )
+
+
+def _restored_context_policy(project: TranslationProject | None) -> TranslationContextPolicy:
+    """从持久化的项目快照恢复上下文策略。
+
+    旧项目缺字段、类型损坏或标记为超长却没有合法预算时，一律按普通模式读取
+    （``ModelSnapshot.from_dict`` 已完成该规范化），不猜预算也不阻止项目打开。
+    """
+    if project is None:
+        return TranslationContextPolicy()
+    snapshot = project.model_snapshot
+    if not snapshot.is_long_context:
+        return TranslationContextPolicy()
+    tokens = snapshot.context_window_tokens
+    assert tokens is not None  # is_long_context 已保证
+    try:
+        return TranslationContextPolicy(ContextMode.LONG, tokens)
+    except ValueError:
+        logger.warning("项目快照中的超长上下文预算无效（%r），按普通模式恢复", tokens)
+        return TranslationContextPolicy()
 
 
 # ── 数据结构（不可变） ─────────────────────────────────
@@ -160,6 +214,9 @@ class BatchJob:
     source_lines: Tuple[str, ...]
     estimated_input_tokens: int
     run_context: TranslationRunContext
+    #: 该批允许的输出 token 额度（超长模式的输出预留）；``None`` 表示普通模式
+    #: 沿用固定预留语义。截断判断与诊断记录使用。
+    output_budget_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +299,11 @@ class QueueTaskSnapshot:
     recommended_action: str | None = None
     correlation_id: str | None = None
     failed_count: int = 0
+    # 超长上下文翻译：任务详情展示"普通/超长"、配置预算与有效预算。
+    context_mode: str = ContextMode.STANDARD.value
+    requested_context_tokens: int | None = None
+    effective_context_tokens: int | None = None
+    budget_limited: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,63 +351,93 @@ def plan_batches(
     纯函数：不读取配置、不修改任务状态、不调用 Tk。
     只为 ``missing_indices`` 中的行生成 BatchJob，``source_indices`` 指向绝对位置。
 
-    - ``target_batch_input_tokens`` 是调度目标，``max_batch_input_tokens`` 是硬上限。
-    - ``max_batch_lines`` 防止极短行无限聚合。
+    分批算法来自 ``application.batch_planner``——主界面、队列和引擎共用同一份
+    token 分批逻辑，避免出现第二套提示词开销算法。
+
+    - ``policy.max_batch_lines`` 与 ``input_token_budget`` 共同约束批次大小。
     - 估算含 system prompt、术语表、行号标记协议开销。
+
+    Raises:
+        BatchPlanningError: 超长模式下单行无法满足预算（普通模式保持旧的
+            "至少推进一行" 行为）。
     """
     if not missing_indices:
         return []
 
-    # 协议固定开销（system prompt + 行号标记模板）
-    protocol = run_context.system_prompt or ""
-    fixed_tokens = estimate_tokens(protocol)
-
-    jobs: List[BatchJob] = []
-    batch_id = start_batch_id
-    idx_pos = 0
-    n = len(missing_indices)
-
-    while idx_pos < n:
-        end_pos = idx_pos
-        used_tokens = fixed_tokens
-        batch_indices: List[int] = []
-        batch_lines: List[str] = []
-
-        while end_pos < n and (end_pos - idx_pos) < policy.max_batch_lines:
-            abs_idx = missing_indices[end_pos]
-            src_line = source_lines[abs_idx] if abs_idx < len(source_lines) else ""
-            marker = f"[LINE_{end_pos - idx_pos + 1:03d}]"
-            line_tokens = estimate_tokens(marker + src_line + "\n")
-            if end_pos > idx_pos and used_tokens + line_tokens > input_token_budget:
-                break
-            used_tokens += line_tokens
-            batch_indices.append(abs_idx)
-            batch_lines.append(src_line)
-            end_pos += 1
-
-        if not batch_indices:
-            # 兜底：至少推进一行
-            abs_idx = missing_indices[idx_pos]
-            src_line = source_lines[abs_idx] if abs_idx < len(source_lines) else ""
-            batch_indices.append(abs_idx)
-            batch_lines.append(src_line)
-            end_pos = idx_pos + 1
-
-        jobs.append(
-            BatchJob(
-                task_id="",  # 由 Coordinator 填充
-                attempt_id="",  # 由 Coordinator 填充
-                batch_id=batch_id,
-                source_indices=tuple(batch_indices),
-                source_lines=tuple(batch_lines),
-                estimated_input_tokens=used_tokens,
-                run_context=run_context,
-            )
+    budget = ResolvedContextBudget(
+        mode=ContextMode.STANDARD,
+        requested_context_tokens=input_token_budget,
+        effective_context_tokens=input_token_budget,
+        safety_margin_tokens=0,
+        batch_budget_tokens=input_token_budget,
+        max_batch_lines=policy.max_batch_lines,
+    )
+    protocol = compute_protocol_overhead(run_context.system_prompt or "")
+    planned = plan_shared_batches(
+        source_lines,
+        missing_indices,
+        budget=budget,
+        protocol=protocol,
+        start_batch_id=start_batch_id,
+    )
+    return [
+        BatchJob(
+            task_id="",  # 由 Coordinator 填充
+            attempt_id="",  # 由 Coordinator 填充
+            batch_id=batch.batch_id,
+            source_indices=batch.source_indices,
+            source_lines=batch.source_lines,
+            estimated_input_tokens=batch.estimated_input_tokens,
+            run_context=run_context,
+            output_budget_tokens=batch.output_budget_tokens,
         )
-        batch_id += 1
-        idx_pos = end_pos
+        for batch in planned
+    ]
 
-    return jobs
+
+def plan_long_context_batches(
+    source_lines: List[str],
+    missing_indices: List[int],
+    *,
+    budget: ResolvedContextBudget,
+    run_context: TranslationRunContext,
+    start_batch_id: int = 0,
+) -> List[BatchJob]:
+    """超长上下文模式的任务批次规划（LC-04）。
+
+    与普通模式共用 ``application.batch_planner``，但**不读取** ``QueuePolicy``
+    的行数/输入 token 上限：超长模式取消的是应用固定的小批次限制，预算只来自
+    用户设置、模型容量与输出预留。
+
+    每个 BatchJob 带着同一个 ``run_context``（含预算快照），因此一个 attempt 的
+    所有批次复用同一份策略与同一个引擎/会话实例。
+
+    Raises:
+        BatchPlanningError: 单行或协议开销本身无法满足预算。
+    """
+    if not missing_indices:
+        return []
+    protocol = compute_protocol_overhead(run_context.system_prompt or "")
+    planned = plan_shared_batches(
+        source_lines,
+        missing_indices,
+        budget=budget,
+        protocol=protocol,
+        start_batch_id=start_batch_id,
+    )
+    return [
+        BatchJob(
+            task_id="",  # 由 Coordinator 填充
+            attempt_id="",  # 由 Coordinator 填充
+            batch_id=batch.batch_id,
+            source_indices=batch.source_indices,
+            source_lines=batch.source_lines,
+            estimated_input_tokens=batch.estimated_input_tokens,
+            run_context=run_context,
+            output_budget_tokens=batch.output_budget_tokens,
+        )
+        for batch in planned
+    ]
 
 
 # ── BatchWorker（执行 BatchJob，返回 BatchOutcome） ─────
@@ -593,6 +685,26 @@ class _TaskSlot:
     finalization_scheduled: bool = False
     finalization_complete: bool = False
     final_state_hint: QueueTaskState | None = None
+    # 超长上下文翻译：任务自己的不可变策略快照。attempt 继承它，直到用户显式
+    # 用另一个模式重新开始才替换。绝不通过修改全局 QueuePolicy 切换模式。
+    context_policy: TranslationContextPolicy = field(default_factory=TranslationContextPolicy)
+    # 用户预算设置与该 attempt 的实际生效预算（供任务详情展示）。
+    resolved_budget: ResolvedContextBudget | None = None
+    # 本 attempt 专属引擎/API 会话归属：该 attempt 的全部 BatchJob 复用同一实例。
+    # 不进入持久化快照、日志或跨 attempt 复用。
+    session_owned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LongContextStartRequest:
+    """超长上下文模式的批量启动命令载荷（类型化，避免裸 dict）。
+
+    ``task_ids`` 在**点击时冻结**：之后新加入队列的文件不会被这次操作意外纳入。
+    ``context_policy`` 是该次运行的不可变策略，被复制到每个目标任务。
+    """
+
+    task_ids: Tuple[str, ...]
+    context_policy: TranslationContextPolicy
 
 
 # ── 命令（Tk 主线程 -> Coordinator） ────────────────────
@@ -600,10 +712,15 @@ class _TaskSlot:
 
 @dataclass(frozen=True, slots=True)
 class _Command:
-    """Coordinator 命令（不可变）。"""
+    """Coordinator 命令（不可变）。
 
-    kind: str  # "start" / "pause" / "resume" / "cancel" / "start_all" / "pause_all" / "cancel_all" / "remove" / "close"
+    ``payload`` 承载类型化命令载荷（如超长模式的上下文策略与目标任务集合）。
+    点击时冻结目标集合，之后新加入的文件不被意外纳入该次操作。
+    """
+
+    kind: str  # "start" / "pause" / "resume" / "cancel" / "start_all" / "pause_all" / "cancel_all" / "remove" / "close" / "start_all_long"
     task_id: str | None = None
+    payload: object | None = None
 
 
 # ── QueueTranslationCoordinator ────────────────────────
@@ -791,16 +908,26 @@ class QueueTranslationCoordinator:
 
     # ── 命令接口（Tk 主线程调用） ────────────────────────
 
-    def submit_command(self, kind: str, task_id: str | None = None) -> None:
-        """提交命令到 Coordinator（非阻塞）。关闭后忽略。"""
+    def submit_command(
+        self, kind: str, task_id: str | None = None, *, payload: object | None = None
+    ) -> None:
+        """提交命令到 Coordinator（非阻塞）。关闭后忽略。
+
+        ``payload`` 承载类型化载荷（如 :class:`LongContextStartRequest`），
+        普通命令保持 ``None`` 以兼容旧调用方。
+        """
         with self._lock:
             if self._closed and kind != "close":
                 return
-            self._commands.append(_Command(kind=kind, task_id=task_id))
+            self._commands.append(_Command(kind=kind, task_id=task_id, payload=payload))
         self._wake_event.set()
 
     def update_policy(self, policy: QueuePolicy) -> None:
-        """Apply settings changes without recreating or losing queued tasks."""
+        """Apply settings changes without recreating or losing queued tasks.
+
+        这是**全局并发/公平调度**策略：不得用它为某个任务切换上下文模式。
+        任务级上下文策略存在 ``_TaskSlot.context_policy``。
+        """
         self._limiter_registry.update_limits(
             configured_max=policy.max_in_flight_requests,
             hard_cap=policy.hard_request_cap,
@@ -812,9 +939,30 @@ class QueueTranslationCoordinator:
             self._activate_pending_tasks_locked()
         self._wake_event.set()
 
+    def submit_long_context_start(self, task_ids, context_policy) -> None:
+        """批量启动超长上下文翻译：冻结目标任务集合与预算快照（LC-04）。
+
+        运行中、取消处理中、保存中的任务不由本方法切换模式——它们的状态在
+        Coordinator 命令处理阶段重新校验，不符合启动条件的目标被忽略。
+        """
+        frozen_ids = tuple(task_ids)
+        if not frozen_ids:
+            return
+        self.submit_command(
+            "start_all_long",
+            payload=LongContextStartRequest(task_ids=frozen_ids, context_policy=context_policy),
+        )
+
     def _split_pending_batches_to_single_lines_locked(self) -> None:
-        """Re-plan not-yet-dispatched work when small-model mode is enabled."""
+        """Re-plan not-yet-dispatched work when small-model mode is enabled.
+
+        只作用于普通模式任务：超长上下文任务的策略快照是运行时的明确选择，
+        不能因为全局小模型开关被静默改写成逐行（两者本就互斥，见
+        ``_prepare_attempt_locked``）。
+        """
         for slot in self._tasks.values():
+            if slot.context_policy.is_long:
+                continue
             if not slot.pending_batches:
                 continue
             used_ids = set(slot.completed_batch_ids)
@@ -965,6 +1113,9 @@ class QueueTranslationCoordinator:
                 project=project,
                 manually_edited_indices=set(restored_manually_edited),
                 completed_indices=set(restored_completed_indices),
+                # §6.3：恢复已持久化的上下文模式与用户预算。旧项目缺字段时
+                # 按普通模式读取，不触发全量重译。
+                context_policy=_restored_context_policy(project),
             )
             slot.failed_indices = list(restored_failed_indices)
             self._tasks[task_id] = slot
@@ -1191,6 +1342,9 @@ class QueueTranslationCoordinator:
             self._cmd_cancel_task(cmd.task_id)
         elif cmd.kind == "cancel_all":
             self._cmd_cancel_all()
+        elif cmd.kind == "start_all_long":
+            request = cmd.payload if isinstance(cmd.payload, LongContextStartRequest) else None
+            self._cmd_start_all_long(request)
         elif cmd.kind == "remove":
             self._cmd_remove_task(cmd.task_id)
         elif cmd.kind == "close":
@@ -1230,6 +1384,35 @@ class QueueTranslationCoordinator:
                     QueueTaskState.PARTIAL,
                 ):
                     slot.start_requested = True
+            self._activate_pending_tasks_locked()
+
+    def _cmd_start_all_long(self, request: LongContextStartRequest | None) -> None:
+        """超长上下文模式的批量启动（LC-04）。
+
+        只处理命令载荷中冻结的目标集合，且只对点击时符合原 ``start_all``
+        启动条件的任务生效：运行中、取消处理中、保存中的任务不切换模式。
+
+        重要：切换模式会为这些任务创建**新的 attempt**（新 attempt_id、新批次
+        规划）。已经跑完的行不会重译，符合"只处理未完成行"的语义。
+        """
+        if request is None or not request.context_policy.is_long:
+            return
+        with self._lock:
+            for task_id in request.task_ids:
+                slot = self._tasks.get(task_id)
+                if slot is None:
+                    continue
+                if slot.state not in (
+                    QueueTaskState.PENDING,
+                    QueueTaskState.PAUSED,
+                    QueueTaskState.CANCELLED,
+                    QueueTaskState.ERROR,
+                    QueueTaskState.PARTIAL,
+                ):
+                    # 运行中 / 取消处理中（FINALIZING）/ 已完成：不切换模式。
+                    continue
+                slot.context_policy = request.context_policy
+                slot.start_requested = True
             self._activate_pending_tasks_locked()
 
     def _active_task_count_locked(self) -> int:
@@ -1297,6 +1480,17 @@ class QueueTranslationCoordinator:
         slot.finalization_scheduled = False
         slot.finalization_complete = False
         slot.final_state_hint = None
+        # 超长上下文翻译的互斥校验必须在准备阶段拦住：小模型模式强制逐行，
+        # 与超长批次语义冲突，不得静默覆盖任一方设置。
+        if slot.context_policy.is_long:
+            app_config = self._config_manager.get_app_config()
+            if bool(app_config.get(SMALL_MODEL_MODE_CONFIG_KEY, False)):
+                slot.state = QueueTaskState.ERROR
+                slot.error_message = _SMALL_MODEL_LONG_CONTEXT_CONFLICT_MESSAGE
+                slot.actionable_error = classify_error(
+                    ValueError(_SMALL_MODEL_LONG_CONTEXT_CONFLICT_MESSAGE)
+                )
+                return
         slot.state = QueueTaskState.PREPARING
 
         # API client creation and context construction can allocate sockets or
@@ -1307,19 +1501,29 @@ class QueueTranslationCoordinator:
         else:
             engine = TranslatorEngine(self._config_manager, cache_dir=self._cache_dir)
         slot.engine = engine
+        slot.session_owned = True
         preparation_error: Exception | None = None
         preparation_stage = "engine_init"
         run_context = None
         input_token_budget = 0
+        resolved_budget = None
         self._lock.release()
         try:
             engine._ensure_api()
             preparation_stage = "run_context"
-            run_context = engine.build_run_context()
-            preparation_stage = "input_budget"
-            input_token_budget = engine.compute_input_token_budget(
-                self._policy.target_batch_input_tokens
-            )
+            # 超长模式：预算由任务自己的策略解析（不受全局 QueuePolicy 的行数/
+            # token 上限影响），并把预算快照放进 run_context 供全部批次复用。
+            # 普通模式保持原有解析顺序与语义。
+            if slot.context_policy.is_long:
+                resolved_budget = engine.resolve_run_budget(slot.context_policy)
+                run_context = engine.build_run_context(budget=resolved_budget)
+                input_token_budget = resolved_budget.batch_budget_tokens
+            else:
+                preparation_stage = "input_budget"
+                input_token_budget = engine.compute_input_token_budget(
+                    self._policy.target_batch_input_tokens
+                )
+                run_context = engine.build_run_context()
         except Exception as exc:  # noqa: BLE001
             preparation_error = exc
         finally:
@@ -1364,13 +1568,38 @@ class QueueTranslationCoordinator:
 
         # 规划批次
         assert run_context is not None
-        jobs = plan_batches(
-            slot.source_lines,
-            missing_indices,
-            self._policy,
-            run_context,
-            input_token_budget,
-        )
+        slot.resolved_budget = resolved_budget
+        if slot.context_policy.is_long:
+            assert resolved_budget is not None
+            try:
+                jobs = plan_long_context_batches(
+                    slot.source_lines,
+                    missing_indices,
+                    budget=resolved_budget,
+                    run_context=run_context,
+                )
+            except BatchPlanningError as exc:
+                # 预算不足（单行过大 / 协议开销占满）必须成为可操作错误，
+                # 不能空转，也不能绕过预算硬发。
+                logger.error("任务 %s 超长上下文规划失败: %s", slot.task_id, exc)
+                slot.state = QueueTaskState.ERROR
+                slot.error_message = str(exc)
+                slot.actionable_error = classify_error(exc)
+                log_classified_error(
+                    exc,
+                    slot.actionable_error,
+                    context={"task_id": slot.task_id, "phase": "long_context_planning"},
+                )
+                self._close_engine_locked(slot)
+                return
+        else:
+            jobs = plan_batches(
+                slot.source_lines,
+                missing_indices,
+                self._policy,
+                run_context,
+                input_token_budget,
+            )
         # 填充 task_id 和 attempt_id
         filled_jobs = [
             BatchJob(
@@ -1933,6 +2162,20 @@ class QueueTranslationCoordinator:
         if consumer_id is None:
             slot.pending_batches.appendleft(job)
             return False
+        # §5.3：单个请求的输入估算若超过非零 TPM 上限，``try_acquire`` 永远
+        # 返回 False（TPM 检查在窗口重置后仍然成立）。此处直接给出可操作错误，
+        # 而不是让任务无限空转。区分"本分钟额度暂时用尽"（下面正常等待）与
+        # "这个请求永远不可能取得额度"。
+        tpm_limit = max(0, int(self._policy.tpm_limit))
+        if tpm_limit > 0 and job.estimated_input_tokens > tpm_limit:
+            slot.in_flight_batches.pop(job.batch_id, None)
+            slot.pending_batches.clear()
+            slot.state = QueueTaskState.ERROR
+            message = _unsatisfiable_tpm_error(job.estimated_input_tokens, tpm_limit)
+            slot.error_message = message
+            slot.actionable_error = classify_error(ValueError(message))
+            logger.error("任务 %s 的批次超过 TPM 上限: %s", slot.task_id, message)
+            return False
         # 获取 limiter 槽位（带预估 token）
         if not limiter.try_acquire(
             estimated_tokens=job.estimated_input_tokens,
@@ -2024,6 +2267,12 @@ class QueueTranslationCoordinator:
                 "failed_indices": list(slot.failed_indices),
                 "manually_edited_indices": set(slot.manually_edited_indices),
                 "completed_indices": set(slot.completed_indices),
+                # §6.3：把本次 attempt 的上下文模式与用户预算写进项目快照，
+                # 使暂停/重启后继承原模式与预算。有效模型容量只作诊断记录，
+                # 恢复时会用**当前**配置重新校验。
+                "context_mode": slot.context_policy.mode.value,
+                "context_window_tokens": slot.context_policy.context_window_tokens,
+                "budget": slot.resolved_budget,
             }
             save_fn = self._make_save_fn(slot, snapshot_data)
         if save_fn is None:
@@ -2066,6 +2315,10 @@ class QueueTranslationCoordinator:
         manually_edited_snapshot = set(snapshot_data["manually_edited_indices"])
         completed_snapshot = set(snapshot_data["completed_indices"])
 
+        context_mode_snapshot = str(snapshot_data.get("context_mode") or "standard")
+        context_window_snapshot = snapshot_data.get("context_window_tokens")
+        resolved_budget = snapshot_data.get("budget")
+
         def _save_txt_with_project(generation: int) -> None:
             # 1. 写 _译文.txt（导出/向后兼容格式）
             content = "\n".join(target_lines_copy)
@@ -2076,6 +2329,13 @@ class QueueTranslationCoordinator:
                 project.failed_indices = set(failed_indices_snapshot)
                 project.manually_edited_indices = set(manually_edited_snapshot)
                 project.completed_indices = set(completed_snapshot)
+                # §6.3：上下文模式随项目快照持久化，恢复时继承。
+                project.model_snapshot.context_mode = context_mode_snapshot
+                project.model_snapshot.context_window_tokens = (
+                    context_window_snapshot if context_mode_snapshot == "long" else None
+                )
+                if resolved_budget is not None:
+                    project.model_snapshot.context_policy_version = resolved_budget.policy_version
                 project_repo.save(project)
 
         return _save_txt_with_project
@@ -2176,6 +2436,16 @@ class QueueTranslationCoordinator:
             recommended_action=(ae.recommended_action if ae else None),
             correlation_id=(ae.correlation_id if ae else None),
             failed_count=len(slot.failed_indices),
+            context_mode=slot.context_policy.mode.value,
+            requested_context_tokens=(
+                slot.context_policy.context_window_tokens if slot.context_policy.is_long else None
+            ),
+            effective_context_tokens=(
+                slot.resolved_budget.effective_context_tokens
+                if slot.resolved_budget is not None
+                else None
+            ),
+            budget_limited=bool(slot.resolved_budget and slot.resolved_budget.is_limited),
         )
 
     # ── Limiter / 引擎 / 写锁 辅助 ──────────────────────
