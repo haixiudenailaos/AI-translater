@@ -46,7 +46,10 @@ from ..config.volcengine_image import (
     VOLCENGINE_IMAGE_DEFAULT_MODEL,
     VOLCENGINE_IMAGE_MODEL_SUGGESTIONS,
 )
-from ..domain.translation_policy import LONG_CONTEXT_DEFAULT_CONTEXT_WINDOW_TOKENS
+from ..domain.translation_policy import (
+    LONG_CONTEXT_DEFAULT_CONTEXT_WINDOW_TOKENS,
+    coerce_context_window_tokens,
+)
 from .form_validation import (
     FormValidator,
     parse_positive_int_text,
@@ -835,8 +838,7 @@ class SettingsWindow:
             current_value = current_tokens.get("context_window_tokens")
         else:
             current_value = None
-        if not isinstance(current_value, int) or isinstance(current_value, bool):
-            current_value = int(current_value) if str(current_value).strip().isdigit() else None
+        current_value = coerce_context_window_tokens(current_value)
         self.long_context_tokens_var = tk.StringVar(
             value=str(current_value or LONG_CONTEXT_DEFAULT_CONTEXT_WINDOW_TOKENS)
         )

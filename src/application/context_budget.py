@@ -19,6 +19,7 @@
 """
 
 from dataclasses import dataclass
+from typing import Mapping
 
 from ..config.translation_profile import DEFAULT_OUTPUT_TOKEN_RESERVE
 from ..domain.translation_policy import (
@@ -39,26 +40,26 @@ STANDARD_MIN_INPUT_BUDGET_TOKENS = 512
 FALLBACK_MODEL_CONTEXT_TOKENS = LONG_CONTEXT_DEFAULT_CONTEXT_WINDOW_TOKENS
 
 
-def resolve_model_context_tokens(api_config: object) -> int:
+def resolve_model_context_tokens(api_config: Mapping[str, object] | None) -> int:
     """从 API 配置读取用户声明的模型容量 ``M``。
 
     这是用户声明的值，**不是**向服务端查询验证过的能力。缺失或损坏时回退
     默认值，而不是猜一个更大的数字。
     """
-    raw = api_config.get("context_window_tokens") if isinstance(api_config, dict) else None
+    raw = api_config.get("context_window_tokens") if api_config is not None else None
     tokens = coerce_context_window_tokens(raw)
     if tokens is None:
         return FALLBACK_MODEL_CONTEXT_TOKENS
     return tokens
 
 
-def resolve_model_max_output_tokens(api_config: object) -> int | None:
+def resolve_model_max_output_tokens(api_config: Mapping[str, object] | None) -> int | None:
     """从 API 配置读取可选的模型输出容量上限；未声明时返回 ``None``。
 
     只接受用户/预设显式写入的正整数，不根据模型名称推断能力，也不编造
     内置能力表。
     """
-    raw = api_config.get("max_output_tokens") if isinstance(api_config, dict) else None
+    raw = api_config.get("max_output_tokens") if api_config is not None else None
     tokens = coerce_context_window_tokens(raw)
     return tokens
 
