@@ -220,11 +220,12 @@ class FormValidator:
         except (tk.TclError, AttributeError):
             return
         clamped = clamp_int(current, spec.lo, spec.hi, default=spec.lo)
-        if isinstance(spec.var, tk.IntVar):
-            try:
-                spec.var.set(clamped)
-            except tk.TclError:
-                pass
+        # StringVar is used by editable spinboxes and text fields; writing only
+        # to IntVar leaves invalid text visible and defeats the clamp contract.
+        try:
+            spec.var.set(clamped)
+        except tk.TclError:
+            pass
 
     def attach_focus_out_clamp(self, spec: FieldSpec) -> None:
         """为字段绑定 ``<FocusOut>`` 自动 clamp + 即时校验。

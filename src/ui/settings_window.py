@@ -116,7 +116,7 @@ class SettingsWindow:
             SILICONFLOW_DEEPSEEK_V32_MODEL: "DeepSeek V3.2（流式）",
             "deepseek-ai/DeepSeek-V4-Flash": "DeepSeek V4 Flash（性价比高）",
             # DeepSeek 官方模型
-            DEEPSEEK_V4_FLASH_MODEL: "DeepSeek V4 Flash",
+            DEEPSEEK_V4_FLASH_MODEL: "DeepSeek Flash",
         }
 
         # 反向映射：显示名称 -> 完整名称
@@ -552,7 +552,7 @@ class SettingsWindow:
         ]
 
         self.deepseek_models = [
-            "DeepSeek V4 Flash",
+            "DeepSeek Flash",
         ]
 
         # 根据当前提供商选择模型列表

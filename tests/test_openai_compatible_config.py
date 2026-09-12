@@ -171,7 +171,7 @@ def test_custom_provider_config_is_saved_without_plaintext_key(
             "provider": "deepseek",
             "base_url": "https://api.deepseek.com/v1",
             "api_key": "sk-deepseek",
-            "model_name": "deepseek-v4-flash",
+            "model_name": "deepseek-flash",
         }
     )
     assert tmp_config_manager.save_api_config(built_in_config)

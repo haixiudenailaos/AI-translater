@@ -512,7 +512,7 @@ def sse(content):
 
 def test_deepseek_v4_translation_disables_default_thinking():
     api, client = make_api(
-        [FakeResponse(chunks=[sse("译文"), "data: [DONE]"])], model_name="deepseek-v4-flash"
+        [FakeResponse(chunks=[sse("译文"), "data: [DONE]"])], model_name="deepseek-flash"
     )
     try:
         api.translate_stream("原文")

@@ -596,7 +596,8 @@ class BaseAPI:
                             # stuck for a minute before its first translated token.
                             **(
                                 {"thinking": {"type": "disabled"}}
-                                if "deepseek-v4" in self.model_name.lower()
+                                if self.model_name.lower()
+                                in {"deepseek-flash", "deepseek-v4-flash"}
                                 and self.config.get("disable_thinking", True)
                                 else {}
                             ),

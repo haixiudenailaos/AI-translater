@@ -9,7 +9,9 @@ OPENAI_COMPATIBLE_PROVIDER = "openai_compatible"
 SMALL_MODEL_MODE_CONFIG_KEY = "small_model_mode"
 
 SILICONFLOW_DEEPSEEK_V32_MODEL = "deepseek-ai/DeepSeek-V3.2"
-DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash"
+DEEPSEEK_FLASH_MODEL = "deepseek-flash"
+# Keep the old symbol available for integrations importing it directly.
+DEEPSEEK_V4_FLASH_MODEL = DEEPSEEK_FLASH_MODEL
 
 DEFAULT_TRANSLATION_BATCH_LINES = 10
 MAX_STABLE_TRANSLATION_BATCH_LINES = 20
@@ -294,6 +296,7 @@ def apply_text_translation_profile(config: Dict[str, Any]) -> Dict[str, Any]:
         legacy_official_models = {
             "deepseek-ai/DeepSeek-V3.2-Exp",
             "deepseek-chat",
+            "deepseek-v4-flash",
         }
         if normalized.get("model_name") in legacy_official_models:
             normalized["model_name"] = DEEPSEEK_V4_FLASH_MODEL
