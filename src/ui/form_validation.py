@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, List, Tuple, cast
 
 TkVar = tk.IntVar | tk.DoubleVar | tk.StringVar | tk.BooleanVar
 
@@ -223,7 +223,10 @@ class FormValidator:
         # StringVar is used by editable spinboxes and text fields; writing only
         # to IntVar leaves invalid text visible and defeats the clamp contract.
         try:
-            spec.var.set(clamped)
+            if isinstance(spec.var, tk.IntVar):
+                spec.var.set(clamped)
+            else:
+                cast(Any, spec.var).set(str(clamped))
         except tk.TclError:
             pass
 
