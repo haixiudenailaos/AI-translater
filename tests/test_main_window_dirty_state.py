@@ -52,6 +52,66 @@ def _make_window(document, *, autosave_state=CLEAN):
     return window, session
 
 
+def _make_epub_window(document):
+    session = DocumentSession(
+        session_id="epub-session",
+        kind=SessionKind.EPUB,
+        source_path=Path("book.epub"),
+        target_path=None,
+        mapping_dir=Path("mapping"),
+        document=document,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._document = document
+    window.file_importer = SimpleNamespace(session=session)
+    return window, session
+
+
+def test_capture_epub_export_snapshot_commits_editor_and_copies_model():
+    document = TranslationDocument()
+    document.replace(["原文一", "原文二"], ["", ""])
+    document.update_target(1, "译文二")
+    window, session = _make_epub_window(document)
+    saved = []
+    window._cell_editor = SimpleNamespace(save=lambda: saved.append(True))
+
+    snapshot = window.capture_epub_export_snapshot()
+
+    assert saved == [True]
+    assert snapshot.session_id == "epub-session"
+    assert snapshot.source_path == Path("book.epub")
+    assert snapshot.mapping_dir == Path("mapping")
+    assert snapshot.source_lines == ("原文一", "原文二")
+    assert snapshot.target_lines == ("", "译文二")
+    assert snapshot.document_version == document.version
+
+
+def test_capture_epub_export_snapshot_is_isolated_from_later_edits():
+    document = TranslationDocument()
+    document.replace(["原文"], [""])
+    window, _session = _make_epub_window(document)
+    snapshot = window.capture_epub_export_snapshot()
+
+    document.update_target(0, "导出后才提交的译文")
+    document.update_source(0, "导出后才编辑的原文")
+
+    assert snapshot.target_lines == ("",)
+    assert snapshot.source_lines == ("原文",)
+
+
+def test_capture_epub_export_snapshot_rejects_non_epub_session():
+    document = TranslationDocument()
+    document.replace(["原文"], [""])
+    window, _session = _make_window(document)
+
+    try:
+        window.capture_epub_export_snapshot()
+    except ValueError as exc:
+        assert "不是 EPUB" in str(exc)
+    else:
+        raise AssertionError("TXT 会话不应捕获双语 EPUB 快照")
+
+
 def test_schedule_save_ignores_clean_document():
     document = TranslationDocument()
     document.replace(["source"], ["translated"])

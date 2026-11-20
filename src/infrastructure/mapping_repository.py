@@ -45,6 +45,14 @@ class MappingGenerationError(RuntimeError):
     """Published mapping manifest is missing or points outside its generation root."""
 
 
+class MappingSnapshotError(RuntimeError):
+    """A read-only content mapping snapshot could not be decoded."""
+
+
+class MappingSnapshotBusyError(MappingSnapshotError):
+    """The mapping generation kept changing during a bounded read-only snapshot."""
+
+
 # ── B-2: generation mark-and-sweep GC ──────────────────────────────────────
 
 
@@ -140,6 +148,77 @@ def resolve_mapping_file(mapping_dir: str | Path, filename: str) -> Path:
     if not path.is_file():
         raise MappingGenerationError(f"已发布 generation 缺少 {filename}")
     return path
+
+
+_MAX_SNAPSHOT_ATTEMPTS = 3
+
+
+def _decode_content_mapping(path: Path) -> dict:
+    """Read and validate one content mapping file as a private in-memory object."""
+    raw = path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise MappingSnapshotError("content_mapping.json 内容损坏，无法导出") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("content_mappings"), dict):
+        raise MappingSnapshotError("content_mapping.json 格式无效，无法导出")
+    return data
+
+
+def read_content_mapping_snapshot(
+    mapping_dir: str | Path,
+    *,
+    max_attempts: int = _MAX_SNAPSHOT_ATTEMPTS,
+) -> dict:
+    """Load one published content mapping without holding a generation path.
+
+    The manifest is read first, the generation member is read immediately into
+    memory, and the manifest is re-read to confirm its references did not change
+    while reading. A missing member is retried a bounded number of times only
+    if the manifest changed, as can happen during concurrent publication and GC.
+    Corrupt manifests or JSON fail explicitly instead of mixing legacy top-level copies.
+
+    Raises:
+        MappingGenerationError: manifest is malformed or points outside its root.
+        MappingSnapshotError: content JSON is missing, corrupt or malformed.
+        MappingSnapshotBusyError: the generation kept changing during all attempts.
+    """
+    root = Path(mapping_dir)
+    attempts = max(1, max_attempts)
+    legacy_missing = False
+    generation_changed = False
+    for _attempt in range(attempts):
+        manifest = _load_manifest(root)
+        if manifest is None:
+            try:
+                return _decode_content_mapping(root / "content_mapping.json")
+            except FileNotFoundError:
+                legacy_missing = True
+                continue
+
+        relative_path = manifest["files"].get("content_mapping.json")
+        if not isinstance(relative_path, str) or not relative_path:
+            raise MappingGenerationError("generation 缺少 content_mapping.json")
+        try:
+            path = _resolve_generation_path(root, relative_path)
+            data = _decode_content_mapping(path)
+        except FileNotFoundError as exc:
+            if _load_manifest(root) == manifest:
+                raise MappingSnapshotError(
+                    "已发布的映射缺少 content_mapping.json，无法生成映射快照"
+                ) from exc
+            generation_changed = True
+            continue
+
+        current_manifest = _load_manifest(root)
+        if current_manifest != manifest:
+            generation_changed = True
+            continue
+        return data
+
+    if legacy_missing and not generation_changed:
+        raise MappingSnapshotError("缺少 content_mapping.json，无法生成映射快照")
+    raise MappingSnapshotBusyError("项目映射正在更新，请稍后重新导出")
 
 
 def _new_generation_directory(mapping_dir: Path) -> tuple[str, Path]:

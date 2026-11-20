@@ -4,6 +4,7 @@
 从MainWindow中提取的翻译流程控制逻辑
 """
 
+import queue
 import threading
 import time
 import tkinter as tk
@@ -27,10 +28,19 @@ from ..application.translation_events import (
 )
 from ..config.translation_profile import SMALL_MODEL_MODE_CONFIG_KEY
 from ..core.translation_result import BatchTranslationResult, TranslationStatus
+from ..domain.epub_export import (
+    BilingualExportReport,
+    EpubDocumentSnapshot,
+    EpubExportOptions,
+    EpubTextMode,
+    resolve_language_tag,
+)
 from ..domain.translation_policy import ContextMode, TranslationContextPolicy
 from ..utils.logger import get_logger
 from .export_helpers import (
+    build_default_bilingual_epub_filename,
     build_default_epub_filename,
+    is_forbidden_bilingual_output,
     load_image_text_translations,
     load_image_translation_result,
 )
@@ -102,6 +112,8 @@ class TranslationController:
         mode_toggle=None,
         backup_dir: Path | str | None = None,
         long_context_btn=None,
+        capture_export_snapshot: Callable[[], EpubDocumentSnapshot] | None = None,
+        get_session_id: Callable[[], str | None] | None = None,
     ):
         self.root = root
         self.config_manager = config_manager
@@ -193,6 +205,11 @@ class TranslationController:
         self._export_job: ExportJob | TextExportJob | None = None
         self._export_poll_after_id: str | None = None
         self._export_kind: str | None = None
+        # 双语导出使用主线程快照回调，任务槽在终态被消费前保持占用。
+        self._capture_export_snapshot = capture_export_snapshot
+        self._get_session_id = get_session_id or (lambda: None)
+        self._export_session_id: str | None = None
+        self._export_report_queue: queue.SimpleQueue[BilingualExportReport] | None = None
         # 每个 run_id 冻结的上下文策略（None = 普通模式）。工作线程按 run_id
         # 取用后立即移除；三个 worker 因此可以共用同一 (content, run_id) 签名。
         self._run_context_policies: dict[str, TranslationContextPolicy | None] = {}
@@ -242,6 +259,8 @@ class TranslationController:
         self._streaming_preview_rows.clear()
         if self._export_job is not None:
             self._export_job.cancel()
+        self._export_session_id = None
+        self._export_report_queue = None
         if self._export_poll_after_id is not None:
             try:
                 self.root.after_cancel(self._export_poll_after_id)
@@ -1764,7 +1783,7 @@ class TranslationController:
                     self._update_target_path(output_path)
                 self._on_save_success()
 
-            self._start_text_export(
+            return self._start_text_export(
                 kind="译文保存",
                 output_path=output_path,
                 build_content=lambda: "\n".join(target_snapshot),
@@ -1772,7 +1791,6 @@ class TranslationController:
                 on_success=on_success,
                 backup_existing=True,
             )
-            return True
         except Exception as exc:
             logger.exception("启动译文保存失败")
             messagebox.showerror("保存错误", f"无法开始保存译文: {exc}")
@@ -1838,7 +1856,8 @@ class TranslationController:
             messagebox.showerror("导出错误", f"无法开始导出对照文件: {exc}")
 
     def _export_is_running(self) -> bool:
-        return self._export_job is not None and self._export_job.is_running
+        """Keep the slot occupied until its terminal event has been consumed."""
+        return self._export_job is not None
 
     def _backup_existing_output(self, output_path: Path) -> None:
         """在覆盖译文前把旧版本写入用户选择的备份目录。
@@ -1870,7 +1889,11 @@ class TranslationController:
         save_mapping: Callable[[], None] | None = None,
         on_success: Callable[[], None] | None = None,
         backup_existing: bool = False,
-    ) -> None:
+    ) -> bool:
+        # Save dialogs can dispatch Tk callbacks that start another export.
+        if self._export_is_running():
+            messagebox.showinfo("导出进行中", "已有导出或保存任务正在处理，请稍后再试。")
+            return False
         job = TextExportJob(
             output_path=output_path,
             build_content=build_content,
@@ -1881,17 +1904,23 @@ class TranslationController:
         self._export_job = job
         self._export_kind = kind
         self._export_success_callback = on_success
+        self._export_session_id = None
+        self._export_report_queue = None
         job.start()
         self.status_updater(f"{kind}已开始，可继续使用界面")
         self._poll_export_job()
+        return True
 
     def export_epub_file(self):
         """在后台将当前译文安全导出为 EPUB。"""
         active_export = self._export_job
-        if active_export is not None and active_export.is_running:
-            if messagebox.askyesno("导出进行中", "当前保存或导出尚未完成。是否取消？"):
-                active_export.cancel()
-                self.status_updater("正在取消导出…")
+        if active_export is not None:
+            if active_export.is_running:
+                if messagebox.askyesno("导出进行中", "当前保存或导出尚未完成。是否取消？"):
+                    active_export.cancel()
+                    self.status_updater("正在取消导出…")
+            else:
+                messagebox.showinfo("导出进行中", "已有导出或保存任务正在处理，请稍后再试。")
             return
         try:
             current_mapping_dir = self.get_mapping_dir()
@@ -1910,6 +1939,9 @@ class TranslationController:
                 filetypes=[("EPUB电子书", "*.epub"), ("所有文件", "*.*")],
             )
             if not out_path:
+                return
+            if self._export_is_running():
+                messagebox.showinfo("导出进行中", "已有导出或保存任务正在处理，请稍后再试。")
                 return
 
             image_map = (
@@ -1940,11 +1972,158 @@ class TranslationController:
             )
             self._export_kind = "EPUB 导出"
             self._export_success_callback = None
+            self._export_session_id = None
+            self._export_report_queue = None
             self._export_job.start()
             self.status_updater("EPUB 导出已开始，可继续使用界面")
             self._poll_export_job()
         except Exception as e:
             messagebox.showerror("导出错误", f"导出EPUB操作失败: {str(e)}")
+
+    def export_bilingual_epub_file(self) -> None:
+        """把当前译文导出为逐段“原文在上、译文在下”的双语 EPUB。
+
+        主线程只提交编辑、捕获不可变快照并弹出对话框；映射稳定读取、DOM
+        渲染、结构校验和原子发布全部在 ``ExportJob`` 的 worker 中完成。
+        本方法不保存项目映射、不清 dirty、不修改会话 target_path。
+        """
+        if self._export_job is not None:
+            messagebox.showinfo("导出进行中", "已有导出或保存任务正在处理，请稍后再试。")
+            return
+        capture = self._capture_export_snapshot
+        if capture is None:
+            messagebox.showerror("导出错误", "当前窗口未提供双语导出所需的文档快照接口")
+            return
+        if not self.get_mapping_dir():
+            messagebox.showwarning("导出警告", "当前会话并非 EPUB 映射，无法导出双语 EPUB")
+            return
+
+        start_session_id = self._get_session_id()
+        try:
+            file_path = filedialog.asksaveasfilename(
+                title="导出双语 EPUB",
+                defaultextension=".epub",
+                initialfile=build_default_bilingual_epub_filename(self.get_source_path()),
+                filetypes=[("EPUB电子书", "*.epub"), ("所有文件", "*.*")],
+            )
+        except Exception as exc:
+            logger.exception("打开双语 EPUB 保存对话框失败")
+            messagebox.showerror("导出错误", f"无法打开保存对话框: {exc}")
+            return
+        if not file_path:
+            return
+        if start_session_id is not None and self._get_session_id() != start_session_id:
+            messagebox.showwarning("导出已取消", "保存对话框打开期间文档已切换，请重新导出。")
+            return
+
+        try:
+            snapshot = capture()
+        except Exception as exc:
+            logger.exception("捕获双语 EPUB 文档快照失败")
+            messagebox.showerror("导出错误", f"无法捕获当前文档快照: {exc}")
+            return
+
+        if self._export_job is not None:
+            messagebox.showinfo("导出进行中", "已有导出或保存任务正在处理，请稍后再试。")
+            return
+        if start_session_id is not None and snapshot.session_id != start_session_id:
+            messagebox.showwarning("导出已取消", "保存对话框打开期间文档已切换，请重新导出。")
+            return
+        if not snapshot.source_lines:
+            messagebox.showwarning("导出警告", "当前文档没有可导出的正文")
+            return
+        if not any(str(line).strip() for line in snapshot.target_lines):
+            messagebox.showwarning("导出警告", "暂无可导出的译文")
+            return
+
+        output_path = Path(file_path)
+        rejection = is_forbidden_bilingual_output(
+            output_path,
+            source_path=snapshot.source_path,
+            target_path=self._get_target_path(),
+            mapping_dir=snapshot.mapping_dir,
+        )
+        if rejection is not None:
+            messagebox.showwarning("导出警告", rejection)
+            return
+
+        language_tag = resolve_language_tag(
+            str(self.config_manager.get_app_config().get("target_language", "") or "")
+        )
+        options = EpubExportOptions(
+            text_mode=EpubTextMode.BILINGUAL,
+            target_language_tag=language_tag,
+        )
+        report_queue: queue.SimpleQueue[BilingualExportReport] = queue.SimpleQueue()
+
+        def export_to(temporary_path: Path) -> Path | str:
+            # 图片记录在 worker 的准备阶段读取为本次导出的私有副本，
+            # 主线程不解析 JSON，也不把 UI 的可变字典传入后台。
+            image_map = load_image_translation_result(snapshot.mapping_dir)
+            image_text_map = load_image_text_translations(snapshot.mapping_dir)
+            return self.epub_processor.export_epub(
+                str(snapshot.mapping_dir),
+                str(temporary_path),
+                image_map,
+                image_text_map,
+                options=options,
+                snapshot=snapshot,
+                on_report=report_queue.put,
+            )
+
+        try:
+            job = ExportJob(
+                output_path=output_path,
+                save_mapping=None,
+                export_to=export_to,
+                backup_existing=self._backup_existing_output,
+            )
+            self._export_job = job
+            self._export_kind = "双语 EPUB 导出"
+            self._export_success_callback = None
+            self._export_session_id = snapshot.session_id
+            self._export_report_queue = report_queue
+            job.start()
+            self.status_updater("双语 EPUB 导出已开始，可继续使用界面")
+            self._poll_export_job()
+        except Exception as exc:
+            logger.exception("启动双语 EPUB 导出失败")
+            self._reset_export_slot()
+            messagebox.showerror("导出错误", f"无法开始导出双语 EPUB: {exc}")
+
+    def _export_belongs_to_current_session(self) -> bool:
+        session_id = self._export_session_id
+        if session_id is None:
+            return True
+        current = self._get_session_id()
+        if current is None:
+            return True
+        return current == session_id
+
+    def _reset_export_slot(self) -> None:
+        self._export_job = None
+        self._export_kind = None
+        self._export_success_callback = None
+        self._export_session_id = None
+        self._export_report_queue = None
+
+    def _take_bilingual_report(self) -> BilingualExportReport | None:
+        report_queue = self._export_report_queue
+        if report_queue is None:
+            return None
+        try:
+            return report_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    @staticmethod
+    def _format_bilingual_report(report: BilingualExportReport | None) -> str:
+        if report is None:
+            return ""
+        details = f"已对照 {report.paired_segments} 段，{report.untranslated_segments} 段未译"
+        if report.preserved_segments:
+            details += f"；{report.preserved_segments} 段按原布局保留"
+        return f"\n已按导出开始时的内容生成：{details}"
 
     def _poll_export_job(self) -> None:
         job = self._export_job
@@ -1952,8 +2131,10 @@ class TranslationController:
             return
         terminal = False
         for event in job.drain_events():
+            same_session = self._export_belongs_to_current_session()
             if isinstance(event, ExportProgress):
-                self.status_updater(event.message)
+                if same_session:
+                    self.status_updater(event.message)
                 continue
             terminal = True
             kind = self._export_kind or "导出"
@@ -1968,20 +2149,22 @@ class TranslationController:
                             callback()
                         except Exception:
                             logger.exception("处理%s成功回调失败", kind)
-                    self.status_updater(f"{kind}已完成: {output_path.name}")
-                    messagebox.showinfo("导出成功", f"{kind}已完成: {output_path.name}")
-                    self._export_job = None
-                    self._export_kind = None
-                    self._export_success_callback = None
+                    report_suffix = self._format_bilingual_report(self._take_bilingual_report())
+                    if same_session:
+                        self.status_updater(f"{kind}已完成: {output_path.name}")
+                    messagebox.showinfo(
+                        "导出成功", f"{kind}已完成: {output_path.name}{report_suffix}"
+                    )
+                    self._reset_export_slot()
                     continue
             elif event.cancelled:
-                self.status_updater(f"{kind}已取消，原目标文件未修改")
+                if same_session:
+                    self.status_updater(f"{kind}已取消，原目标文件未修改")
             else:
-                self.status_updater(f"{kind}失败")
+                if same_session:
+                    self.status_updater(f"{kind}失败")
                 messagebox.showerror("导出错误", f"{kind}失败: {event.error_message or '未知错误'}")
-            self._export_job = None
-            self._export_kind = None
-            self._export_success_callback = None
+            self._reset_export_slot()
         if terminal:
             self._export_poll_after_id = None
             return

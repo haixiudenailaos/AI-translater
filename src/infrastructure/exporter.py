@@ -21,16 +21,28 @@ import importlib
 import json
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 from shutil import copyfileobj
 from tempfile import NamedTemporaryFile
+from time import perf_counter
 from typing import Dict
 from uuid import uuid4
 from xml.etree import ElementTree
 from zipfile import ZipFile
 
-from ..domain.errors import EpubFingerprintMismatchError
+from ..domain.epub_export import (
+    BilingualDocumentPlan,
+    BilingualExportReport,
+    BilingualRenderPlan,
+    EpubDocumentSnapshot,
+    EpubExportOptions,
+    EpubTextMode,
+)
+from ..domain.errors import BilingualEpubExportError, EpubFingerprintMismatchError
 from ..utils.logger import get_logger
+from .bilingual_renderer import BILINGUAL_CSS, build_pair_id, render_bilingual_document
+from .bilingual_validation import validate_bilingual_epub
 from .document_order import get_item_name, iter_spine_documents, normalize_chapter_id
 from .image_rewriter import (
     add_translated_images,
@@ -40,7 +52,7 @@ from .image_rewriter import (
     rewrite_image_references,
     set_document_content,
 )
-from .mapping_repository import resolve_mapping_file
+from .mapping_repository import read_content_mapping_snapshot, resolve_mapping_file
 from .segment_extractor import (
     BLOCK_TAGS,
     compute_source_checksum,
@@ -81,6 +93,10 @@ def export_epub(
     output_path: str,
     image_map: Dict[str, str] | None = None,
     image_text_map: Dict[str, Dict] | None = None,
+    *,
+    options: EpubExportOptions | None = None,
+    snapshot: EpubDocumentSnapshot | None = None,
+    on_report: Callable[[BilingualExportReport], None] | None = None,
 ) -> str:
     """根据 mapping 重建并导出 EPUB。
 
@@ -92,20 +108,33 @@ def export_epub(
     5. 修正特殊格式标题识别问题
     6. 支持插图翻译替换
     7. 支持图片文字翻译注释（figcaption）
+    8. 双语模式：原文节点保持原样，译文插入其后的独立容器
 
     Args:
         mapping_dir: 映射目录路径
         output_path: 输出 EPUB 文件路径
         image_map: {original_epub_path: local_new_filename} 图片替换映射
         image_text_map: {image_path: {translated_text, original_text}} 图片文字翻译
+        options: 呈现选项；``None`` 等价于既有纯译文导出
+        snapshot: 双语模式必需的主线程文档快照
+        on_report: 双语模式通过增强校验后回调一次不可变统计
 
     Returns:
         输出文件路径
 
     Raises:
         EpubFingerprintMismatchError: 源 EPUB 内容哈希不匹配
+        BilingualEpubExportError: 双语快照、结构或写出后校验失败
         Exception: 缺少必要文件或依赖
     """
+    bilingual = options is not None and options.text_mode is EpubTextMode.BILINGUAL
+    if bilingual and snapshot is None:
+        raise BilingualEpubExportError("双语 EPUB 导出缺少文档快照，已拒绝使用磁盘旧译文")
+    if not bilingual and snapshot is not None:
+        raise BilingualEpubExportError("文档快照仅用于双语 EPUB 导出")
+    started_at = perf_counter()
+    bilingual_job_id = uuid4().hex[:8] if bilingual else ""
+
     try:
         epub_module = importlib.import_module("ebooklib.epub")
         beautiful_soup = getattr(importlib.import_module("bs4"), _BEAUTIFUL_SOUP_ATTRIBUTE)
@@ -115,13 +144,23 @@ def export_epub(
         raise Exception("需要安装ebooklib和beautifulsoup4库来支持EPUB导出")
 
     mapping_dir_p = Path(mapping_dir)
-    content_file = resolve_mapping_file(mapping_dir_p, "content_mapping.json")
-    if not content_file.exists():
-        raise Exception("缺少content_mapping.json，无法导出EPUB")
+    if bilingual:
+        assert snapshot is not None
+        content_obj = read_content_mapping_snapshot(mapping_dir_p)
+        items = content_obj.get("content_mappings", {})
+        project_info = content_obj.get("project_info", {})
+        if not isinstance(items, dict) or not isinstance(project_info, dict):
+            raise BilingualEpubExportError("映射文件格式无效，无法导出双语 EPUB")
+        ordered_records = _validate_bilingual_snapshot(mapping_dir_p, project_info, items, snapshot)
+        _overlay_snapshot_targets(ordered_records, snapshot)
+    else:
+        content_file = resolve_mapping_file(mapping_dir_p, "content_mapping.json")
+        if not content_file.exists():
+            raise Exception("缺少content_mapping.json，无法导出EPUB")
+        content_obj = json.loads(content_file.read_text(encoding="utf-8"))
+        items = content_obj.get("content_mappings", {})
+        project_info = content_obj.get("project_info", {})
 
-    content_obj = json.loads(content_file.read_text(encoding="utf-8"))
-    items = content_obj.get("content_mappings", {})
-    project_info = content_obj.get("project_info", {})
     original_file = project_info.get("original_file")
     if not original_file or not Path(original_file).exists():
         raise Exception("original_file不存在，无法基于原结构导出EPUB")
@@ -132,6 +171,12 @@ def export_epub(
     # 加载原书以保留结构
     book = read_epub(str(original_file))
     _configure_single_page_pagination(book, project_info, Path(original_file))
+
+    stylesheet_name = ""
+    stylesheet_id = ""
+    if bilingual:
+        stylesheet_name, stylesheet_id = _choose_bilingual_stylesheet(book)
+    language_tag = options.target_language_tag if options is not None else None
 
     # PERF-007：收集 spine 文档列表，避免多次遍历生成器
     spine_docs = list(iter_spine_documents(book))
@@ -170,7 +215,19 @@ def export_epub(
                 f"章节 {normalize_chapter_id(doc_name)} 的 HTML/XML 段落结构不一致："
                 f"定位 {len(mapping_blocks)}，输出 {len(output_blocks)}"
             )
+        if bilingual:
+            for block_index, (mapping_block, output_block) in enumerate(
+                zip(mapping_blocks, output_blocks, strict=True)
+            ):
+                if (mapping_block.get_text() or "").strip() != (
+                    output_block.get_text() or ""
+                ).strip():
+                    raise SegmentCountMismatchError(
+                        f"章节 {normalize_chapter_id(doc_name)} 第 {block_index} 段 "
+                        "的 HTML/XML 文本不一致"
+                    )
         parsed_docs.append((item, doc_name, soup, mapping_blocks, output_blocks))
+    parsed_at = perf_counter()
 
     use_locators = bool(sorted_records) and all(
         record.get("chapter_id")
@@ -186,6 +243,7 @@ def export_epub(
         consumed_legacy_chapters: set[str] = set()
 
     # PERF-007：单次 DOM 解析，合并正文替换、图片引用替换、figcaption 和空白清理
+    bilingual_documents: list[BilingualDocumentPlan] = []
     for item, doc_name, soup, mapping_blocks, output_blocks in parsed_docs:
         if use_locators:
             chapter_id = normalize_chapter_id(doc_name)
@@ -199,15 +257,31 @@ def export_epub(
             if record_chapter:
                 consumed_legacy_chapters.add(record_chapter)
 
-        for node, record in zip(output_blocks, records, strict=False):
-            translation = str(record.get("translated_text", "")).strip()
-            original = str(record.get("original_text", "")).strip()
-            if translation and translation != original:
-                _replace_text_preserving_inline(soup, node, translation)
+        if bilingual:
+            if isinstance(item, epub_module.EpubNav):
+                # ebooklib 会用包内目录数据重新生成导航文档，不能在其 DOM 中插入译文。
+                bilingual_documents.append(_preserved_document_plan(doc_name, records))
+            else:
+                bilingual_documents.append(
+                    render_bilingual_document(
+                        soup,
+                        doc_name,
+                        records,
+                        output_blocks,
+                        language_tag=language_tag,
+                        stylesheet_name=stylesheet_name,
+                    )
+                )
+        else:
+            for node, record in zip(output_blocks, records, strict=False):
+                translation = str(record.get("translated_text", "")).strip()
+                original = str(record.get("original_text", "")).strip()
+                if translation and translation != original:
+                    _replace_text_preserving_inline(soup, node, translation)
 
         # 注释必须在图片 src 改写前匹配原始 EPUB 路径。
         if image_text_map:
-            inject_figcaption(soup, image_text_map, doc_name)
+            inject_figcaption(soup, image_text_map, doc_name, mark_generated=bilingual)
 
         # PERF-007：图片引用替换（合并到同一 DOM 解析，避免双重解析）
         if path_mapping:
@@ -227,6 +301,7 @@ def export_epub(
                         image_tag[attribute] = new_rel_path
 
         set_document_content(item, str(soup).encode("utf-8"))
+    rendered_at = perf_counter()
 
     if use_locators and consumed_records != len(sorted_records):
         raise SegmentCountMismatchError(
@@ -251,9 +326,42 @@ def export_epub(
     # 写出 EPUB
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    bilingual_plan: BilingualRenderPlan | None = None
+    if bilingual:
+        _add_bilingual_stylesheet(book, epub_module, stylesheet_name, stylesheet_id)
+        _append_target_language(book, language_tag)
+        bilingual_plan = _build_bilingual_plan(
+            stylesheet_name, bilingual_documents, len(sorted_records)
+        )
     _ensure_toc_link_ids(book, epub_module)
     write_epub(str(out_path), book)
     _enforce_single_page_spine(out_path)
+    written_at = perf_counter()
+    if bilingual_plan is not None:
+        # 双语结构校验只在新模式执行；通过后才允许主线程显示统计。
+        validate_bilingual_epub(out_path, bilingual_plan, language_tag=language_tag)
+        validated_at = perf_counter()
+        report = bilingual_plan.report
+        logger.info(
+            "双语 EPUB 导出完成: job=%s, text_mode=%s, session=%s, document_version=%s, total=%d, "
+            "paired=%d, untranslated=%d, preserved=%d, "
+            "prepare=%.2fs, render=%.2fs, write=%.2fs, validate=%.2fs, elapsed=%.2fs",
+            bilingual_job_id,
+            EpubTextMode.BILINGUAL.value,
+            snapshot.session_id if snapshot is not None else "",
+            snapshot.document_version if snapshot is not None else "",
+            report.total_segments,
+            report.paired_segments,
+            report.untranslated_segments,
+            report.preserved_segments,
+            parsed_at - started_at,
+            rendered_at - parsed_at,
+            written_at - rendered_at,
+            validated_at - written_at,
+            validated_at - started_at,
+        )
+        if on_report is not None:
+            on_report(report)
     return str(out_path)
 
 
@@ -431,6 +539,159 @@ def _replace_text_preserving_inline(soup, node, translation: str) -> None:
             s.extract()
     else:
         node.insert(0, soup.new_string(translation))
+
+
+def _same_project_path(left: Path, right: Path) -> bool:
+    try:
+        return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
+    except OSError:
+        return os.path.normcase(str(left.absolute())) == os.path.normcase(str(right.absolute()))
+
+
+def _validate_bilingual_snapshot(
+    mapping_dir: Path,
+    project_info: dict,
+    items: dict,
+    snapshot: EpubDocumentSnapshot,
+) -> list[dict]:
+    """Validate snapshot/mapping identity and strict line alignment; return ordered records."""
+    if not _same_project_path(mapping_dir, snapshot.mapping_dir):
+        raise BilingualEpubExportError("文档快照的映射目录与导出映射目录不一致")
+    original_file = project_info.get("original_file")
+    if not original_file or not _same_project_path(Path(str(original_file)), snapshot.source_path):
+        raise BilingualEpubExportError("文档快照与原 EPUB 映射不属于同一项目")
+
+    records = list(items.values())
+    if len(snapshot.source_lines) != len(snapshot.target_lines):
+        raise BilingualEpubExportError("文档快照的原文与译文行数不一致")
+    if len(records) != len(snapshot.source_lines):
+        raise BilingualEpubExportError(
+            "映射记录数与文档快照不一致：" f"映射 {len(records)}，快照 {len(snapshot.source_lines)}"
+        )
+
+    by_line_number: dict[int, dict] = {}
+    for record in records:
+        line_number = record.get("line_number")
+        if isinstance(line_number, bool) or not isinstance(line_number, int):
+            raise BilingualEpubExportError(f"映射行号 {line_number!r} 不是整数，无法安全对齐")
+        if line_number in by_line_number:
+            raise BilingualEpubExportError(f"映射行号重复：第 {line_number} 行出现多次")
+        by_line_number[line_number] = record
+
+    ordered: list[dict] = []
+    for expected_line in range(1, len(records) + 1):
+        record = by_line_number.get(expected_line)
+        if record is None:
+            raise BilingualEpubExportError(f"映射行号缺失：第 {expected_line} 行不存在")
+        ordered.append(record)
+
+    for index, record in enumerate(ordered):
+        mapped_text = str(record.get("original_text", "")).strip()
+        current_text = str(snapshot.source_lines[index]).strip()
+        if mapped_text != current_text:
+            raise BilingualEpubExportError(
+                f"第 {index + 1} 行原文已编辑，与 EPUB 映射不一致；"
+                "可使用现有 TXT 对照导出保存编辑内容"
+            )
+    return ordered
+
+
+def _overlay_snapshot_targets(ordered_records: list[dict], snapshot: EpubDocumentSnapshot) -> None:
+    """Overlay snapshot translations onto the private in-memory mapping copy."""
+    for record, target in zip(ordered_records, snapshot.target_lines, strict=True):
+        record["translated_text"] = target
+
+
+def _existing_item_names(book) -> set[str]:
+    names: set[str] = set()
+    for item in book.get_items():
+        name = get_item_name(item)
+        if name:
+            names.add(str(name))
+    return names
+
+
+def _existing_item_ids(book) -> set[str]:
+    ids: set[str] = set()
+    for item in book.get_items():
+        item_id = getattr(item, "id", None)
+        if isinstance(item_id, str) and item_id:
+            ids.add(item_id)
+    return ids
+
+
+def _preserved_document_plan(document_name: str, records: list[dict]) -> BilingualDocumentPlan:
+    """Build a plan for a document that keeps all segments untouched (e.g. nav)."""
+    pair_ids = tuple(build_pair_id(record.get("line_number")) for record in records)
+    return BilingualDocumentPlan(
+        document_name=document_name,
+        targets=(),
+        preserved_pair_ids=pair_ids,
+        untranslated_pair_ids=(),
+        original_ids=(),
+        generated=True,
+    )
+
+
+def _choose_bilingual_stylesheet(book) -> tuple[str, str]:
+    """Choose a CSS file name and manifest id that never shadow existing resources."""
+    names = _existing_item_names(book)
+    file_name = "Styles/ait-bilingual.css"
+    suffix = 0
+    while file_name in names:
+        suffix += 1
+        file_name = f"Styles/ait-bilingual-{suffix}.css"
+
+    ids = _existing_item_ids(book)
+    item_id = "ait-bilingual-css"
+    suffix = 0
+    while item_id in ids:
+        suffix += 1
+        item_id = f"ait-bilingual-css-{suffix}"
+    return file_name, item_id
+
+
+def _add_bilingual_stylesheet(book, epub_module, file_name: str, item_id: str) -> None:
+    css_item = epub_module.EpubItem(
+        uid=item_id,
+        file_name=file_name,
+        media_type="text/css",
+        content=BILINGUAL_CSS.encode("utf-8"),
+    )
+    book.add_item(css_item)
+
+
+def _append_target_language(book, language_tag: str | None) -> None:
+    if not language_tag:
+        return
+    try:
+        existing = {str(value[0]) for value in book.get_metadata("DC", "language") if value}
+    except (KeyError, AttributeError):
+        existing = set()
+    if language_tag not in existing:
+        book.add_metadata("DC", "language", language_tag)
+
+
+def _build_bilingual_plan(
+    stylesheet_name: str,
+    documents: list[BilingualDocumentPlan],
+    total_segments: int,
+) -> BilingualRenderPlan:
+    report = BilingualExportReport(
+        total_segments=total_segments,
+        paired_segments=sum(len(document.targets) for document in documents),
+        untranslated_segments=sum(len(document.untranslated_pair_ids) for document in documents),
+        preserved_segments=sum(len(document.preserved_pair_ids) for document in documents),
+    )
+    if report.total_segments != (
+        report.paired_segments + report.untranslated_segments + report.preserved_segments
+    ):
+        raise BilingualEpubExportError("双语渲染计划未覆盖全部映射段落")
+    return BilingualRenderPlan(
+        stylesheet_name=stylesheet_name,
+        documents=tuple(documents),
+        report=report,
+    )
 
 
 def _collect_text_blocks(soup) -> list:

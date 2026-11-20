@@ -29,6 +29,11 @@ from typing import (
 )
 from zipfile import BadZipFile, ZipFile
 
+from ..domain.epub_export import (
+    BilingualExportReport,
+    EpubDocumentSnapshot,
+    EpubExportOptions,
+)
 from ..infrastructure.atomic_file import write_json_atomic as _write_json_atomic
 from ..infrastructure.document_order import (
     get_item_media_type as _get_item_media_type_impl,
@@ -928,6 +933,10 @@ class EPUBProcessor:
         output_path: str,
         image_map: Dict[str, str] | None = None,
         image_text_map: Dict[str, Dict[str, object]] | None = None,
+        *,
+        options: "EpubExportOptions | None" = None,
+        snapshot: "EpubDocumentSnapshot | None" = None,
+        on_report: "Callable[[BilingualExportReport], None] | None" = None,
     ) -> str:
         """根据mapping重建并导出EPUB（委托到 infrastructure.exporter）。
 
@@ -939,7 +948,19 @@ class EPUBProcessor:
         5. 修正特殊格式标题识别问题
         6. 支持插图翻译替换（新增）
         7. 支持图片文字翻译注释（figcaption）
+        8. 新增可选双语呈现模式（需传 snapshot）
 
         返回输出文件路径
         """
-        return _export_epub_impl(mapping_dir, output_path, image_map, image_text_map)
+        if options is None and snapshot is None and on_report is None:
+            # 保持原四参数委托方式，兼容既有 mock/monkeypatch 与调用方。
+            return _export_epub_impl(mapping_dir, output_path, image_map, image_text_map)
+        return _export_epub_impl(
+            mapping_dir,
+            output_path,
+            image_map,
+            image_text_map,
+            options=options,
+            snapshot=snapshot,
+            on_report=on_report,
+        )

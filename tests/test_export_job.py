@@ -85,6 +85,29 @@ def test_export_job_cancelled_before_publish_preserves_existing_output(tmp_path)
     assert not list(tmp_path.glob(".*.tmp.epub"))
 
 
+def test_export_job_without_mapping_callback_skips_mapping_stage(tmp_path):
+    output = tmp_path / "book.epub"
+    output.write_bytes(b"old-output")
+    job = ExportJob(output_path=output, export_to=_write_epub)
+    job.start()
+
+    stages: list[str] = []
+    result: ExportResult | None = None
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and result is None:
+        for event in job.drain_events():
+            if isinstance(event, ExportResult):
+                result = event
+            else:
+                stages.append(event.stage)
+        time.sleep(0.01)
+
+    assert result is not None and result.succeeded
+    assert "mapping" not in stages
+    with ZipFile(output) as archive:
+        assert archive.read("mimetype") == b"application/epub+zip"
+
+
 def test_text_export_builds_and_publishes_from_a_worker(tmp_path):
     output = tmp_path / "translation.txt"
     output.write_text("old-output", encoding="utf-8")

@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Callable, Dict, List
 
 
 class TranslationTableAdapter:
@@ -28,10 +28,16 @@ class TranslationTableAdapter:
         # 翻译热路径更新译文时同步写入缓存，避免 apply_review_filter
         # 对 5000+ 行逐行调用 ``Treeview.item()``。
         self._row_values_cache: Dict[str, tuple] | None = None
+        # 译文实际发生变化时回调（例如字数统计），由调用方自行 debounce。
+        self._change_callback: Callable[[], None] | None = None
 
     def set_row_values_cache(self, cache: Dict[str, tuple] | None) -> None:
         """P2-4：注入行值缓存。``None`` 表示禁用缓存同步。"""
         self._row_values_cache = cache
+
+    def set_change_callback(self, callback: Callable[[], None] | None) -> None:
+        """注入值变更回调。``None`` 表示不通知。"""
+        self._change_callback = callback
 
     @property
     def row_count(self) -> int:
@@ -81,6 +87,7 @@ class TranslationTableAdapter:
         - P2-4：同步更新行值缓存（若已注入），保持 apply_review_filter 一致性。
         """
         last_item: str | None = None
+        changed = False
         cache = self._row_values_cache
         for row_index, target in updates.items():
             item = self.item_id(row_index)
@@ -94,10 +101,13 @@ class TranslationTableAdapter:
             if len(values) > 2 and values[2] != new_val:
                 values[2] = new_val
                 self._treeview.item(item, values=values)
+                changed = True
                 if cache is not None:
                     source = str(values[1]) if len(values) > 1 else ""
                     cache[item] = (source, str(new_val))
             last_item = item
+        if changed and self._change_callback is not None:
+            self._change_callback()
         return last_item
 
     def apply_streaming_preview(
@@ -111,6 +121,7 @@ class TranslationTableAdapter:
         P2-4：同步更新行值缓存（若已注入）。
         """
         last_item: str | None = None
+        changed = False
         cache = self._row_values_cache
         for row_index, target in updates.items():
             item = self.item_id(row_index)
@@ -121,10 +132,13 @@ class TranslationTableAdapter:
             if len(values) > 2 and values[2] != new_val:
                 values[2] = new_val
                 self._treeview.item(item, values=values)
+                changed = True
                 if cache is not None:
                     source = str(values[1]) if len(values) > 1 else ""
                     cache[item] = (source, str(new_val))
             last_item = item
+        if changed and self._change_callback is not None:
+            self._change_callback()
         return last_item
 
     def see(self, row_index: int) -> None:

@@ -36,7 +36,7 @@ class ExportJob:
         self,
         *,
         output_path: Path,
-        save_mapping: Callable[[], None],
+        save_mapping: Callable[[], None] | None = None,
         export_to: Callable[[Path], Path | str],
         backup_existing: Callable[[Path], None] | None = None,
     ) -> None:
@@ -81,11 +81,12 @@ class ExportJob:
                 self._events.put(ExportResult(None, cancelled=True))
                 return
 
-            self._publish_stage("mapping", "正在保存 EPUB 映射…")
-            self._save_mapping()
-            if self._cancel_event.is_set():
-                self._events.put(ExportResult(None, cancelled=True))
-                return
+            if self._save_mapping is not None:
+                self._publish_stage("mapping", "正在保存 EPUB 映射…")
+                self._save_mapping()
+                if self._cancel_event.is_set():
+                    self._events.put(ExportResult(None, cancelled=True))
+                    return
 
             self._publish_stage("export", "正在重写 EPUB 内容…")
             produced_path = Path(self._export_to(temporary_path))

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -86,3 +87,57 @@ def build_default_epub_filename(source_path: Path | None) -> str:
     if source_path is None:
         return ""
     return f"{source_path.stem}_译文.epub"
+
+
+def build_default_bilingual_epub_filename(source_path: Path | None) -> str:
+    """生成双语 EPUB 的默认文件名，不改动既有默认文件名函数。"""
+    if source_path is None:
+        return ""
+    return f"{source_path.stem}_双语对照.epub"
+
+
+def _normalized_path(path: Path) -> str:
+    candidate = Path(path)
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        resolved = candidate.absolute()
+    return os.path.normcase(str(resolved))
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    if _normalized_path(left) == _normalized_path(right):
+        return True
+    try:
+        return left.exists() and right.exists() and Path(left).samefile(Path(right))
+    except OSError:
+        return False
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    child_text = _normalized_path(child)
+    parent_text = _normalized_path(parent).rstrip("\\/")
+    return child_text == parent_text or child_text.startswith(parent_text + os.sep)
+
+
+def is_forbidden_bilingual_output(
+    output_path: Path,
+    *,
+    source_path: Path | None,
+    target_path: Path | None,
+    mapping_dir: Path | None,
+) -> str | None:
+    """Return a user-facing rejection message when the output path is protected.
+
+    双语导出产物不得覆盖原 EPUB、当前会话译文文件或项目映射目录及其子目录。
+    返回 ``None`` 表示可以继续。大小写、硬链接与别名按平台规则识别。
+    """
+    if source_path is not None and _same_file(output_path, Path(source_path)):
+        return "不能将双语 EPUB 覆盖原 EPUB 文件，请选择其他输出位置。"
+    if target_path is not None and _same_file(output_path, Path(target_path)):
+        return "不能将双语 EPUB 覆盖当前会话的译文文件，请选择其他输出位置。"
+    if mapping_dir is not None:
+        mapping_root = Path(mapping_dir)
+        if _is_within(output_path, mapping_root) or _is_within(mapping_root, output_path):
+            return "不能将双语 EPUB 写入项目映射目录，请选择其他输出位置。"
+    return None

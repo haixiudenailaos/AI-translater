@@ -539,6 +539,8 @@ def inject_figcaption(
     soup,
     image_text_map: Dict[str, Dict],
     doc_name: str,
+    *,
+    mark_generated: bool = False,
 ) -> None:
     """注入图片文字翻译注释（figcaption）。
 
@@ -589,6 +591,8 @@ def inject_figcaption(
                 caption_text = f"[原文: {original}] {translated}"
             figcaption = soup.new_tag("figcaption")
             figcaption.string = caption_text
+            if mark_generated:
+                figcaption[IMAGE_CAPTION_ATTRIBUTE] = "true"
             figcaption["style"] = (
                 "font-size: 0.85em; color: #666; "
                 "text-align: center; margin-top: 4px; "
@@ -604,6 +608,11 @@ def _is_image_only_document(soup) -> bool:
         return False
     has_image = body.find("img") is not None or body.find("image") is not None
     return has_image and not _has_visible_body_text(body)
+
+
+def is_image_only_document(soup) -> bool:
+    """公开只读入口；双语导出复用与图片注释一致的纯图片页判断。"""
+    return _is_image_only_document(soup)
 
 
 _NON_VISIBLE_TEXT_CONTAINERS = {
@@ -623,6 +632,41 @@ _HIDDEN_CLASS_NAMES = {
 }
 _ZERO_WIDTH_CHARACTERS = "\u200b\u200c\u200d\ufeff"
 _ZERO_WIDTH_TRANSLATION = str.maketrans("", "", _ZERO_WIDTH_CHARACTERS)
+# 标记由图片翻译流程临时生成的注释，供双语导出校验区分“原文变化”。
+IMAGE_CAPTION_ATTRIBUTE = "data-ait-image-caption"
+
+
+def _element_is_hidden(element, stop) -> bool:
+    """Apply the shared visibility heuristics from *element* up to (excluding) *stop*."""
+    while element is not None and element is not stop:
+        name = str(getattr(element, "name", "") or "").lower()
+        if name in _NON_VISIBLE_TEXT_CONTAINERS:
+            return True
+
+        attrs = getattr(element, "attrs", {}) or {}
+        classes = attrs.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        if _HIDDEN_CLASS_NAMES.intersection(str(value).lower() for value in classes):
+            return True
+        if element.has_attr("hidden") or str(attrs.get("aria-hidden", "")).lower() == "true":
+            return True
+
+        inline_style = "".join(str(attrs.get("style", "")).lower().split())
+        if "display:none" in inline_style or "visibility:hidden" in inline_style:
+            return True
+        element = getattr(element, "parent", None)
+    return False
+
+
+def is_hidden_node(node) -> bool:
+    """Return whether *node* itself or an ancestor is hidden from rendering.
+
+    This reuses the image module's visibility heuristics; it cannot evaluate
+    external stylesheets and does not try to build a CSS engine.
+    """
+    body = node.find_parent("body") if hasattr(node, "find_parent") else None
+    return _element_is_hidden(node, body)
 
 
 def _has_visible_body_text(body) -> bool:
@@ -639,31 +683,7 @@ def _has_visible_body_text(body) -> bool:
             continue
 
         element = getattr(text_node, "parent", None)
-        hidden = False
-        while element is not None and element is not body:
-            name = str(getattr(element, "name", "") or "").lower()
-            if name in _NON_VISIBLE_TEXT_CONTAINERS:
-                hidden = True
-                break
-
-            attrs = getattr(element, "attrs", {}) or {}
-            classes = attrs.get("class", [])
-            if isinstance(classes, str):
-                classes = classes.split()
-            if _HIDDEN_CLASS_NAMES.intersection(str(value).lower() for value in classes):
-                hidden = True
-                break
-            if element.has_attr("hidden") or str(attrs.get("aria-hidden", "")).lower() == "true":
-                hidden = True
-                break
-
-            inline_style = "".join(str(attrs.get("style", "")).lower().split())
-            if "display:none" in inline_style or "visibility:hidden" in inline_style:
-                hidden = True
-                break
-            element = getattr(element, "parent", None)
-
-        if not hidden:
+        if not _element_is_hidden(element, body):
             return True
 
     return False

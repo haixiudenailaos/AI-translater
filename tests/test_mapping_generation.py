@@ -37,6 +37,47 @@ def _format_payload(value: str = "title-a") -> dict:
     return {"metadata": {"title": value}, "spine_order": []}
 
 
+def test_read_content_mapping_snapshot_tracks_latest_published_generation(tmp_path):
+    """双语导出的只读快照按 manifest 读取当前 generation，而不是旧顶层副本。"""
+    repository.publish_mapping_bundle(
+        tmp_path,
+        _content_payload("v1"),
+        _images_payload(),
+        _format_payload(),
+    )
+    assert (
+        repository.read_content_mapping_snapshot(tmp_path)["content_mappings"]["line_000001"][
+            "translated_text"
+        ]
+        == "v1"
+    )
+
+    repository.publish_mapping_file_update(tmp_path, "content_mapping.json", _content_payload("v2"))
+
+    assert (
+        repository.read_content_mapping_snapshot(tmp_path)["content_mappings"]["line_000001"][
+            "translated_text"
+        ]
+        == "v2"
+    )
+
+
+def test_read_content_mapping_snapshot_does_not_require_other_members(tmp_path):
+    """只读取 content mapping，不为了快照额外依赖 images.json / format_info.json。"""
+    repository.publish_mapping_bundle(
+        tmp_path,
+        _content_payload("content"),
+        _images_payload(),
+        _format_payload(),
+    )
+    for filename in ("images.json", "format_info.json"):
+        repository.resolve_mapping_file(tmp_path, filename).unlink()
+
+    data = repository.read_content_mapping_snapshot(tmp_path)
+
+    assert data["content_mappings"]["line_000001"]["translated_text"] == "content"
+
+
 def test_failed_generation_write_keeps_previous_published_bundle(tmp_path, monkeypatch):
     """成员写入失败时 manifest 继续指向上一完整三文件 generation。"""
     repository.publish_mapping_bundle(

@@ -12,8 +12,83 @@ import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock, call
 
+import pytest
+
+from src.infrastructure import atomic_file as atomic_mod
 from src.utils.file_handler import write_json_atomic, write_text_atomic
+
+_ATOMIC_WRITE_CASES = [
+    pytest.param(write_text_atomic, "new", b"new", id="text"),
+    pytest.param(write_json_atomic, {"value": "new"}, b'{\n  "value": "new"\n}', id="json"),
+    pytest.param(atomic_mod.write_bytes_atomic, b"new", b"new", id="bytes"),
+]
+
+
+@pytest.mark.parametrize("write_atomic,payload,expected", _ATOMIC_WRITE_CASES)
+def test_permission_error_retries_until_content_is_published(
+    tmp_path, monkeypatch, write_atomic, payload, expected
+):
+    """文件短暂占用时继续重试，只有替换成功后才同步目录并返回成功。"""
+    target = tmp_path / "state"
+    target.write_bytes(b"old")
+    real_replace = os.replace
+    attempts = 0
+
+    def replace_after_contention(source, destination):
+        nonlocal attempts
+        attempts += 1
+        assert target.read_bytes() == b"old"
+        if attempts < 3:
+            raise PermissionError("file is busy")
+        real_replace(source, destination)
+
+    sleep = Mock()
+    sync_parent = Mock()
+    monkeypatch.setattr(atomic_mod.os, "replace", replace_after_contention)
+    monkeypatch.setattr(atomic_mod.time, "sleep", sleep)
+    monkeypatch.setattr(atomic_mod, "_fsync_parent_directory", sync_parent)
+
+    write_atomic(target, payload)
+
+    assert attempts == 3
+    assert target.read_bytes() == expected
+    assert sleep.call_args_list == [
+        call(atomic_mod._REPLACE_RETRY_BASE_DELAY),
+        call(atomic_mod._REPLACE_RETRY_BASE_DELAY * 2),
+    ]
+    sync_parent.assert_called_once_with(target)
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.parametrize("write_atomic,payload,expected", _ATOMIC_WRITE_CASES)
+def test_permission_error_exhaustion_preserves_old_content_and_raises(
+    tmp_path, monkeypatch, write_atomic, payload, expected
+):
+    """持续占用必须向调用方报错，保留旧文件并清理本次临时文件。"""
+    target = tmp_path / "state"
+    target.write_bytes(b"old")
+    failure = PermissionError("file is busy")
+    replace = Mock(side_effect=failure)
+    sleep = Mock()
+    sync_parent = Mock()
+    monkeypatch.setattr(atomic_mod.os, "replace", replace)
+    monkeypatch.setattr(atomic_mod.time, "sleep", sleep)
+    monkeypatch.setattr(atomic_mod, "_fsync_parent_directory", sync_parent)
+
+    with pytest.raises(PermissionError) as raised:
+        write_atomic(target, payload)
+
+    assert raised.value is failure
+    assert replace.call_count == atomic_mod._REPLACE_RETRY_COUNT
+    assert sleep.call_args_list == [
+        call(atomic_mod._REPLACE_RETRY_BASE_DELAY * (2**attempt))
+        for attempt in range(atomic_mod._REPLACE_RETRY_COUNT)
+    ]
+    sync_parent.assert_not_called()
+    assert target.read_bytes() == b"old"
+    assert list(tmp_path.iterdir()) == [target]
 
 
 class TestAtomicWriteUniqueTemp:

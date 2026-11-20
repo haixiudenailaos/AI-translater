@@ -80,6 +80,14 @@ class EpubFingerprintMismatchError(Exception):
         self.actual = actual
 
 
+class BilingualEpubExportError(Exception):
+    """双语 EPUB 导出无法安全完成时抛出。
+
+    覆盖快照与映射不一致、源 EPUB 已包含双语标记、无法安全插入译文节点，
+    以及写出后的双语结构校验失败。调用方必须清理临时产物并保留旧输出。
+    """
+
+
 class SegmentMappingError(Exception):
     """段落映射错误（R2-BUG-004/005）
 

@@ -25,6 +25,7 @@ from ..application.context_budget import (
     resolve_model_context_tokens,
     resolve_model_max_output_tokens,
 )
+from ..application.document_session import SessionKind
 from ..application.preflight import PreflightSeverity, build_preflight_report
 from ..application.quality_review import inspect_quality
 from ..application.translation_document import TranslationDocument
@@ -33,6 +34,7 @@ from ..config.translation_profile import (
     SMALL_MODEL_MODE_CONFIG_KEY,
     build_queue_policy_from_app_config,
 )
+from ..domain.epub_export import EpubDocumentSnapshot
 from ..domain.project import TranslationProject
 from ..domain.translation import TranslationOptions
 from ..utils.logger import get_logger
@@ -107,6 +109,8 @@ class MainWindow:
         self._row_values_cache: dict[str, tuple[str, str]] = {}
         self._table_load_after_id = None
         self._table_load_generation = 0
+        # 字数统计的 debounce 句柄：翻译/编辑热路径只调度，不逐次全量计数。
+        self._word_count_after_id = None
         self._table_loading = False
         self._api_configured = None
         self._api_status_queue = queue.SimpleQueue()
@@ -140,6 +144,8 @@ class MainWindow:
         # P2-4：把行值缓存注入适配器，翻译热路径更新译文时同步写缓存，
         # apply_review_filter 直接读缓存，避免逐行 Tcl 调用。
         self._table_adapter.set_row_values_cache(self._row_values_cache)
+        # 翻译/流式预览更新译文时通知字数统计刷新（debounce，避免逐事件计数）。
+        self._table_adapter.set_change_callback(self._schedule_word_count_refresh)
 
         # ── 初始化控制器 ────────────────────────────
         self.file_importer = FileImporter(
@@ -206,6 +212,8 @@ class MainWindow:
             backup_dir=(
                 storage_paths.translation_backups_dir if storage_paths is not None else None
             ),
+            capture_export_snapshot=self.capture_epub_export_snapshot,
+            get_session_id=lambda: self.file_importer.session.session_id,
         )
 
         # PERF §8：自动保存协调器（generation 状态机 + 单飞 + debounce）。
@@ -362,6 +370,12 @@ class MainWindow:
         export_menu.add_command(
             label="导出 EPUB", command=lambda: self.translation_controller.export_epub_file()
         )
+        export_menu.add_command(
+            label="导出双语 EPUB",
+            command=lambda: self.translation_controller.export_bilingual_epub_file(),
+        )
+        self._export_menu = export_menu
+        self._bilingual_export_action_index = export_menu.index("end")
         file_menu.add_cascade(label="导出", menu=export_menu)
         menu_bar.add_cascade(label="文件", menu=file_menu)
 
@@ -623,6 +637,11 @@ class MainWindow:
             label="导出 EPUB", command=lambda: self.translation_controller.export_epub_file()
         )
         self._epub_action_index = self.more_actions_menu.index("end")
+        self.more_actions_menu.add_command(
+            label="导出双语 EPUB",
+            command=lambda: self.translation_controller.export_bilingual_epub_file(),
+        )
+        self._bilingual_epub_action_index = self.more_actions_menu.index("end")
         ttk.Menubutton(right_control, text="更多操作", menu=self.more_actions_menu).pack(
             side=tk.LEFT
         )
@@ -644,6 +663,16 @@ class MainWindow:
     def create_status_bar(self, parent):
         status_frame = ttk.Frame(parent)
         status_frame.pack(fill=tk.X)
+        # 字数统计：紧凑显示在状态栏最左端（界面左下角），不额外占用布局行。
+        self.word_count_var = tk.StringVar(value="字数 原文 0 / 译文 0")
+        self.word_count_label = ttk.Label(
+            status_frame,
+            textvariable=self.word_count_var,
+            relief=tk.SUNKEN,
+            width=26,
+            anchor=tk.W,
+        )
+        self.word_count_label.pack(side=tk.LEFT, padx=(0, 4))
         self.status_label = ttk.Label(status_frame, text="就绪", relief=tk.SUNKEN)
         self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.api_status_label = ttk.Label(status_frame, text="API: 未配置", relief=tk.SUNKEN)
@@ -810,6 +839,7 @@ class MainWindow:
         self._set_save_status("已加载")
         self.continue_btn.config(state=tk.NORMAL)
         self.refresh_action_state()
+        self._refresh_word_count()
 
     # ── 校对工作流 ────────────────────────────────────
 
@@ -862,6 +892,8 @@ class MainWindow:
             session.mark_dirty()
         self._schedule_save_to_target()
         self.refresh_action_state()
+        if col_idx in (1, 2):
+            self._schedule_word_count_refresh()
 
     def _row_index_of(self, item_id) -> int | None:
         """根据 item ID 查找行号（线性查找，仅用于低频的单元格编辑）。"""
@@ -869,6 +901,46 @@ class MainWindow:
             return self._all_items.index(item_id)
         except ValueError:
             return None
+
+    # ── 字数统计 ──────────────────────────────────────
+
+    def _schedule_word_count_refresh(self) -> None:
+        """延迟刷新字数统计。
+
+        翻译流式预览/连续编辑会在短时间内触发大量更新，统一合并为
+        一次全量计数，避免热路径反复遍历整篇文档。
+        """
+        if getattr(self, "word_count_var", None) is None:
+            return
+        # 已有排程则直接合并本次请求：流式翻译持续触发时保证每 300ms 最多统计一次。
+        if getattr(self, "_word_count_after_id", None) is not None:
+            return
+        self._word_count_after_id = self.root.after(300, self._refresh_word_count)
+
+    def _refresh_word_count(self) -> None:
+        """统计原文/译文字数（不计空白字符），显示在左下角。"""
+        self._word_count_after_id = None
+        label_var = getattr(self, "word_count_var", None)
+        if label_var is None:
+            return
+        # 优先读行值缓存：它与表格显示内容一致（含流式预览），且无需 Tcl 调用。
+        cache = getattr(self, "_row_values_cache", None)
+        if cache is not None:
+            pairs = cache.values()
+        else:
+            document = getattr(self, "_document", None)
+            if document is None:
+                return
+            pairs = (
+                (document.row(i).source, document.row(i).target) for i in range(document.row_count)
+            )
+
+        source_chars = 0
+        target_chars = 0
+        for source, target in pairs:
+            source_chars += sum(len(part) for part in str(source).split())
+            target_chars += sum(len(part) for part in str(target).split())
+        label_var.set(f"字数 原文 {source_chars:,} / 译文 {target_chars:,}")
 
     def undo(self):
         if not self._undo_stack:
@@ -1435,11 +1507,22 @@ class MainWindow:
                 self.export_epub_btn.config(state=menu_state)
             if self._epub_action_index is not None:
                 self.more_actions_menu.entryconfigure(self._epub_action_index, state=menu_state)
+            bilingual_state = tk.NORMAL if is_epub and has_content else tk.DISABLED
+            bilingual_index = getattr(self, "_bilingual_epub_action_index", None)
+            if bilingual_index is not None:
+                self.more_actions_menu.entryconfigure(bilingual_index, state=bilingual_state)
             image_state = tk.DISABLED if self._image_translation_busy else menu_state
             if self._ai_image_action_index is not None:
                 self.more_actions_menu.entryconfigure(
                     self._ai_image_action_index, state=image_state
                 )
+        export_menu = getattr(self, "_export_menu", None)
+        bilingual_export_index = getattr(self, "_bilingual_export_action_index", None)
+        if export_menu is not None and bilingual_export_index is not None:
+            export_menu.entryconfigure(
+                bilingual_export_index,
+                state=tk.NORMAL if is_epub and has_content else tk.DISABLED,
+            )
         if hasattr(self, "ai_image_translate_btn"):
             image_state = tk.NORMAL if is_epub and not self._image_translation_busy else tk.DISABLED
             self.ai_image_translate_btn.config(state=image_state)
@@ -1495,6 +1578,34 @@ class MainWindow:
         保留方法签名以降低调用方改动。模型数据是业务状态的唯一真相来源。
         """
         return self._document.source_lines(), self._document.target_lines()
+
+    def capture_epub_export_snapshot(self) -> EpubDocumentSnapshot:
+        """在主线程一次性提交编辑并捕获双语导出所需的不可变快照。
+
+        不插入 ``update()`` 或分块 ``after()``：提交编辑、读取会话、读取
+        ``document.version`` 与复制原/译文 tuple 全部在同一个 Tk 回调内完成。
+        """
+        editor = getattr(self, "_cell_editor", None)
+        if editor is not None:
+            editor.save()
+
+        session = getattr(getattr(self, "file_importer", None), "session", None)
+        if session is None:
+            raise ValueError("当前没有打开的文档")
+        if session.kind is not SessionKind.EPUB:
+            raise ValueError("当前会话不是 EPUB 项目")
+        if session.source_path is None or session.mapping_dir is None:
+            raise ValueError("当前 EPUB 会话缺少原文件或映射目录")
+
+        document = session.document
+        return EpubDocumentSnapshot(
+            session_id=session.session_id,
+            document_version=document.version,
+            source_path=Path(session.source_path),
+            mapping_dir=Path(session.mapping_dir),
+            source_lines=tuple(document.source_lines()),
+            target_lines=tuple(document.target_lines()),
+        )
 
     # ── 实时保存 ───────────────────────────────────────
 

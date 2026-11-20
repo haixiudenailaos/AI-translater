@@ -50,6 +50,7 @@ def _atomic_replace(src: Path, dst: Path) -> None:
             # Windows：目标文件被其他线程/进程短暂占用
             last_exc = exc
             time.sleep(_REPLACE_RETRY_BASE_DELAY * (2**attempt))
+            continue
         except FileNotFoundError as exc:
             # 源临时文件被其他写入者删除，属于冲突，不重试
             last_exc = exc
